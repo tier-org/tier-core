@@ -16,7 +16,7 @@ using PeerId = tier::crypto::Ed25519PublicKey;
 
 // A QUIC endpoint: one UDP socket that both accepts incoming connections
 // (server role) and dials out (client role), each side authenticated by its
-// node certificate over mutual TLS 1.3. v0 is deliberately minimal — a single
+// node certificate over mutual TLS 1.3. v0 is deliberately minimal -a single
 // local UDP path, connections matched by remote address, no Retry/migration.
 class Endpoint {
  public:

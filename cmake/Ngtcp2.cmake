@@ -2,7 +2,7 @@
 # core transport library (libngtcp2, which has no TLS dependency) via its own
 # CMake in lib-only mode, so ngtcp2 never runs find_package() for a system TLS
 # stack. The wolfSSL crypto backend (crypto/shared.c + crypto/wolfssl/wolfssl.c)
-# we compile ourselves against our vendored wolfSSL target — the same code
+# we compile ourselves against our vendored wolfSSL target -the same code
 # ngtcp2 would build, but wired to our pinned wolfSSL instead of a system one.
 
 set(ENABLE_LIB_ONLY   ON  CACHE BOOL "" FORCE)  # core libngtcp2 only; no examples/crypto subdirs
@@ -34,7 +34,7 @@ target_compile_definitions(tier_ngtcp2_crypto_wolfssl
   PRIVATE BUILDING_NGTCP2)
 
 # Public: only the crypto backend's public header. Private: ngtcp2's internal
-# lib/ and crypto/ headers plus the generated ones in the build tree — the same
+# lib/ and crypto/ headers plus the generated ones in the build tree -the same
 # include set ngtcp2's own crypto/wolfssl/CMakeLists.txt uses to compile these
 # sources. (wolfSSL's own include dirs arrive via the linked wolfssl target.)
 set(_ngtcp2_bin "${CMAKE_CURRENT_BINARY_DIR}/vendor/ngtcp2")

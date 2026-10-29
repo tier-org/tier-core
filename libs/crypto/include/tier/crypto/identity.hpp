@@ -11,7 +11,7 @@ namespace tier::crypto {
 // network name, plus a self-signed X.509 certificate carrying that public key
 // in its SubjectPublicKeyInfo (the libp2p-TLS pattern). The certificate becomes
 // the QUIC/TLS leaf certificate, so a peer's identity is exactly the key it
-// presents in the handshake — no external PKI.
+// presents in the handshake -no external PKI.
 class NodeIdentity {
  public:
   // Fresh identity from the system CSPRNG. Throws std::runtime_error on backend
