@@ -3,10 +3,13 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/crypto/primitives.hpp"
 
 namespace tier::net {
 
@@ -44,9 +47,25 @@ class Endpoint {
   // Number of connections that have completed their TLS handshake.
   [[nodiscard]] std::size_t completed_handshakes() const noexcept;
 
+  // Name of the key-exchange group negotiated by the most recently completed
+  // handshake (e.g. "X25519MLKEM768"), or empty if none has completed.
+  [[nodiscard]] std::string last_negotiated_group() const;
+
   // Invoked once per connection when its handshake completes, with the peer's
   // authenticated identity.
   void on_handshake(std::function<void(const PeerId&)> callback);
+
+  // Invoked for each application message (one length-prefixed frame) received
+  // on a connection, with the peer's identity and the frame payload.
+  void on_message(
+      std::function<void(const PeerId&, std::span<const tier::crypto::Byte>)> callback);
+
+  // Demo/base-layer behaviour for the walking skeleton:
+  //  - a client connection, once its handshake completes, opens one bidi stream
+  //    and sends this payload as a single frame (empty = send nothing);
+  //  - a server connection echoes every received frame back on the same stream.
+  void set_auto_ping(std::vector<tier::crypto::Byte> payload);
+  void set_auto_echo(bool enabled);
 
  private:
   struct Impl;

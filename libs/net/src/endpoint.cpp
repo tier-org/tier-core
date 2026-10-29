@@ -37,6 +37,20 @@ constexpr std::size_t kCidLen = 16;
 constexpr char kAlpn[] = "tier/0";  // wire ALPN identifier for v0
 constexpr std::size_t kMaxUdpPayload = 1452;
 
+// Application framing: a 4-byte big-endian length prefix followed by the
+// payload. The cap bounds a single frame from an untrusted peer (this decoder
+// is a prime fuzz target).
+constexpr std::uint32_t kMaxFrameLen = 65536;
+
+void append_frame(std::vector<Byte>& out, std::span<const Byte> payload) {
+  const auto len = static_cast<std::uint32_t>(payload.size());
+  out.push_back(static_cast<Byte>((len >> 24) & 0xFFU));
+  out.push_back(static_cast<Byte>((len >> 16) & 0xFFU));
+  out.push_back(static_cast<Byte>((len >> 8) & 0xFFU));
+  out.push_back(static_cast<Byte>(len & 0xFFU));
+  out.insert(out.end(), payload.begin(), payload.end());
+}
+
 // ngtcp2 timeline is monotonic nanoseconds.
 ngtcp2_tstamp timestamp() noexcept {
   const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -90,6 +104,12 @@ struct Endpoint::Impl {
     bool closing = false;
     PeerId peer_id{};
 
+    // One application stream per connection in v0.
+    std::int64_t stream_id = -1;
+    std::vector<Byte> out_buf;    // outbound framed bytes (kept alive until conn end)
+    std::size_t out_sent = 0;     // bytes of out_buf already handed to ngtcp2
+    std::vector<Byte> in_buf;     // inbound reassembly buffer
+
     Connection() = default;
     ~Connection() {
       if (conn != nullptr) {
@@ -130,11 +150,16 @@ struct Endpoint::Impl {
   void arm_timer();
   void reap_closed();
   void note_handshake(Connection& c);
+  void handle_message(Connection& c, std::span<const Byte> payload);
 
   // ngtcp2 callbacks that need the (private) Connection type live as static
   // members so they can name it; the rest are free functions below.
   static ngtcp2_conn* get_conn_cb(ngtcp2_crypto_conn_ref* ref);
   static int handshake_completed_cb(ngtcp2_conn* conn, void* user_data);
+  static int recv_stream_data_cb(ngtcp2_conn* conn, std::uint32_t flags,
+                                 std::int64_t stream_id, std::uint64_t offset,
+                                 const std::uint8_t* data, std::size_t datalen,
+                                 void* user_data, void* stream_user_data);
   static ngtcp2_callbacks make_callbacks(bool server);
 
   int udp_fd = -1;
@@ -150,7 +175,11 @@ struct Endpoint::Impl {
 
   std::vector<std::unique_ptr<Connection>> conns;
   std::function<void(const PeerId&)> on_handshake;
+  std::function<void(const PeerId&, std::span<const Byte>)> on_message;
+  std::vector<Byte> auto_ping;
+  bool auto_echo = false;
   std::size_t completed = 0;
+  std::string last_group;
 };
 
 namespace {
@@ -173,13 +202,15 @@ int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid,
   return 0;
 }
 
-int recv_stream_data_cb(ngtcp2_conn* conn, std::uint32_t /*flags*/,
-                        std::int64_t stream_id, std::uint64_t /*offset*/,
-                        const std::uint8_t* /*data*/, std::size_t datalen,
-                        void* /*user_data*/, void* /*stream_user_data*/) {
-  ngtcp2_conn_extend_max_stream_offset(conn, stream_id, datalen);
-  ngtcp2_conn_extend_max_offset(conn, datalen);
-  return 0;
+// Grant enough stream/flow-control budget that a peer can open an application
+// stream and send frames; defaults leave these at zero.
+void set_stream_limits(ngtcp2_transport_params& params) noexcept {
+  params.initial_max_streams_bidi = 8;
+  params.initial_max_streams_uni = 8;
+  params.initial_max_stream_data_bidi_local = 256 * 1024;
+  params.initial_max_stream_data_bidi_remote = 256 * 1024;
+  params.initial_max_stream_data_uni = 256 * 1024;
+  params.initial_max_data = 1024 * 1024;
 }
 
 void fill_sockaddr(sockaddr_storage& ss, socklen_t& len, const std::string& ip,
@@ -207,6 +238,13 @@ WOLFSSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
   if (cfg_rc != 0) {
     wolfSSL_CTX_free(ctx);
     throw std::runtime_error("ngtcp2_crypto_wolfssl_configure_*_context failed");
+  }
+
+  // Post-quantum key exchange: hybrid X25519 + ML-KEM-768. Classical X25519 is
+  // offered as a fallback so a peer without ML-KEM can still connect.
+  if (wolfSSL_CTX_set1_groups_list(ctx, "X25519MLKEM768:X25519") != WOLFSSL_SUCCESS) {
+    wolfSSL_CTX_free(ctx);
+    throw std::runtime_error("wolfSSL_CTX_set1_groups_list failed");
   }
 
   if (wolfSSL_CTX_use_certificate_buffer(ctx, cert_der.data(),
@@ -241,6 +279,47 @@ ngtcp2_conn* Endpoint::Impl::get_conn_cb(ngtcp2_crypto_conn_ref* ref) {
 int Endpoint::Impl::handshake_completed_cb(ngtcp2_conn*, void* user_data) {
   auto* const c = static_cast<Connection*>(user_data);
   c->ep->note_handshake(*c);
+  return 0;
+}
+
+int Endpoint::Impl::recv_stream_data_cb(ngtcp2_conn* conn, std::uint32_t,
+                                        std::int64_t stream_id, std::uint64_t,
+                                        const std::uint8_t* data,
+                                        std::size_t datalen, void* user_data,
+                                        void*) {
+  auto* const c = static_cast<Connection*>(user_data);
+  ngtcp2_conn_extend_max_stream_offset(conn, stream_id, datalen);
+  ngtcp2_conn_extend_max_offset(conn, datalen);
+
+  // A server replies on the same client-initiated stream.
+  if (c->server && c->stream_id < 0) {
+    c->stream_id = stream_id;
+  }
+
+  c->in_buf.insert(c->in_buf.end(), data, data + datalen);
+
+  // Extract whole length-prefixed frames.
+  for (;;) {
+    if (c->in_buf.size() < 4) {
+      break;
+    }
+    const std::uint32_t len = (static_cast<std::uint32_t>(c->in_buf[0]) << 24) |
+                              (static_cast<std::uint32_t>(c->in_buf[1]) << 16) |
+                              (static_cast<std::uint32_t>(c->in_buf[2]) << 8) |
+                              static_cast<std::uint32_t>(c->in_buf[3]);
+    if (len > kMaxFrameLen) {
+      c->closing = true;  // oversized frame from an untrusted peer
+      return NGTCP2_ERR_CALLBACK_FAILURE;
+    }
+    if (c->in_buf.size() < 4 + len) {
+      break;
+    }
+    std::vector<Byte> payload(c->in_buf.begin() + 4,
+                              c->in_buf.begin() + 4 + static_cast<std::ptrdiff_t>(len));
+    c->in_buf.erase(c->in_buf.begin(),
+                    c->in_buf.begin() + 4 + static_cast<std::ptrdiff_t>(len));
+    c->ep->handle_message(*c, payload);
+  }
   return 0;
 }
 
@@ -372,6 +451,7 @@ void Endpoint::Impl::connect(const std::string& ip, std::uint16_t port) {
 
   ngtcp2_transport_params params;
   ngtcp2_transport_params_default(&params);
+  set_stream_limits(params);
 
   ngtcp2_callbacks cb = make_callbacks(false);
   c->conn_ref.get_conn = get_conn_cb;
@@ -431,6 +511,7 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
 
   ngtcp2_transport_params params;
   ngtcp2_transport_params_default(&params);
+  set_stream_limits(params);
   ngtcp2_cid_init(&params.original_dcid, vcid.dcid, vcid.dcidlen);
   params.original_dcid_present = 1;
 
@@ -491,15 +572,35 @@ void Endpoint::Impl::flush_writes() {
       ngtcp2_path_storage ps;
       ngtcp2_path_storage_zero(&ps);
       std::array<std::uint8_t, kMaxUdpPayload> buf{};
-      const ngtcp2_ssize nwrite = ngtcp2_conn_write_pkt(
-          c->conn, &ps.path, nullptr, buf.data(), buf.size(), timestamp());
+
+      ngtcp2_vec datav{};
+      std::int64_t stream_id = -1;
+      std::size_t veccnt = 0;
+      if (c->stream_id >= 0 && c->out_sent < c->out_buf.size()) {
+        stream_id = c->stream_id;
+        datav.base = c->out_buf.data() + c->out_sent;
+        datav.len = c->out_buf.size() - c->out_sent;
+        veccnt = 1;
+      }
+
+      ngtcp2_ssize ndatalen = 0;
+      const ngtcp2_ssize nwrite = ngtcp2_conn_writev_stream(
+          c->conn, &ps.path, nullptr, buf.data(), buf.size(), &ndatalen,
+          NGTCP2_WRITE_STREAM_FLAG_NONE, stream_id,
+          veccnt > 0 ? &datav : nullptr, veccnt, timestamp());
       if (nwrite < 0) {
-        c->closing = true;
+        if (nwrite != NGTCP2_ERR_STREAM_DATA_BLOCKED) {
+          c->closing = true;
+        }
         break;
+      }
+      if (ndatalen > 0) {
+        c->out_sent += static_cast<std::size_t>(ndatalen);
       }
       if (nwrite == 0) {
         break;
       }
+      ngtcp2_conn_update_pkt_tx_time(c->conn, timestamp());
       ::sendto(udp_fd, buf.data(), static_cast<std::size_t>(nwrite), 0,
                reinterpret_cast<sockaddr*>(&c->remote), c->remotelen);
     }
@@ -549,9 +650,30 @@ void Endpoint::Impl::note_handshake(Connection& c) {
   }
   c.handshake_done = true;
   c.peer_id = extract_peer_id(c.ssl);
+  const char* const group = wolfSSL_get_curve_name(c.ssl);
+  last_group = group != nullptr ? group : "";
   ++completed;
+
+  // A client opens one bidi stream and sends its ping payload as a frame.
+  if (!c.server && !auto_ping.empty()) {
+    std::int64_t stream_id = -1;
+    if (ngtcp2_conn_open_bidi_stream(c.conn, &stream_id, nullptr) == 0) {
+      c.stream_id = stream_id;
+      append_frame(c.out_buf, auto_ping);
+    }
+  }
+
   if (on_handshake) {
     on_handshake(c.peer_id);
+  }
+}
+
+void Endpoint::Impl::handle_message(Connection& c, std::span<const Byte> payload) {
+  if (c.server && auto_echo && c.stream_id >= 0) {
+    append_frame(c.out_buf, payload);  // echo back on the same stream
+  }
+  if (on_message) {
+    on_message(c.peer_id, payload);
   }
 }
 
@@ -596,8 +718,21 @@ std::size_t Endpoint::completed_handshakes() const noexcept {
   return impl_->completed;
 }
 
+std::string Endpoint::last_negotiated_group() const { return impl_->last_group; }
+
 void Endpoint::on_handshake(std::function<void(const PeerId&)> callback) {
   impl_->on_handshake = std::move(callback);
 }
+
+void Endpoint::on_message(
+    std::function<void(const PeerId&, std::span<const tier::crypto::Byte>)> callback) {
+  impl_->on_message = std::move(callback);
+}
+
+void Endpoint::set_auto_ping(std::vector<tier::crypto::Byte> payload) {
+  impl_->auto_ping = std::move(payload);
+}
+
+void Endpoint::set_auto_echo(bool enabled) { impl_->auto_echo = enabled; }
 
 }  // namespace tier::net
