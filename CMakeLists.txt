@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(tier-core LANGUAGES CXX VERSION 0.0.0)
+project(tier-core LANGUAGES C CXX VERSION 0.0.0)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -24,6 +24,7 @@ include(cmake/Sanitizers.cmake)
 # Tier interface targets so sanitizer/warning flags on tier::options never reach
 # third-party code.
 include(cmake/Wolfssl.cmake)
+include(cmake/Ngtcp2.cmake)
 
 enable_testing()
 

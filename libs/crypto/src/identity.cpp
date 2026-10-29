@@ -116,4 +116,24 @@ std::vector<Byte> NodeIdentity::self_signed_certificate_der() const {
   return der;
 }
 
+std::vector<Byte> NodeIdentity::private_key_pkcs8_der() const {
+  detail::Ed25519Key key;
+  const int import_rc = wc_ed25519_import_private_key(
+      seed().data(), static_cast<word32>(seed().size()),
+      public_key().data(), static_cast<word32>(public_key().size()), key.get());
+  if (import_rc != 0) {
+    detail::throw_wolf("wc_ed25519_import_private_key", import_rc);
+  }
+
+  // An Ed25519 PKCS#8 private key is well under 128 bytes.
+  std::vector<Byte> der(128);
+  const int len =
+      wc_Ed25519PrivateKeyToDer(key.get(), der.data(), static_cast<word32>(der.size()));
+  if (len < 0) {
+    detail::throw_wolf("wc_Ed25519PrivateKeyToDer", len);
+  }
+  der.resize(static_cast<std::size_t>(len));
+  return der;
+}
+
 }  // namespace tier::crypto

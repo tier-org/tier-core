@@ -36,6 +36,10 @@ class NodeIdentity {
   // std::runtime_error on backend failure.
   [[nodiscard]] std::vector<Byte> self_signed_certificate_der() const;
 
+  // PKCS#8 DER encoding of the Ed25519 private key, for loading into the TLS
+  // stack as the leaf key. Handle as a secret. Throws on backend failure.
+  [[nodiscard]] std::vector<Byte> private_key_pkcs8_der() const;
+
  private:
   explicit NodeIdentity(Ed25519Signer signer) noexcept;
 
