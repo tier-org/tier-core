@@ -3,13 +3,13 @@
 Core node for Tier, a decentralized network for encrypted messaging and payments.
 
 **Status:** early scaffold. The networking base layer (QUIC over ngtcp2 with
-aws-lc) is not implemented yet.
+wolfSSL) is not implemented yet.
 
 ## Layout
 
 - `libs/core` — transport-agnostic core (sans-I/O state machines)
-- `libs/crypto` — cryptographic seam (signing / KEX / hash), backed by aws-lc
-- `libs/net` — QUIC networking (ngtcp2 + aws-lc) *(pending)*
+- `libs/crypto` — cryptographic seam (signing / KEX / hash), backed by wolfSSL
+- `libs/net` — QUIC networking (ngtcp2 + wolfSSL) *(pending)*
 - `apps/node` — node daemon
 - `apps/cli` — command-line client
 - `tests` — unit tests (CTest)

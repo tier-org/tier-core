@@ -1,8 +1,13 @@
-# Header-only seam for now. Implementations over aws-lc (the libcrypto backend)
-# are added in a later step; the interfaces exist from day one so the rest of
-# the stack never depends on a concrete algorithm (Ed25519 today, ML-DSA later).
-add_library(tier_crypto INTERFACE)
+# Cryptographic seam with a wolfSSL-backed implementation. The public headers
+# stay backend-free (only std types and tier::crypto::Byte); wolfSSL is a
+# private link dependency, so the rest of the stack never sees its headers and
+# an algorithm swap (Ed25519 -> ML-DSA) stays local to this library.
+add_library(tier_crypto STATIC
+  src/ed25519.cpp
+  src/identity.cpp)
 add_library(tier::crypto ALIAS tier_crypto)
 
-target_include_directories(tier_crypto INTERFACE include)
-target_link_libraries(tier_crypto INTERFACE tier::options)
+target_include_directories(tier_crypto PUBLIC include)
+target_link_libraries(tier_crypto
+  PUBLIC tier::options
+  PRIVATE tier::wolfssl)

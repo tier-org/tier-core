@@ -14,8 +14,16 @@ option(TIER_SANITIZE "Build with AddressSanitizer + UndefinedBehaviorSanitizer" 
 option(TIER_WERROR "Treat warnings as errors" ON)
 option(TIER_FUZZ "Build libFuzzer targets (requires Clang)" OFF)
 
+# Single statically-linked node binary; vendored deps build static too.
+set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
+
 include(cmake/CompilerOptions.cmake)
 include(cmake/Sanitizers.cmake)
+
+# Vendored dependencies (configured, then built uninstrumented). Added after the
+# Tier interface targets so sanitizer/warning flags on tier::options never reach
+# third-party code.
+include(cmake/Wolfssl.cmake)
 
 enable_testing()
 
