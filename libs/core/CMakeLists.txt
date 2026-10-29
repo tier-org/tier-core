@@ -1,4 +1,6 @@
-add_library(tier_core STATIC src/version.cpp)
+add_library(tier_core STATIC
+  src/version.cpp
+  src/membership.cpp)
 add_library(tier::core ALIAS tier_core)
 
 target_include_directories(tier_core PUBLIC include)

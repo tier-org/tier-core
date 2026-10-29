@@ -1,7 +1,12 @@
+#include <array>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <span>
+#include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
@@ -11,6 +16,56 @@
 #include "tier/net/endpoint.hpp"
 
 namespace {
+
+// Where the node's long-term Ed25519 seed lives. Override with TIER_ID_FILE
+// (e.g. /etc/tier-network/id or /var/lib/tier/id for a system daemon);
+// otherwise a non-root XDG state path is used.
+std::string resolve_id_path() {
+  if (const char* const env = std::getenv("TIER_ID_FILE"); env != nullptr) {
+    return env;
+  }
+  if (const char* const xdg = std::getenv("XDG_STATE_HOME"); xdg != nullptr) {
+    return std::string(xdg) + "/tier/node_key";
+  }
+  if (const char* const home = std::getenv("HOME"); home != nullptr) {
+    return std::string(home) + "/.local/state/tier/node_key";
+  }
+  return "tier_node_key";
+}
+
+// Load the node identity from a 32-byte seed file, creating (and persisting) a
+// fresh one if the file is absent. The seed is secret: file 0600, dir 0700.
+tier::crypto::NodeIdentity load_or_create_identity(const std::string& path) {
+  namespace fs = std::filesystem;
+
+  std::error_code ec;
+  if (fs::exists(path, ec) &&
+      fs::file_size(path, ec) == tier::crypto::kEd25519SeedSize) {
+    std::array<tier::crypto::Byte, tier::crypto::kEd25519SeedSize> seed{};
+    std::ifstream in(path, std::ios::binary);
+    in.read(reinterpret_cast<char*>(seed.data()),
+            static_cast<std::streamsize>(seed.size()));
+    if (in.gcount() == static_cast<std::streamsize>(seed.size())) {
+      return tier::crypto::NodeIdentity::from_seed(seed);
+    }
+  }
+
+  const auto identity = tier::crypto::NodeIdentity::generate();
+  const fs::path file(path);
+  if (file.has_parent_path()) {
+    fs::create_directories(file.parent_path(), ec);
+    fs::permissions(file.parent_path(), fs::perms::owner_all,
+                    fs::perm_options::replace, ec);
+  }
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  const auto& seed = identity.seed();
+  out.write(reinterpret_cast<const char*>(seed.data()),
+            static_cast<std::streamsize>(seed.size()));
+  out.close();
+  fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
+                  fs::perm_options::replace, ec);
+  return identity;
+}
 
 void print_hex(const char* label, std::span<const tier::crypto::Byte> bytes) {
   std::fputs(label, stdout);
@@ -96,7 +151,9 @@ int main(int argc, char** argv) {
     return usage();
   }
 
-  const auto identity = tier::crypto::NodeIdentity::generate();
+  const std::string id_path = resolve_id_path();
+  const auto identity = load_or_create_identity(id_path);
+  std::printf("id file:  %s\n", id_path.c_str());
   const std::string_view cmd = argv[1];
 
   if (cmd == "listen") {
