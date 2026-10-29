@@ -1,0 +1,26 @@
+# Локальные проектные документы (каноничная версия — в Claude Docs)
+docs/
+
+# Сборка
+/build/
+/out/
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+*.exe
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake-build-*/
+
+# IDE
+.vscode/
+.idea/
+.cache/
+compile_commands.json
+
+# Прочее
+*.log
