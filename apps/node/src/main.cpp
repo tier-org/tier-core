@@ -97,13 +97,14 @@ bool parse_port(std::string_view text, std::uint16_t& out) {
 
 int run_listen(const tier::crypto::NodeIdentity& identity, std::uint16_t port) {
   tier::net::Endpoint ep(identity, "0.0.0.0", port);
-  ep.set_auto_echo(true);
-  ep.on_handshake([](const tier::net::PeerId& peer) {
-    print_hex("peer connected: ", peer);
-    std::fflush(stdout);
-  });
-  ep.on_message([](const tier::net::PeerId&,
-                   std::span<const tier::crypto::Byte> payload) {
+  ep.on_handshake(
+      [](tier::net::ConnId, bool, const tier::net::PeerId& peer) {
+        print_hex("peer connected: ", peer);
+        std::fflush(stdout);
+      });
+  ep.on_message([&ep](tier::net::ConnId conn, const tier::net::PeerId&,
+                      std::span<const tier::crypto::Byte> payload) {
+    ep.send(conn, payload);  // echo
     std::printf("echoed %zu bytes\n", payload.size());
     std::fflush(stdout);
   });
@@ -120,13 +121,17 @@ int run_connect(const tier::crypto::NodeIdentity& identity, const char* ip,
                 std::uint16_t port) {
   tier::net::Endpoint ep(identity, "0.0.0.0", 0);
   const std::vector<tier::crypto::Byte> ping{0x70, 0x69, 0x6E, 0x67};  // "ping"
-  ep.set_auto_ping(ping);
 
   bool got_echo = false;
-  ep.on_handshake(
-      [](const tier::net::PeerId& peer) { print_hex("connected to: ", peer); });
-  ep.on_message([&](const tier::net::PeerId&,
-                    std::span<const tier::crypto::Byte> payload) {
+  ep.on_handshake([&ep, &ping](tier::net::ConnId conn, bool initiator,
+                               const tier::net::PeerId& peer) {
+    print_hex("connected to: ", peer);
+    if (initiator) {
+      ep.send(conn, ping);
+    }
+  });
+  ep.on_message([&got_echo](tier::net::ConnId, const tier::net::PeerId&,
+                            std::span<const tier::crypto::Byte> payload) {
     print_hex("echo:         ", payload);
     got_echo = true;
   });

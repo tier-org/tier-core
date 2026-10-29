@@ -94,6 +94,7 @@ int accept_verify_cb(int /*preverify_ok*/, WOLFSSL_X509_STORE_CTX* /*ctx*/) {
 struct Endpoint::Impl {
   struct Connection {
     Impl* ep = nullptr;
+    ConnId id = 0;
     ngtcp2_conn* conn = nullptr;
     WOLFSSL* ssl = nullptr;
     ngtcp2_crypto_conn_ref conn_ref{};
@@ -173,11 +174,13 @@ struct Endpoint::Impl {
   std::vector<Byte> cert_der;
   std::vector<Byte> key_der;
 
+  Connection* find_by_id(ConnId id) noexcept;
+  void send(ConnId id, std::span<const Byte> payload);
+
   std::vector<std::unique_ptr<Connection>> conns;
-  std::function<void(const PeerId&)> on_handshake;
-  std::function<void(const PeerId&, std::span<const Byte>)> on_message;
-  std::vector<Byte> auto_ping;
-  bool auto_echo = false;
+  std::function<void(ConnId, bool, const PeerId&)> on_handshake;
+  std::function<void(ConnId, const PeerId&, std::span<const Byte>)> on_message;
+  ConnId next_conn_id = 1;
   std::size_t completed = 0;
   std::string last_group;
 };
@@ -435,6 +438,7 @@ void Endpoint::Impl::setup_tls(Connection& c, bool server) {
 void Endpoint::Impl::connect(const std::string& ip, std::uint16_t port) {
   auto c = std::make_unique<Connection>();
   c->ep = this;
+  c->id = next_conn_id++;
   c->server = false;
   fill_sockaddr(c->remote, c->remotelen, ip, port);
 
@@ -494,6 +498,7 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
 
   auto c = std::make_unique<Connection>();
   c->ep = this;
+  c->id = next_conn_id++;
   c->server = true;
   std::memcpy(&c->remote, &ra, ral);
   c->remotelen = ral;
@@ -654,27 +659,41 @@ void Endpoint::Impl::note_handshake(Connection& c) {
   last_group = group != nullptr ? group : "";
   ++completed;
 
-  // A client opens one bidi stream and sends its ping payload as a frame.
-  if (!c.server && !auto_ping.empty()) {
-    std::int64_t stream_id = -1;
-    if (ngtcp2_conn_open_bidi_stream(c.conn, &stream_id, nullptr) == 0) {
-      c.stream_id = stream_id;
-      append_frame(c.out_buf, auto_ping);
-    }
-  }
-
   if (on_handshake) {
-    on_handshake(c.peer_id);
+    on_handshake(c.id, !c.server, c.peer_id);
   }
 }
 
 void Endpoint::Impl::handle_message(Connection& c, std::span<const Byte> payload) {
-  if (c.server && auto_echo && c.stream_id >= 0) {
-    append_frame(c.out_buf, payload);  // echo back on the same stream
-  }
   if (on_message) {
-    on_message(c.peer_id, payload);
+    on_message(c.id, c.peer_id, payload);
   }
+}
+
+Endpoint::Impl::Connection* Endpoint::Impl::find_by_id(ConnId id) noexcept {
+  for (auto& c : conns) {
+    if (c->id == id && !c->closing) {
+      return c.get();
+    }
+  }
+  return nullptr;
+}
+
+void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
+  Connection* const c = find_by_id(id);
+  if (c == nullptr) {
+    return;
+  }
+  // Open our own bidi stream on first send if none is associated yet (the
+  // initiator case; a responder already learned the stream from the peer).
+  if (c->stream_id < 0) {
+    std::int64_t stream_id = -1;
+    if (ngtcp2_conn_open_bidi_stream(c->conn, &stream_id, nullptr) != 0) {
+      return;
+    }
+    c->stream_id = stream_id;
+  }
+  append_frame(c->out_buf, payload);
 }
 
 void Endpoint::Impl::poll(int timeout_ms) {
@@ -720,19 +739,19 @@ std::size_t Endpoint::completed_handshakes() const noexcept {
 
 std::string Endpoint::last_negotiated_group() const { return impl_->last_group; }
 
-void Endpoint::on_handshake(std::function<void(const PeerId&)> callback) {
+void Endpoint::on_handshake(
+    std::function<void(ConnId, bool, const PeerId&)> callback) {
   impl_->on_handshake = std::move(callback);
 }
 
 void Endpoint::on_message(
-    std::function<void(const PeerId&, std::span<const tier::crypto::Byte>)> callback) {
+    std::function<void(ConnId, const PeerId&, std::span<const tier::crypto::Byte>)>
+        callback) {
   impl_->on_message = std::move(callback);
 }
 
-void Endpoint::set_auto_ping(std::vector<tier::crypto::Byte> payload) {
-  impl_->auto_ping = std::move(payload);
+void Endpoint::send(ConnId conn, std::span<const tier::crypto::Byte> payload) {
+  impl_->send(conn, payload);
 }
-
-void Endpoint::set_auto_echo(bool enabled) { impl_->auto_echo = enabled; }
 
 }  // namespace tier::net

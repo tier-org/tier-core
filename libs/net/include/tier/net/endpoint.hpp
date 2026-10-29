@@ -17,6 +17,9 @@ namespace tier::net {
 // certificate it presents in the QUIC/TLS handshake (the libp2p-TLS pattern).
 using PeerId = tier::crypto::Ed25519PublicKey;
 
+// Opaque handle to one connection owned by an Endpoint.
+using ConnId = std::uint64_t;
+
 // A QUIC endpoint: one UDP socket that both accepts incoming connections
 // (server role) and dials out (client role), each side authenticated by its
 // node certificate over mutual TLS 1.3. v0 is deliberately minimal -a single
@@ -51,21 +54,22 @@ class Endpoint {
   // handshake (e.g. "X25519MLKEM768"), or empty if none has completed.
   [[nodiscard]] std::string last_negotiated_group() const;
 
-  // Invoked once per connection when its handshake completes, with the peer's
+  // Invoked once per connection when its handshake completes, with the
+  // connection handle, whether we initiated it (dialed), and the peer's
   // authenticated identity.
-  void on_handshake(std::function<void(const PeerId&)> callback);
+  void on_handshake(
+      std::function<void(ConnId, bool initiator, const PeerId&)> callback);
 
   // Invoked for each application message (one length-prefixed frame) received
-  // on a connection, with the peer's identity and the frame payload.
+  // on a connection, with the connection handle, the peer's identity, and the
+  // frame payload.
   void on_message(
-      std::function<void(const PeerId&, std::span<const tier::crypto::Byte>)> callback);
+      std::function<void(ConnId, const PeerId&, std::span<const tier::crypto::Byte>)>
+          callback);
 
-  // Demo/base-layer behaviour for the walking skeleton:
-  //  - a client connection, once its handshake completes, opens one bidi stream
-  //    and sends this payload as a single frame (empty = send nothing);
-  //  - a server connection echoes every received frame back on the same stream.
-  void set_auto_ping(std::vector<tier::crypto::Byte> payload);
-  void set_auto_echo(bool enabled);
+  // Queue one length-prefixed frame to send on a connection. A bidi stream is
+  // opened lazily on first send if we initiated the connection.
+  void send(ConnId conn, std::span<const tier::crypto::Byte> payload);
 
  private:
   struct Impl;

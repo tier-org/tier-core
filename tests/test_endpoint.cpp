@@ -31,23 +31,30 @@ int main() {
   bool server_done = false;
   bool client_done = false;
 
-  server.on_handshake([&](const tier::net::PeerId& peer) {
-    server_saw_peer = peer;
-    server_done = true;
-  });
-  client.on_handshake([&](const tier::net::PeerId& peer) {
-    client_saw_peer = peer;
-    client_done = true;
-  });
-
   // Ping/echo over a QUIC stream: client sends "ping", server echoes it.
   const std::vector<tier::crypto::Byte> ping{0x70, 0x69, 0x6E, 0x67};  // "ping"
   std::vector<tier::crypto::Byte> echo_received;
   bool echo_done = false;
 
-  server.set_auto_echo(true);
-  client.set_auto_ping(ping);
-  client.on_message([&](const tier::net::PeerId&,
+  server.on_handshake([&](tier::net::ConnId, bool, const tier::net::PeerId& peer) {
+    server_saw_peer = peer;
+    server_done = true;
+  });
+  client.on_handshake(
+      [&](tier::net::ConnId conn, bool initiator, const tier::net::PeerId& peer) {
+        client_saw_peer = peer;
+        client_done = true;
+        if (initiator) {
+          client.send(conn, ping);
+        }
+      });
+
+  // Server echoes any received frame back on the same connection.
+  server.on_message([&](tier::net::ConnId conn, const tier::net::PeerId&,
+                        std::span<const tier::crypto::Byte> payload) {
+    server.send(conn, payload);
+  });
+  client.on_message([&](tier::net::ConnId, const tier::net::PeerId&,
                         std::span<const tier::crypto::Byte> payload) {
     echo_received.assign(payload.begin(), payload.end());
     echo_done = true;
