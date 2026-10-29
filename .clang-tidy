@@ -1,0 +1,11 @@
+# Static-analysis policy for Tier (run in CI; clang-tidy not required locally).
+Checks: >
+  bugprone-*,
+  cert-*,
+  clang-analyzer-*,
+  cppcoreguidelines-*,
+  performance-*,
+  portability-*,
+  -cppcoreguidelines-avoid-magic-numbers
+WarningsAsErrors: ''
+HeaderFilterRegex: '.*/(libs|apps)/.*'

@@ -2,7 +2,7 @@
 docs/
 
 # Сборка
-/build/
+/build*/
 /out/
 *.o
 *.obj
