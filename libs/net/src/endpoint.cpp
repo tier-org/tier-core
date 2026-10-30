@@ -107,9 +107,11 @@ struct Endpoint::Impl {
 
     // One application stream per connection in v0.
     std::int64_t stream_id = -1;
-    std::vector<Byte> out_buf;    // outbound framed bytes (kept alive until conn end)
-    std::size_t out_sent = 0;     // bytes of out_buf already handed to ngtcp2
-    std::vector<Byte> in_buf;     // inbound reassembly buffer
+    std::vector<Byte> out_buf;         // outbound framed bytes pending/in-flight
+    std::size_t out_sent = 0;          // bytes of out_buf already handed to ngtcp2
+    std::uint64_t total_written = 0;   // absolute stream offset handed to ngtcp2
+    std::uint64_t total_acked = 0;     // absolute stream offset acknowledged
+    std::vector<Byte> in_buf;          // inbound reassembly buffer
 
     Connection() = default;
     ~Connection() {
@@ -161,6 +163,11 @@ struct Endpoint::Impl {
                                  std::int64_t stream_id, std::uint64_t offset,
                                  const std::uint8_t* data, std::size_t datalen,
                                  void* user_data, void* stream_user_data);
+  static int acked_stream_data_offset_cb(ngtcp2_conn* conn,
+                                         std::int64_t stream_id,
+                                         std::uint64_t offset,
+                                         std::uint64_t datalen, void* user_data,
+                                         void* stream_user_data);
   static ngtcp2_callbacks make_callbacks(bool server);
 
   int udp_fd = -1;
@@ -176,6 +183,7 @@ struct Endpoint::Impl {
 
   Connection* find_by_id(ConnId id) noexcept;
   void send(ConnId id, std::span<const Byte> payload);
+  void broadcast(std::span<const Byte> payload);
 
   std::vector<std::unique_ptr<Connection>> conns;
   std::function<void(ConnId, bool, const PeerId&)> on_handshake;
@@ -216,16 +224,33 @@ void set_stream_limits(ngtcp2_transport_params& params) noexcept {
   params.initial_max_data = 1024 * 1024;
 }
 
+// Build an IPv6 sockaddr for the dual-stack socket. Accepts native IPv6, the
+// wildcards "", "0.0.0.0" and "::" (bind any), and IPv4 literals (encoded as
+// IPv4-mapped IPv6, ::ffff:a.b.c.d, so v4 peers are reachable too).
 void fill_sockaddr(sockaddr_storage& ss, socklen_t& len, const std::string& ip,
                    std::uint16_t port) {
   std::memset(&ss, 0, sizeof(ss));
-  auto* const sin = reinterpret_cast<sockaddr_in*>(&ss);
-  sin->sin_family = AF_INET;
-  sin->sin_port = htons(port);
-  if (inet_pton(AF_INET, ip.c_str(), &sin->sin_addr) != 1) {
-    throw std::runtime_error("invalid IPv4 address: " + ip);
+  auto* const sin6 = reinterpret_cast<sockaddr_in6*>(&ss);
+  sin6->sin6_family = AF_INET6;
+  sin6->sin6_port = htons(port);
+  len = sizeof(sockaddr_in6);
+
+  if (ip.empty() || ip == "0.0.0.0" || ip == "::") {
+    sin6->sin6_addr = in6addr_any;
+    return;
   }
-  len = sizeof(sockaddr_in);
+  if (inet_pton(AF_INET6, ip.c_str(), &sin6->sin6_addr) == 1) {
+    return;
+  }
+  in_addr v4{};
+  if (inet_pton(AF_INET, ip.c_str(), &v4) == 1) {
+    auto* const bytes = sin6->sin6_addr.s6_addr;
+    bytes[10] = 0xFF;
+    bytes[11] = 0xFF;
+    std::memcpy(bytes + 12, &v4, sizeof(v4));
+    return;
+  }
+  throw std::runtime_error("invalid IP address: " + ip);
 }
 
 WOLFSSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
@@ -339,6 +364,7 @@ ngtcp2_callbacks Endpoint::Impl::make_callbacks(bool server) {
   cb.decrypt = ngtcp2_crypto_decrypt_cb;
   cb.hp_mask = ngtcp2_crypto_hp_mask_cb;
   cb.recv_stream_data = recv_stream_data_cb;
+  cb.acked_stream_data_offset = acked_stream_data_offset_cb;
   cb.rand = rand_cb;
   cb.update_key = ngtcp2_crypto_update_key_cb;
   cb.delete_crypto_aead_ctx = ngtcp2_crypto_delete_crypto_aead_ctx_cb;
@@ -354,10 +380,14 @@ Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
                      const std::string& ip, std::uint16_t port)
     : cert_der(identity.self_signed_certificate_der()),
       key_der(identity.private_key_pkcs8_der()) {
-  udp_fd = ::socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+  // One AF_INET6 dual-stack socket: with IPV6_V6ONLY off it serves native IPv6
+  // and IPv4 (as v4-mapped addresses) at once.
+  udp_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
   if (udp_fd < 0) {
     throw std::runtime_error("socket() failed");
   }
+  int v6only = 0;
+  ::setsockopt(udp_fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
 
   sockaddr_storage bind_ss{};
   socklen_t bind_len = 0;
@@ -404,8 +434,8 @@ Endpoint::Impl::~Impl() {
 }
 
 std::uint16_t Endpoint::Impl::local_port() const noexcept {
-  const auto* const sin = reinterpret_cast<const sockaddr_in*>(&local_addr);
-  return ntohs(sin->sin_port);
+  const auto* const sin6 = reinterpret_cast<const sockaddr_in6*>(&local_addr);
+  return ntohs(sin6->sin6_port);
 }
 
 ngtcp2_path Endpoint::Impl::make_path(Connection& c) noexcept {
@@ -601,6 +631,7 @@ void Endpoint::Impl::flush_writes() {
       }
       if (ndatalen > 0) {
         c->out_sent += static_cast<std::size_t>(ndatalen);
+        c->total_written += static_cast<std::uint64_t>(ndatalen);
       }
       if (nwrite == 0) {
         break;
@@ -670,6 +701,18 @@ void Endpoint::Impl::handle_message(Connection& c, std::span<const Byte> payload
   }
 }
 
+int Endpoint::Impl::acked_stream_data_offset_cb(ngtcp2_conn*, std::int64_t,
+                                                std::uint64_t offset,
+                                                std::uint64_t datalen,
+                                                void* user_data, void*) {
+  auto* const c = static_cast<Connection*>(user_data);
+  const std::uint64_t acked_to = offset + datalen;
+  if (acked_to > c->total_acked) {
+    c->total_acked = acked_to;
+  }
+  return 0;
+}
+
 Endpoint::Impl::Connection* Endpoint::Impl::find_by_id(ConnId id) noexcept {
   for (auto& c : conns) {
     if (c->id == id && !c->closing) {
@@ -693,7 +736,22 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
     }
     c->stream_id = stream_id;
   }
+  // Reclaim the send buffer once everything written has been acknowledged and
+  // nothing is in flight; bounds memory under periodic gossip. ngtcp2 does not
+  // copy stream data, so this is only safe when no bytes are still referenced.
+  if (c->out_sent == c->out_buf.size() && c->total_acked == c->total_written) {
+    c->out_buf.clear();
+    c->out_sent = 0;
+  }
   append_frame(c->out_buf, payload);
+}
+
+void Endpoint::Impl::broadcast(std::span<const Byte> payload) {
+  for (auto& c : conns) {
+    if (!c->closing && c->handshake_done) {
+      send(c->id, payload);
+    }
+  }
 }
 
 void Endpoint::Impl::poll(int timeout_ms) {
@@ -752,6 +810,10 @@ void Endpoint::on_message(
 
 void Endpoint::send(ConnId conn, std::span<const tier::crypto::Byte> payload) {
   impl_->send(conn, payload);
+}
+
+void Endpoint::broadcast(std::span<const tier::crypto::Byte> payload) {
+  impl_->broadcast(payload);
 }
 
 }  // namespace tier::net

@@ -71,6 +71,9 @@ class Endpoint {
   // opened lazily on first send if we initiated the connection.
   void send(ConnId conn, std::span<const tier::crypto::Byte> payload);
 
+  // Queue a frame on every connection whose handshake has completed.
+  void broadcast(std::span<const tier::crypto::Byte> payload);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

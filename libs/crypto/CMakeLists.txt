@@ -4,7 +4,8 @@
 # an algorithm swap (Ed25519 -> ML-DSA) stays local to this library.
 add_library(tier_crypto STATIC
   src/ed25519.cpp
-  src/identity.cpp)
+  src/identity.cpp
+  src/hash.cpp)
 add_library(tier::crypto ALIAS tier_crypto)
 
 target_include_directories(tier_crypto PUBLIC include)

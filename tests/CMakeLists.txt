@@ -18,3 +18,18 @@ add_executable(test_endpoint test_endpoint.cpp)
 target_link_libraries(test_endpoint PRIVATE tier::net tier::crypto tier::options)
 add_test(NAME endpoint COMMAND test_endpoint)
 set_tests_properties(endpoint PROPERTIES TIMEOUT 30)
+
+add_executable(test_node test_node.cpp)
+target_link_libraries(test_node PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME node COMMAND test_node)
+set_tests_properties(node PROPERTIES TIMEOUT 30)
+
+add_executable(test_gossip test_gossip.cpp)
+target_link_libraries(test_gossip PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME gossip COMMAND test_gossip)
+set_tests_properties(gossip PROPERTIES TIMEOUT 60)
+
+add_executable(test_ipv6 test_ipv6.cpp)
+target_link_libraries(test_ipv6 PRIVATE tier::net tier::crypto tier::options)
+add_test(NAME ipv6 COMMAND test_ipv6)
+set_tests_properties(ipv6 PROPERTIES TIMEOUT 30)

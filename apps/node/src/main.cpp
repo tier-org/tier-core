@@ -11,11 +11,27 @@
 #include <system_error>
 #include <vector>
 
+#include "tier/core/membership.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/crypto/primitives.hpp"
 #include "tier/net/endpoint.hpp"
+#include "tier/net/node.hpp"
 
 namespace {
+
+const char* role_name(tier::core::Role role) {
+  switch (role) {
+    case tier::core::Role::client:
+      return "client";
+    case tier::core::Role::validator:
+      return "validator";
+    case tier::core::Role::keeper:
+      return "keeper";
+    case tier::core::Role::transmitter:
+      return "transmitter";
+  }
+  return "?";
+}
 
 // Where the node's long-term Ed25519 seed lives. Override with TIER_ID_FILE
 // (e.g. /etc/tier-network/id or /var/lib/tier/id for a system daemon);
@@ -78,10 +94,37 @@ void print_hex(const char* label, std::span<const tier::crypto::Byte> bytes) {
 int usage() {
   std::fputs(
       "usage:\n"
+      "  tier-node run <port> [<seed_ip> <seed_port>]\n"
       "  tier-node listen <port>\n"
       "  tier-node connect <ip> <port>\n",
       stderr);
   return 2;
+}
+
+// Long-lived participant: gossips membership and logs every peer it learns of.
+int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
+             const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
+  tier::net::Node node(identity, tier::core::Role::client, "0.0.0.0", port);
+  node.on_membership_change([](const tier::core::PeerInfo& peer) {
+    std::fputs("discovered peer ", stdout);
+    for (const auto b : peer.id) {
+      std::printf("%02x", static_cast<unsigned>(b));
+    }
+    std::printf(" role=%s addr=%s\n", role_name(peer.role), peer.address.c_str());
+    std::fflush(stdout);
+  });
+
+  print_hex("node id:  ", node.peer_id());
+  std::printf("listening on 0.0.0.0:%u\n", static_cast<unsigned>(node.local_port()));
+  if (has_seed) {
+    std::printf("dialing seed %s:%u\n", seed_ip, static_cast<unsigned>(seed_port));
+    node.connect(seed_ip, seed_port);
+  }
+  std::fflush(stdout);
+
+  for (;;) {
+    node.poll(200);
+  }
 }
 
 bool parse_port(std::string_view text, std::uint16_t& out) {
@@ -160,6 +203,21 @@ int main(int argc, char** argv) {
   const auto identity = load_or_create_identity(id_path);
   std::printf("id file:  %s\n", id_path.c_str());
   const std::string_view cmd = argv[1];
+
+  if (cmd == "run") {
+    std::uint16_t port = 0;
+    if ((argc != 3 && argc != 5) || !parse_port(argv[2], port)) {
+      return usage();
+    }
+    if (argc == 5) {
+      std::uint16_t seed_port = 0;
+      if (!parse_port(argv[4], seed_port)) {
+        return usage();
+      }
+      return run_node(identity, port, argv[3], seed_port, true);
+    }
+    return run_node(identity, port, nullptr, 0, false);
+  }
 
   if (cmd == "listen") {
     std::uint16_t port = 0;
