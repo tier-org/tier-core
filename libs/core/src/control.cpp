@@ -179,4 +179,98 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
   return peers;
 }
 
+std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
+  if (in.empty()) {
+    return std::nullopt;
+  }
+  switch (in[0]) {
+    case static_cast<std::uint8_t>(ControlType::membership):
+      return ControlType::membership;
+    case static_cast<std::uint8_t>(ControlType::ping):
+      return ControlType::ping;
+    case static_cast<std::uint8_t>(ControlType::ack):
+      return ControlType::ack;
+    case static_cast<std::uint8_t>(ControlType::ping_req):
+      return ControlType::ping_req;
+    default:
+      return std::nullopt;
+  }
+}
+
+std::vector<std::uint8_t> encode_ping(std::uint64_t seq) {
+  std::vector<std::uint8_t> out;
+  out.push_back(static_cast<std::uint8_t>(ControlType::ping));
+  put_u64(out, seq);
+  return out;
+}
+
+std::vector<std::uint8_t> encode_ack(std::uint64_t seq) {
+  std::vector<std::uint8_t> out;
+  out.push_back(static_cast<std::uint8_t>(ControlType::ack));
+  put_u64(out, seq);
+  return out;
+}
+
+std::vector<std::uint8_t> encode_ping_req(std::uint64_t seq,
+                                          const PeerId& target) {
+  std::vector<std::uint8_t> out;
+  out.push_back(static_cast<std::uint8_t>(ControlType::ping_req));
+  put_u64(out, seq);
+  out.insert(out.end(), target.begin(), target.end());
+  return out;
+}
+
+namespace {
+
+// Decode a bare [type:1][seq:8] body, checking the type tag. Shared by ping/ack.
+std::optional<std::uint64_t> decode_seq_message(std::span<const std::uint8_t> in,
+                                                ControlType expected) {
+  Reader r(in);
+  std::uint8_t type = 0;
+  if (!r.u8(type) || type != static_cast<std::uint8_t>(expected)) {
+    return std::nullopt;
+  }
+  std::uint64_t seq = 0;
+  if (!r.u64(seq) || !r.at_end()) {
+    return std::nullopt;
+  }
+  return seq;
+}
+
+}  // namespace
+
+std::optional<PingMessage> decode_ping(std::span<const std::uint8_t> in) {
+  const auto seq = decode_seq_message(in, ControlType::ping);
+  if (!seq) {
+    return std::nullopt;
+  }
+  return PingMessage{*seq};
+}
+
+std::optional<AckMessage> decode_ack(std::span<const std::uint8_t> in) {
+  const auto seq = decode_seq_message(in, ControlType::ack);
+  if (!seq) {
+    return std::nullopt;
+  }
+  return AckMessage{*seq};
+}
+
+std::optional<PingReqMessage> decode_ping_req(std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t type = 0;
+  if (!r.u8(type) || type != static_cast<std::uint8_t>(ControlType::ping_req)) {
+    return std::nullopt;
+  }
+  PingReqMessage msg;
+  if (!r.u64(msg.seq)) {
+    return std::nullopt;
+  }
+  std::span<const std::uint8_t> target_bytes;
+  if (!r.bytes(msg.target.size(), target_bytes) || !r.at_end()) {
+    return std::nullopt;
+  }
+  std::copy(target_bytes.begin(), target_bytes.end(), msg.target.begin());
+  return msg;
+}
+
 }  // namespace tier::core

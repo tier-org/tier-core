@@ -34,6 +34,8 @@ bool Membership::apply(const PeerInfo& update) {
   return true;
 }
 
+bool Membership::remove(const PeerId& id) { return peers_.erase(id) > 0; }
+
 std::optional<PeerInfo> Membership::find(const PeerId& id) const {
   const auto it = peers_.find(id);
   if (it == peers_.end()) {

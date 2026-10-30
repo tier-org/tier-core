@@ -3,9 +3,11 @@
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <string>
 
 #include "tier/core/membership.hpp"
+#include "tier/core/swim.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/net/endpoint.hpp"
 
@@ -19,7 +21,8 @@ namespace tier::net {
 class Node {
  public:
   Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
-       const std::string& ip, std::uint16_t port);
+       const std::string& ip, std::uint16_t port,
+       tier::core::SwimConfig swim = {});
 
   [[nodiscard]] std::uint16_t local_port() const noexcept;
 
@@ -45,6 +48,10 @@ class Node {
   std::string self_address_;
   std::function<void(const tier::core::PeerInfo&)> on_change_;
   std::chrono::steady_clock::time_point last_gossip_{};
+  // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
+  // detector sends probes by peer id and this routes them.
+  std::map<tier::core::PeerId, ConnId> conn_by_peer_;
+  tier::core::FailureDetector fd_;
 };
 
 }  // namespace tier::net

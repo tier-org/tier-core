@@ -11,10 +11,12 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <deque>
 #include <cstdint>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <wolfssl/options.h>
@@ -105,12 +107,22 @@ struct Endpoint::Impl {
     bool closing = false;
     PeerId peer_id{};
 
-    // One application stream per connection in v0.
+    // One application stream per connection in v0. Outbound bytes live in a
+    // queue of immovable chunks: ngtcp2 does not copy stream data when we hand
+    // it over, it holds the pointer until the bytes are acknowledged (for
+    // retransmission), so an in-flight chunk must never be moved or freed. Each
+    // send appends a new chunk (never touching existing ones), and a chunk is
+    // dropped only once fully acked. `base` is the chunk's absolute offset in
+    // the stream.
     std::int64_t stream_id = -1;
-    std::vector<Byte> out_buf;         // outbound framed bytes pending/in-flight
-    std::size_t out_sent = 0;          // bytes of out_buf already handed to ngtcp2
-    std::uint64_t total_written = 0;   // absolute stream offset handed to ngtcp2
-    std::uint64_t total_acked = 0;     // absolute stream offset acknowledged
+    struct OutChunk {
+      std::uint64_t base = 0;
+      std::vector<Byte> data;
+    };
+    std::deque<OutChunk> out;          // queued/in-flight outbound chunks
+    std::uint64_t appended = 0;        // absolute offset for the next chunk
+    std::uint64_t write_cursor = 0;    // absolute offset handed to ngtcp2
+    std::uint64_t total_acked = 0;     // absolute offset acknowledged
     std::vector<Byte> in_buf;          // inbound reassembly buffer
 
     Connection() = default;
@@ -184,6 +196,7 @@ struct Endpoint::Impl {
   Connection* find_by_id(ConnId id) noexcept;
   void send(ConnId id, std::span<const Byte> payload);
   void broadcast(std::span<const Byte> payload);
+  std::vector<std::pair<ConnId, PeerId>> connections() const;
 
   std::vector<std::unique_ptr<Connection>> conns;
   std::function<void(ConnId, bool, const PeerId&)> on_handshake;
@@ -603,19 +616,33 @@ void Endpoint::Impl::flush_writes() {
     if (c->closing) {
       continue;
     }
+    // Drop chunks ngtcp2 has fully acknowledged; it no longer references them.
+    while (!c->out.empty() &&
+           c->out.front().base + c->out.front().data.size() <= c->total_acked) {
+      c->out.pop_front();
+    }
     for (;;) {
       ngtcp2_path_storage ps;
       ngtcp2_path_storage_zero(&ps);
       std::array<std::uint8_t, kMaxUdpPayload> buf{};
 
+      // Feed the first chunk that still has bytes past the write cursor. The
+      // pointer stays valid until the chunk is acked and popped above.
       ngtcp2_vec datav{};
       std::int64_t stream_id = -1;
       std::size_t veccnt = 0;
-      if (c->stream_id >= 0 && c->out_sent < c->out_buf.size()) {
-        stream_id = c->stream_id;
-        datav.base = c->out_buf.data() + c->out_sent;
-        datav.len = c->out_buf.size() - c->out_sent;
-        veccnt = 1;
+      if (c->stream_id >= 0) {
+        for (auto& ch : c->out) {
+          const std::uint64_t ch_end = ch.base + ch.data.size();
+          if (c->write_cursor < ch_end) {
+            const auto within = static_cast<std::size_t>(c->write_cursor - ch.base);
+            datav.base = ch.data.data() + within;
+            datav.len = ch.data.size() - within;
+            stream_id = c->stream_id;
+            veccnt = 1;
+            break;
+          }
+        }
       }
 
       ngtcp2_ssize ndatalen = 0;
@@ -630,8 +657,7 @@ void Endpoint::Impl::flush_writes() {
         break;
       }
       if (ndatalen > 0) {
-        c->out_sent += static_cast<std::size_t>(ndatalen);
-        c->total_written += static_cast<std::uint64_t>(ndatalen);
+        c->write_cursor += static_cast<std::uint64_t>(ndatalen);
       }
       if (nwrite == 0) {
         break;
@@ -736,14 +762,13 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
     }
     c->stream_id = stream_id;
   }
-  // Reclaim the send buffer once everything written has been acknowledged and
-  // nothing is in flight; bounds memory under periodic gossip. ngtcp2 does not
-  // copy stream data, so this is only safe when no bytes are still referenced.
-  if (c->out_sent == c->out_buf.size() && c->total_acked == c->total_written) {
-    c->out_buf.clear();
-    c->out_sent = 0;
-  }
-  append_frame(c->out_buf, payload);
+  // Queue the framed payload as a fresh chunk. Appending never touches chunks
+  // already handed to ngtcp2, so their bytes stay put until acknowledged.
+  Connection::OutChunk chunk;
+  chunk.base = c->appended;
+  append_frame(chunk.data, payload);
+  c->appended += chunk.data.size();
+  c->out.push_back(std::move(chunk));
 }
 
 void Endpoint::Impl::broadcast(std::span<const Byte> payload) {
@@ -752,6 +777,16 @@ void Endpoint::Impl::broadcast(std::span<const Byte> payload) {
       send(c->id, payload);
     }
   }
+}
+
+std::vector<std::pair<ConnId, PeerId>> Endpoint::Impl::connections() const {
+  std::vector<std::pair<ConnId, PeerId>> out;
+  for (const auto& c : conns) {
+    if (!c->closing && c->handshake_done) {
+      out.emplace_back(c->id, c->peer_id);
+    }
+  }
+  return out;
 }
 
 void Endpoint::Impl::poll(int timeout_ms) {
@@ -793,6 +828,10 @@ void Endpoint::poll(int timeout_ms) { impl_->poll(timeout_ms); }
 
 std::size_t Endpoint::completed_handshakes() const noexcept {
   return impl_->completed;
+}
+
+std::vector<std::pair<ConnId, PeerId>> Endpoint::connections() const {
+  return impl_->connections();
 }
 
 std::string Endpoint::last_negotiated_group() const { return impl_->last_group; }

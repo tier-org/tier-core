@@ -15,3 +15,9 @@ add_executable(fuzz_membership fuzz_membership.cpp)
 target_link_libraries(fuzz_membership PRIVATE tier::core tier::options)
 target_compile_options(fuzz_membership PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_membership PRIVATE -fsanitize=fuzzer)
+
+# Decoders of the SWIM probe messages (ping / ack / ping_req).
+add_executable(fuzz_control fuzz_control.cpp)
+target_link_libraries(fuzz_control PRIVATE tier::core tier::options)
+target_compile_options(fuzz_control PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_control PRIVATE -fsanitize=fuzzer)

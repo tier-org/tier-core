@@ -38,6 +38,10 @@ class Membership {
   // (dead > suspect > alive) wins; a lower incarnation is ignored.
   bool apply(const PeerInfo& update);
 
+  // Drop an entry (e.g. a dead peer past its cleanup grace). Returns true if an
+  // entry was removed.
+  bool remove(const PeerId& id);
+
   [[nodiscard]] std::optional<PeerInfo> find(const PeerId& id) const;
   [[nodiscard]] std::size_t size() const noexcept;
 

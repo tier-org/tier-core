@@ -1,8 +1,10 @@
 #include "tier/net/node.hpp"
 
+#include <chrono>
 #include <span>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "tier/core/control.hpp"
 #include "tier/crypto/hash.hpp"
@@ -10,10 +12,19 @@
 namespace tier::net {
 
 Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
-           const std::string& ip, std::uint16_t port)
+           const std::string& ip, std::uint16_t port,
+           tier::core::SwimConfig swim)
     : identity_(std::move(identity)),
       self_id_(tier::crypto::sha256(identity_.public_key())),
-      endpoint_(identity_, ip, port) {
+      endpoint_(identity_, ip, port),
+      fd_(self_id_, membership_, swim,
+          [this](const tier::core::PeerId& to,
+                 const std::vector<std::uint8_t>& msg) {
+            const auto it = conn_by_peer_.find(to);
+            if (it != conn_by_peer_.end()) {
+              endpoint_.send(it->second, msg);
+            }
+          }) {
   self_address_ = ip + ":" + std::to_string(endpoint_.local_port());
 
   tier::core::PeerInfo me;
@@ -26,8 +37,12 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
 
   endpoint_.on_handshake(
       [this](ConnId conn, bool, const PeerId&) { push_membership(conn); });
-  endpoint_.on_message([this](ConnId, const PeerId&,
+  endpoint_.on_message([this](ConnId, const PeerId& key,
                               std::span<const tier::crypto::Byte> payload) {
+    const tier::core::PeerId from = tier::crypto::sha256(key);
+    if (fd_.handle(std::chrono::steady_clock::now(), from, payload)) {
+      return;  // consumed as a SWIM probe message
+    }
     merge_message(payload);
   });
 }
@@ -52,10 +67,23 @@ void Node::on_membership_change(
 void Node::poll(int timeout_ms) {
   endpoint_.poll(timeout_ms);
 
-  // Periodic anti-entropy: push the current snapshot to all peers so the view
-  // stays fresh and propagates transitively through a seed.
-  constexpr auto kGossipInterval = std::chrono::milliseconds(100);
+  // Refresh the peer->connection routing and the neighbor set from the live
+  // connections; reaped connections drop out here on their own.
+  conn_by_peer_.clear();
+  std::vector<tier::core::PeerId> neighbors;
+  for (const auto& [conn, key] : endpoint_.connections()) {
+    const tier::core::PeerId id = tier::crypto::sha256(key);
+    conn_by_peer_[id] = conn;
+    neighbors.push_back(id);
+  }
+
   const auto now = std::chrono::steady_clock::now();
+  fd_.tick(now, neighbors);
+
+  // Periodic anti-entropy: push the current snapshot to all peers so the view
+  // (including liveness changes the detector made) stays fresh and propagates
+  // transitively through a seed.
+  constexpr auto kGossipInterval = std::chrono::milliseconds(100);
   if (now - last_gossip_ >= kGossipInterval) {
     endpoint_.broadcast(tier::core::encode_membership_message(membership_.snapshot()));
     last_gossip_ = now;

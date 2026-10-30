@@ -33,3 +33,13 @@ add_executable(test_ipv6 test_ipv6.cpp)
 target_link_libraries(test_ipv6 PRIVATE tier::net tier::crypto tier::options)
 add_test(NAME ipv6 COMMAND test_ipv6)
 set_tests_properties(ipv6 PROPERTIES TIMEOUT 30)
+
+add_executable(test_swim test_swim.cpp)
+target_link_libraries(test_swim PRIVATE tier::core tier::options)
+add_test(NAME swim COMMAND test_swim)
+set_tests_properties(swim PROPERTIES TIMEOUT 30)
+
+add_executable(test_swim_net test_swim_net.cpp)
+target_link_libraries(test_swim_net PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME swim_net COMMAND test_swim_net)
+set_tests_properties(swim_net PROPERTIES TIMEOUT 60)

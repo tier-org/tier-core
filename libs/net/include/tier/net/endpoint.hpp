@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "tier/crypto/ed25519.hpp"
@@ -49,6 +50,12 @@ class Endpoint {
 
   // Number of connections that have completed their TLS handshake.
   [[nodiscard]] std::size_t completed_handshakes() const noexcept;
+
+  // Snapshot of the currently live connections (handshake complete, not
+  // closing), as (handle, peer identity). The caller rebuilds its peer->conn
+  // routing and neighbor set from this each cycle, so reaped connections drop
+  // out on their own.
+  [[nodiscard]] std::vector<std::pair<ConnId, PeerId>> connections() const;
 
   // Name of the key-exchange group negotiated by the most recently completed
   // handshake (e.g. "X25519MLKEM768"), or empty if none has completed.
