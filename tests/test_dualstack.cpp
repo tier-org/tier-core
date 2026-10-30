@@ -21,7 +21,8 @@ void check(bool ok, const char* what) {
 }
 
 tier::net::Node make_node(tier::core::Role role) {
-  return tier::net::Node(tier::crypto::NodeIdentity::generate(), role, "::", 0);
+  return tier::net::Node(tier::crypto::NodeIdentity::generate(),
+                         tier::core::role_bit(role), "::", 0);
 }
 
 bool advertises_prefix(const tier::net::Node& n, const char* prefix) {

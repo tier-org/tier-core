@@ -106,7 +106,7 @@ std::vector<std::uint8_t> encode_membership_message(
   put_u32(out, static_cast<std::uint32_t>(peers.size()));
   for (const PeerInfo& p : peers) {
     out.insert(out.end(), p.id.begin(), p.id.end());
-    out.push_back(static_cast<std::uint8_t>(p.role));
+    out.push_back(static_cast<std::uint8_t>(p.roles));
     put_u64(out, p.incarnation);
     out.push_back(static_cast<std::uint8_t>(p.liveness));
     const std::size_t addr_count =
@@ -149,11 +149,14 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
     }
     std::copy(id_bytes.begin(), id_bytes.end(), p.id.begin());
 
-    std::uint8_t role = 0;
-    if (!r.u8(role) || role > static_cast<std::uint8_t>(Role::transmitter)) {
+    std::uint8_t roles = 0;
+    // Reject any bit outside the defined role set (roles | kAllRoles would then
+    // exceed kAllRoles), so unknown roles from a newer/hostile peer are refused.
+    if (!r.u8(roles) ||
+        static_cast<RoleSet>(roles | kAllRoles) != kAllRoles) {
       return std::nullopt;
     }
-    p.role = static_cast<Role>(role);
+    p.roles = roles;
 
     if (!r.u64(p.incarnation)) {
       return std::nullopt;

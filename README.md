@@ -109,3 +109,70 @@ the package and attaches the `.deb` to a GitHub Release. To install and run:
 The node stores its Ed25519 identity under `/var/lib/tier` (systemd
 StateDirectory). Bootstrap by pointing `TIER_ARGS` at one reachable seed; the
 rest of the mesh is learned via gossip.
+
+## Node requirements
+
+The lite node is what this repo builds today; its figures are grounded in the
+current binary. The **validator role is not implemented yet**, so its figures
+are architectural estimates from the design, meant for provisioning with
+headroom and to be revised once the role exists and is measured. When sizing a
+server, use the "comfortable" column.
+
+Common baseline for every role:
+
+- Linux x86-64 (amd64), packaged for Ubuntu 22.04 / 24.04, glibc >= 2.34.
+- Static binary: no runtime dependency beyond `libc6`.
+- IPv4 and/or IPv6 - the daemon binds dual-stack (`::`).
+- One reachable UDP port (the listen port in `TIER_ARGS`).
+
+### Lite node (client / general participant)
+
+Runs the messaging and wallet side: holds its own coins and chat locally, joins
+the peer mesh, and contacts validators to spend. Light and intermittent-friendly,
+and works behind NAT (direct connections plus hole punching).
+
+| Resource | Minimum | Comfortable |
+|----------|---------|-------------|
+| CPU      | 1 core  | 2 cores |
+| RAM      | 256 MB  | 512 MB - 1 GB |
+| Disk     | 1 GB plus your own wallet/chat data | SSD, a few GB |
+| Network  | ~1 Mbit/s, NAT is fine, no public IP needed | stable link |
+| Uptime   | none, may be offline | - |
+
+The base-layer footprint is small (a static ~4 MB binary, gossip, and a handful
+of QUIC connections). Most of a client's disk is its own data - wallet and
+message history - which it keeps itself and which grows with use.
+
+### Validator node (role not implemented yet - estimates)
+
+Signs the first spend of each coin and keeps a nullifier store (markers of spent
+coins, not a ledger or chain). Validators form an authenticated full-mesh
+(<= 100 peers) with SWIM + Lifeguard liveness. The role must be always-on,
+low-latency, and publicly reachable.
+
+| Resource | Minimum (estimate) | Comfortable (estimate) |
+|----------|--------------------|------------------------|
+| CPU      | 2 cores | 4+ cores (headroom for post-quantum signatures) |
+| RAM      | 2 GB    | 4 - 8 GB |
+| Disk     | 20 GB SSD/NVMe | 50+ GB NVMe |
+| Network  | static public IPv4 and/or IPv6, open UDP port, low latency, ~10 Mbit/s | symmetric, more headroom |
+| Uptime   | 24/7, stable | - |
+
+Where these come from:
+
+- CPU is signature-bound (verify and sign on the spend path). Ed25519 is cheap;
+  the planned post-quantum signatures are larger and heavier, hence the headroom.
+- RAM holds the ~100 persistent mesh connections plus a hot index over the
+  nullifier store.
+- Disk grows monotonically with spent coins (hashes, bounded by spend volume -
+  there is no block history, since there is no chain). Put it on SSD/NVMe
+  because lookups sit on the latency-critical spend path.
+- A validator is part of a small full-mesh and answers spend requests, so it
+  needs a routable address (no NAT), an open UDP port, a stable low-latency
+  link, and NTP-synced time for liveness and quorum timing.
+- The validator signing key is high value: the packaged systemd unit already
+  sandboxes the service, and stronger key custody (HSM, offline signing) is a
+  later consideration.
+
+The keeper (paid encrypted storage) and transmitter (relay) roles will get their
+own profiles - storage-heavy and bandwidth-heavy respectively - when they land.

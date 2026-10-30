@@ -45,6 +45,22 @@ const char* role_name(tier::core::Role role) {
   return "?";
 }
 
+// Render a role set as "client|validator|..." (just "-" if empty).
+std::string format_roles(tier::core::RoleSet roles) {
+  std::string out;
+  for (const tier::core::Role r :
+       {tier::core::Role::client, tier::core::Role::validator,
+        tier::core::Role::keeper, tier::core::Role::transmitter}) {
+    if (tier::core::has_role(roles, r)) {
+      if (!out.empty()) {
+        out += '|';
+      }
+      out += role_name(r);
+    }
+  }
+  return out.empty() ? "-" : out;
+}
+
 // Where the node's long-term Ed25519 seed lives. Override with TIER_ID_FILE
 // (e.g. /etc/tier-network/id or /var/lib/tier/id for a system daemon);
 // otherwise a non-root XDG state path is used.
@@ -118,7 +134,8 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
              const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
   // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
-  tier::net::Node node(identity, tier::core::Role::client, "::", port);
+  tier::net::Node node(identity, tier::core::role_bit(tier::core::Role::client),
+                       "::", port);
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -131,7 +148,7 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
     for (const auto b : peer.id) {
       std::printf("%02x", static_cast<unsigned>(b));
     }
-    std::printf(" role=%s addr=%s\n", role_name(peer.role),
+    std::printf(" roles=%s addr=%s\n", format_roles(peer.roles).c_str(),
                 join_addresses(peer.addresses).c_str());
     std::fflush(stdout);
   });

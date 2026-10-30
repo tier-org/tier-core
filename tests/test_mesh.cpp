@@ -19,8 +19,8 @@ void check(bool ok, const char* what) {
 // Bind the wildcard so each node starts out advertising "0.0.0.0:port", which
 // is not dialable: the test proves the node learns its real address from peers.
 tier::net::Node make_node(tier::core::Role role) {
-  return tier::net::Node(tier::crypto::NodeIdentity::generate(), role,
-                         "0.0.0.0", 0);
+  return tier::net::Node(tier::crypto::NodeIdentity::generate(),
+                         tier::core::role_bit(role), "0.0.0.0", 0);
 }
 
 void codec_roundtrip() {

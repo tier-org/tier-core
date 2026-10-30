@@ -52,11 +52,11 @@ int main() {
   using tier::core::Role;
 
   auto a = std::make_unique<tier::net::Node>(
-      tier::crypto::NodeIdentity::generate(), Role::validator, "127.0.0.1", 0,
-      fast_config());
+      tier::crypto::NodeIdentity::generate(), tier::core::role_bit(Role::validator),
+      "127.0.0.1", 0, fast_config());
   auto b = std::make_unique<tier::net::Node>(
-      tier::crypto::NodeIdentity::generate(), Role::client, "127.0.0.1", 0,
-      fast_config());
+      tier::crypto::NodeIdentity::generate(), tier::core::role_bit(Role::client),
+      "127.0.0.1", 0, fast_config());
 
   const auto a_id = a->peer_id();
   b->connect("127.0.0.1", a->local_port());

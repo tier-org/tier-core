@@ -75,7 +75,7 @@ bool is_ipv6(const std::string& addr) {
 
 }  // namespace
 
-Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
+Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
            const std::string& ip, std::uint16_t port,
            tier::core::SwimConfig swim)
     : identity_(std::move(identity)),
@@ -94,7 +94,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
   tier::core::PeerInfo me;
   me.id = self_id_;
   me.addresses = {self_address_};
-  me.role = role;
+  me.roles = roles;
   me.incarnation = 1;
   me.liveness = tier::core::Liveness::alive;
   membership_.apply(me);

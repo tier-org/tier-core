@@ -17,6 +17,25 @@ using PeerId = std::array<std::uint8_t, 32>;
 
 enum class Role : std::uint8_t { client, validator, keeper, transmitter };
 
+// A node may hold several roles at once (e.g. a validator that is also a
+// keeper), so roles travel as a bitmask: bit (1 << Role) per role held. This
+// keeps the single on-wire role byte and leaves room for future roles.
+using RoleSet = std::uint8_t;
+
+[[nodiscard]] constexpr RoleSet role_bit(Role r) noexcept {
+  return static_cast<RoleSet>(1U << static_cast<unsigned>(r));
+}
+
+[[nodiscard]] constexpr bool has_role(RoleSet set, Role r) noexcept {
+  return (set & role_bit(r)) != 0;
+}
+
+// Every defined role bit OR'd together; used to reject unknown bits off the
+// wire. Update when a role is added to the enum.
+inline constexpr RoleSet kAllRoles = static_cast<RoleSet>(
+    role_bit(Role::client) | role_bit(Role::validator) |
+    role_bit(Role::keeper) | role_bit(Role::transmitter));
+
 // SWIM liveness. Order matters for the merge: alive < suspect < dead, so at an
 // equal incarnation a worse report wins.
 enum class Liveness : std::uint8_t { alive = 0, suspect = 1, dead = 2 };
@@ -28,7 +47,7 @@ struct PeerInfo {
   // advertises every address it is reachable at so a dialer can pick one of a
   // family it can use; a peer with a single address behaves as before.
   std::vector<std::string> addresses;
-  Role role = Role::client;
+  RoleSet roles = role_bit(Role::client);  // one or more roles this node holds
   std::uint64_t incarnation = 0;    // a peer raises its own to refute suspicion
   Liveness liveness = Liveness::alive;
 };

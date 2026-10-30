@@ -23,7 +23,9 @@ namespace tier::net {
 // application messages.
 class Node {
  public:
-  Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
+  // `roles` is the set of roles this node holds (tier::core::role_bit(...),
+  // OR'd for several). A plain participant passes role_bit(Role::client).
+  Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
        const std::string& ip, std::uint16_t port,
        tier::core::SwimConfig swim = {});
 

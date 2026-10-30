@@ -16,8 +16,8 @@ void check(bool ok, const char* what) {
 }
 
 tier::net::Node make_node(tier::core::Role role) {
-  return tier::net::Node(tier::crypto::NodeIdentity::generate(), role,
-                         "127.0.0.1", 0);
+  return tier::net::Node(tier::crypto::NodeIdentity::generate(),
+                         tier::core::role_bit(role), "127.0.0.1", 0);
 }
 
 }  // namespace
