@@ -1,0 +1,45 @@
+[Unit]
+Description=Tier node daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/tier/tier-node.env
+# Long-term Ed25519 seed lives under the systemd StateDirectory (/var/lib/tier).
+Environment=TIER_ID_FILE=%S/tier/node_key
+ExecStart=/usr/bin/tier-node $TIER_ARGS
+Restart=on-failure
+RestartSec=2
+
+# Dedicated transient service account; persistent state in /var/lib/tier (0700).
+DynamicUser=yes
+StateDirectory=tier
+StateDirectoryMode=0700
+
+# Hardening.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

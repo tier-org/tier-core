@@ -17,6 +17,14 @@ option(TIER_FUZZ "Build libFuzzer targets (requires Clang)" OFF)
 # Single statically-linked node binary; vendored deps build static too.
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build shared libraries" FORCE)
 
+# Directories created implicitly by install() must be world-readable (0755),
+# independent of the build user's umask; otherwise the packaged /usr, /etc, ...
+# inherit a restrictive mode that would be wrong in the .deb.
+set(CMAKE_INSTALL_DEFAULT_DIRECTORY_PERMISSIONS
+    OWNER_READ OWNER_WRITE OWNER_EXECUTE
+    GROUP_READ GROUP_EXECUTE
+    WORLD_READ WORLD_EXECUTE)
+
 include(cmake/CompilerOptions.cmake)
 include(cmake/Sanitizers.cmake)
 
@@ -38,3 +46,7 @@ add_subdirectory(tests)
 if(TIER_FUZZ)
   add_subdirectory(fuzz)
 endif()
+
+# Install rules + CPack DEB packaging (used by `cpack -G DEB` after a Release
+# build; harmless for development builds).
+include(cmake/Packaging.cmake)

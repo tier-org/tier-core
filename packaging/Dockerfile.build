@@ -1,0 +1,36 @@
+# Clean-room build on a bare Ubuntu image. It proves the documented dependency
+# set is sufficient, produces the statically linked binary, runs the tests, and
+# builds the .deb. From the repo root:
+#
+#   docker build -f packaging/Dockerfile.build -t tier-build .
+#   docker run --rm -v "$PWD/out:/out" tier-build sh -c 'cp /src/build/*.deb /out/'
+#
+# Base is 22.04 to set the glibc floor (2.35) so the .deb also runs on 24.04.
+# Ubuntu 22.04 ships CMake 3.22 (< the required 3.25), so CMake comes from pip.
+FROM ubuntu:22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        ninja-build \
+        git \
+        dpkg-dev \
+        file \
+        ca-certificates \
+        python3-pip \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip3 install --no-cache-dir "cmake>=3.25"
+
+WORKDIR /src
+COPY . .
+
+RUN cmake -S . -B build -G Ninja \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DTIER_SANITIZE=OFF \
+        -DTIER_WERROR=OFF \
+        -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++" \
+ && cmake --build build \
+ && ctest --test-dir build --output-on-failure \
+ && ( cd build && cpack -G DEB ) \
+ && echo "=== ldd ===" && ldd build/apps/node/tier-node \
+ && echo "=== deb contents ===" && dpkg -c build/*.deb

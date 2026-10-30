@@ -1,0 +1,54 @@
+name: release
+
+# Build the static binary and publish a .deb to a GitHub Release whenever a
+# version tag is pushed. Built on Ubuntu 22.04 so the glibc floor stays at 2.35
+# (runs on 22.04 and 24.04).
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  deb:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build dpkg-dev file
+          # The hosted ubuntu-22.04 runner already provides CMake >= 3.25.
+
+      - name: Version from tag
+        run: echo "TIER_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTIER_SANITIZE=OFF \
+            -DTIER_WERROR=OFF \
+            -DTIER_VERSION="$TIER_VERSION" \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure
+
+      - name: Package
+        run: cd build && cpack -G DEB
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.deb
+          fail_on_unmatched_files: true
+          generate_release_notes: true

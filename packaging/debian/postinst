@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    # Enable for boot, but do not start now: the operator sets the bootstrap
+    # seed in /etc/tier/tier-node.env first, then starts the service.
+    systemctl enable tier-node.service >/dev/null 2>&1 || true
+    echo "tier-node: edit /etc/tier/tier-node.env, then: systemctl start tier-node" >&2
+fi
+
+exit 0
