@@ -15,7 +15,7 @@ jobs:
   deb:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -47,8 +47,6 @@ jobs:
         run: cd build && cpack -G DEB
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: build/*.deb
-          fail_on_unmatched_files: true
-          generate_release_notes: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build/*.deb --generate-notes
