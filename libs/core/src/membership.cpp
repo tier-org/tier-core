@@ -26,9 +26,9 @@ bool Membership::apply(const PeerInfo& update) {
   }
 
   PeerInfo merged = update;
-  // Do not drop a known dial address because a liveness-only update omitted it.
-  if (merged.address.empty()) {
-    merged.address = it->second.address;
+  // Do not drop known dial addresses because a liveness-only update omitted them.
+  if (merged.addresses.empty()) {
+    merged.addresses = it->second.addresses;
   }
   it->second = std::move(merged);
   return true;

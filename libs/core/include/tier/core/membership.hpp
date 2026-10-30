@@ -23,7 +23,11 @@ enum class Liveness : std::uint8_t { alive = 0, suspect = 1, dead = 2 };
 
 struct PeerInfo {
   PeerId id{};
-  std::string address;              // "ip:port" to dial; empty if not yet known
+  // Candidate "ip:port" endpoints to dial, one per reachable interface/family
+  // (e.g. an IPv4 and an IPv6 address). Empty if none is known yet. A node
+  // advertises every address it is reachable at so a dialer can pick one of a
+  // family it can use; a peer with a single address behaves as before.
+  std::vector<std::string> addresses;
   Role role = Role::client;
   std::uint64_t incarnation = 0;    // a peer raises its own to refute suspicion
   Liveness liveness = Liveness::alive;

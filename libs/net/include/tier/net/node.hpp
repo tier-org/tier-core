@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <optional>
 #include <span>
 #include <string>
 #include <vector>
@@ -41,6 +42,18 @@ class Node {
 
   // Invoked whenever a membership entry is newly learned or updated by a merge.
   void on_membership_change(std::function<void(const tier::core::PeerInfo&)> cb);
+
+  // Dial policy for one peer's candidate addresses (static and pure, exposed
+  // for testing). Returns the address to attempt next, or std::nullopt when
+  // nothing is dialable or an attempt is still within `retry`. IPv6 candidates
+  // are preferred; attempts to a single peer are serialized (one in flight per
+  // `retry` window) and rotate across candidates, so an unreachable family is
+  // not retried forever before the next one is tried.
+  static std::optional<std::string> select_dial_candidate(
+      const std::vector<std::string>& candidates,
+      const std::map<std::string, std::chrono::steady_clock::time_point>& dialed,
+      std::chrono::steady_clock::time_point now,
+      std::chrono::steady_clock::duration retry);
 
  private:
   void push_membership(ConnId conn);

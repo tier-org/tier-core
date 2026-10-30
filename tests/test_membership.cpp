@@ -17,7 +17,7 @@ tier::core::PeerInfo peer(std::uint8_t tag, std::uint64_t incarnation,
                           tier::core::Liveness liveness) {
   tier::core::PeerInfo info;
   info.id.fill(tag);
-  info.address = "127.0.0.1:1";
+  info.addresses = {"127.0.0.1:1"};
   info.incarnation = incarnation;
   info.liveness = liveness;
   return info;
@@ -58,6 +58,26 @@ int main() {
   // A different peer is tracked independently.
   check(m.apply(peer(0xBB, 0, Liveness::alive)), "second peer inserted");
   check(m.size() == 2, "size is 2 with two peers");
+
+  // A liveness-only update (no addresses) must not drop the known dial set.
+  {
+    tier::core::PeerInfo multi;
+    multi.id.fill(0xCC);
+    multi.addresses = {"10.0.0.1:7777", "[2001:db8::1]:7777"};
+    multi.incarnation = 5;
+    multi.liveness = Liveness::alive;
+    check(m.apply(multi), "multi-address peer inserted");
+
+    tier::core::PeerInfo liveness_only;
+    liveness_only.id.fill(0xCC);
+    liveness_only.incarnation = 6;  // higher: supersedes
+    liveness_only.liveness = Liveness::suspect;
+    check(m.apply(liveness_only), "higher-incarnation liveness update applies");
+    const auto cc = m.find(liveness_only.id);
+    check(cc && cc->addresses.size() == 2,
+          "addresses preserved across a liveness-only update");
+    check(cc && cc->liveness == Liveness::suspect, "liveness updated");
+  }
 
   if (g_failures == 0) {
     std::puts("ok");

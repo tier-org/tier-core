@@ -1,5 +1,6 @@
 #include "tier/net/node.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -66,6 +67,12 @@ bool is_dialable(const std::string& addr) {
   return addr.rfind("0.0.0.0:", 0) != 0 && addr.rfind("[::]:", 0) != 0;
 }
 
+// An IPv6 "ip:port" is bracketed ("[::1]:443"); anything else is treated as
+// IPv4. Used only to order dial candidates (prefer IPv6), never for parsing.
+bool is_ipv6(const std::string& addr) {
+  return !addr.empty() && addr.front() == '[';
+}
+
 }  // namespace
 
 Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
@@ -86,7 +93,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::Role role,
 
   tier::core::PeerInfo me;
   me.id = self_id_;
-  me.address = self_address_;
+  me.addresses = {self_address_};
   me.role = role;
   me.incarnation = 1;
   me.liveness = tier::core::Liveness::alive;
@@ -196,42 +203,106 @@ void Node::handle_observed(const tier::core::PeerId& from,
   }
   observed_[from] = msg->address;
 
-  // Tally reports and take the most-agreed address.
+  // Advertise every address confirmed by enough peers, not just one: a
+  // dual-stack node is seen at its IPv4 address by IPv4 peers and at its IPv6
+  // address by IPv6 peers, and must advertise both so either family can reach
+  // it. Tally the reports and keep each address at or above the threshold.
   std::map<std::string, std::size_t> tally;
-  const std::string* best = nullptr;
-  std::size_t best_count = 0;
   for (const auto& [peer, addr] : observed_) {
-    const std::size_t n = ++tally[addr];
-    if (n > best_count) {
-      best_count = n;
-      best = &tally.find(addr)->first;
+    ++tally[addr];
+  }
+  std::vector<std::string> confirmed;
+  for (const auto& [addr, n] : tally) {
+    if (n >= kAddressConfirmations) {
+      confirmed.push_back(addr);  // std::map keeps these sorted and unique
     }
   }
-  if (best == nullptr || best_count < kAddressConfirmations) {
+  if (confirmed.empty()) {
     return;
+  }
+  // Keep any dialable address we were started with (e.g. a concrete bind IP)
+  // alongside the observed ones.
+  if (is_dialable(self_address_) &&
+      std::find(confirmed.begin(), confirmed.end(), self_address_) ==
+          confirmed.end()) {
+    confirmed.push_back(self_address_);
+    std::sort(confirmed.begin(), confirmed.end());
   }
 
   const auto self = membership_.find(self_id_);
-  if (!self || self->address == *best) {
-    return;  // already advertising this address
+  if (!self || self->addresses == confirmed) {
+    return;  // already advertising exactly this set
   }
-  // Adopt it: raise our incarnation so the new address supersedes the old one
-  // everywhere (same mechanism SWIM uses to refute a stale report).
+  // Adopt it: raise our incarnation so the new address set supersedes the old
+  // one everywhere (the same mechanism SWIM uses to refute a stale report).
   tier::core::PeerInfo me = *self;
-  me.address = *best;
+  me.addresses = std::move(confirmed);
   me.incarnation += 1;
   me.liveness = tier::core::Liveness::alive;
-  self_address_ = me.address;
   membership_.apply(me);
   if (on_change_) {
     on_change_(me);
   }
 }
 
+std::optional<std::string> Node::select_dial_candidate(
+    const std::vector<std::string>& candidates,
+    const std::map<std::string, std::chrono::steady_clock::time_point>& dialed,
+    std::chrono::steady_clock::time_point now,
+    std::chrono::steady_clock::duration retry) {
+  using Clock = std::chrono::steady_clock;
+
+  std::vector<const std::string*> dialable;
+  for (const std::string& addr : candidates) {
+    if (is_dialable(addr)) {
+      dialable.push_back(&addr);
+    }
+  }
+  if (dialable.empty()) {
+    return std::nullopt;
+  }
+
+  // Serialize attempts to this peer: if any candidate was tried within `retry`,
+  // wait for it rather than opening a second connection to the same peer.
+  Clock::time_point last_attempt = Clock::time_point::min();
+  for (const std::string* addr : dialable) {
+    const auto it = dialed.find(*addr);
+    if (it != dialed.end()) {
+      last_attempt = std::max(last_attempt, it->second);
+    }
+  }
+  if (last_attempt != Clock::time_point::min() && now - last_attempt < retry) {
+    return std::nullopt;
+  }
+
+  // Pick the least-recently dialed candidate (never-dialed sorts oldest), so
+  // attempts rotate across families; prefer IPv6 on a tie.
+  const std::string* best = nullptr;
+  Clock::time_point best_when{};
+  for (const std::string* addr : dialable) {
+    const auto it = dialed.find(*addr);
+    const Clock::time_point when =
+        it != dialed.end() ? it->second : Clock::time_point::min();
+    bool better = false;
+    if (best == nullptr) {
+      better = true;
+    } else if (when != best_when) {
+      better = when < best_when;
+    } else {
+      better = is_ipv6(*addr) && !is_ipv6(*best);  // tie: prefer IPv6
+    }
+    if (better) {
+      best = addr;
+      best_when = when;
+    }
+  }
+  return *best;
+}
+
 void Node::autodial(std::chrono::steady_clock::time_point now) {
   for (const tier::core::PeerInfo& p : membership_.snapshot()) {
     if (p.id == self_id_ || p.liveness == tier::core::Liveness::dead ||
-        !is_dialable(p.address) || conn_by_peer_.count(p.id) != 0) {
+        conn_by_peer_.count(p.id) != 0) {
       continue;
     }
     // Tie-break: only the lower id dials, so a pair ends up with one connection
@@ -239,12 +310,12 @@ void Node::autodial(std::chrono::steady_clock::time_point now) {
     if (!(self_id_ < p.id)) {
       continue;
     }
-    const auto seen = dialed_.find(p.address);
-    if (seen != dialed_.end() && now - seen->second < kDialRetry) {
+    const auto chosen = select_dial_candidate(p.addresses, dialed_, now, kDialRetry);
+    if (!chosen) {
       continue;
     }
-    dialed_[p.address] = now;
-    const auto hp = split_host_port(p.address);
+    dialed_[*chosen] = now;
+    const auto hp = split_host_port(*chosen);
     if (!hp) {
       continue;
     }

@@ -82,10 +82,20 @@ int main() {
   for (const auto* n : {&a, &b, &c}) {
     const auto self = n->membership().find(n->peer_id());
     check(self.has_value(), "self entry present");
-    check(self && self->address.rfind("0.0.0.0:", 0) != 0,
-          "advertised address is no longer the wildcard");
-    check(self && self->address.rfind("127.0.0.1:", 0) == 0,
-          "advertised address is the observed loopback address");
+    bool has_loopback = false;
+    bool has_wildcard = false;
+    if (self) {
+      for (const auto& addr : self->addresses) {
+        if (addr.rfind("127.0.0.1:", 0) == 0) {
+          has_loopback = true;
+        }
+        if (addr.rfind("0.0.0.0:", 0) == 0) {
+          has_wildcard = true;
+        }
+      }
+    }
+    check(has_loopback, "advertised addresses include the observed loopback address");
+    check(!has_wildcard, "wildcard address is no longer advertised");
   }
 
   if (g_failures == 0) {

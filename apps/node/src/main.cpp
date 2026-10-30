@@ -20,6 +20,17 @@
 
 namespace {
 
+std::string join_addresses(const std::vector<std::string>& addresses) {
+  std::string out;
+  for (const std::string& addr : addresses) {
+    if (!out.empty()) {
+      out += ',';
+    }
+    out += addr;
+  }
+  return out;
+}
+
 const char* role_name(tier::core::Role role) {
   switch (role) {
     case tier::core::Role::client:
@@ -105,12 +116,14 @@ int usage() {
 // Long-lived participant: gossips membership and logs every peer it learns of.
 int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
              const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
-  tier::net::Node node(identity, tier::core::Role::client, "0.0.0.0", port);
+  // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
+  // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
+  tier::net::Node node(identity, tier::core::Role::client, "::", port);
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
       // Our own entry changed: we adopted a reachable address from a peer.
-      std::printf("advertising addr=%s\n", peer.address.c_str());
+      std::printf("advertising addr=%s\n", join_addresses(peer.addresses).c_str());
       std::fflush(stdout);
       return;
     }
@@ -118,12 +131,13 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
     for (const auto b : peer.id) {
       std::printf("%02x", static_cast<unsigned>(b));
     }
-    std::printf(" role=%s addr=%s\n", role_name(peer.role), peer.address.c_str());
+    std::printf(" role=%s addr=%s\n", role_name(peer.role),
+                join_addresses(peer.addresses).c_str());
     std::fflush(stdout);
   });
 
   print_hex("node id:  ", node.peer_id());
-  std::printf("listening on 0.0.0.0:%u\n", static_cast<unsigned>(node.local_port()));
+  std::printf("listening on [::]:%u\n", static_cast<unsigned>(node.local_port()));
   if (has_seed) {
     std::printf("dialing seed %s:%u\n", seed_ip, static_cast<unsigned>(seed_port));
     node.connect(seed_ip, seed_port);
@@ -157,7 +171,7 @@ bool parse_port(std::string_view text, std::uint16_t& out) {
 }
 
 int run_listen(const tier::crypto::NodeIdentity& identity, std::uint16_t port) {
-  tier::net::Endpoint ep(identity, "0.0.0.0", port);
+  tier::net::Endpoint ep(identity, "::", port);
   ep.on_handshake(
       [](tier::net::ConnId, bool, const tier::net::PeerId& peer) {
         print_hex("peer connected: ", peer);
@@ -171,7 +185,7 @@ int run_listen(const tier::crypto::NodeIdentity& identity, std::uint16_t port) {
   });
 
   print_hex("node id:  ", identity.public_key());
-  std::printf("listening on 0.0.0.0:%u\n", static_cast<unsigned>(ep.local_port()));
+  std::printf("listening on [::]:%u\n", static_cast<unsigned>(ep.local_port()));
   std::fflush(stdout);
   for (;;) {
     ep.poll(1000);
@@ -180,7 +194,7 @@ int run_listen(const tier::crypto::NodeIdentity& identity, std::uint16_t port) {
 
 int run_connect(const tier::crypto::NodeIdentity& identity, const char* ip,
                 std::uint16_t port) {
-  tier::net::Endpoint ep(identity, "0.0.0.0", 0);
+  tier::net::Endpoint ep(identity, "::", 0);
   const std::vector<tier::crypto::Byte> ping{0x70, 0x69, 0x6E, 0x67};  // "ping"
 
   bool got_echo = false;

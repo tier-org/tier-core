@@ -109,12 +109,17 @@ std::vector<std::uint8_t> encode_membership_message(
     out.push_back(static_cast<std::uint8_t>(p.role));
     put_u64(out, p.incarnation);
     out.push_back(static_cast<std::uint8_t>(p.liveness));
-    const auto addr_len =
-        static_cast<std::uint16_t>(p.address.size() > kMaxAddressLen
-                                       ? kMaxAddressLen
-                                       : p.address.size());
-    put_u16(out, addr_len);
-    out.insert(out.end(), p.address.begin(), p.address.begin() + addr_len);
+    const std::size_t addr_count =
+        p.addresses.size() > kMaxAddressesPerPeer ? kMaxAddressesPerPeer
+                                                  : p.addresses.size();
+    out.push_back(static_cast<std::uint8_t>(addr_count));
+    for (std::size_t a = 0; a < addr_count; ++a) {
+      const std::string& addr = p.addresses[a];
+      const auto addr_len = static_cast<std::uint16_t>(
+          addr.size() > kMaxAddressLen ? kMaxAddressLen : addr.size());
+      put_u16(out, addr_len);
+      out.insert(out.end(), addr.begin(), addr.begin() + addr_len);
+    }
   }
   return out;
 }
@@ -160,15 +165,22 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
     }
     p.liveness = static_cast<Liveness>(liveness);
 
-    std::uint16_t addr_len = 0;
-    if (!r.u16(addr_len) || addr_len > kMaxAddressLen) {
+    std::uint8_t addr_count = 0;
+    if (!r.u8(addr_count) || addr_count > kMaxAddressesPerPeer) {
       return std::nullopt;
     }
-    std::span<const std::uint8_t> addr_bytes;
-    if (!r.bytes(addr_len, addr_bytes)) {
-      return std::nullopt;
+    p.addresses.reserve(addr_count);
+    for (std::uint8_t a = 0; a < addr_count; ++a) {
+      std::uint16_t addr_len = 0;
+      if (!r.u16(addr_len) || addr_len > kMaxAddressLen) {
+        return std::nullopt;
+      }
+      std::span<const std::uint8_t> addr_bytes;
+      if (!r.bytes(addr_len, addr_bytes)) {
+        return std::nullopt;
+      }
+      p.addresses.emplace_back(addr_bytes.begin(), addr_bytes.end());
     }
-    p.address.assign(addr_bytes.begin(), addr_bytes.end());
 
     peers.push_back(std::move(p));
   }
