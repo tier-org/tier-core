@@ -192,6 +192,8 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
       return ControlType::ack;
     case static_cast<std::uint8_t>(ControlType::ping_req):
       return ControlType::ping_req;
+    case static_cast<std::uint8_t>(ControlType::observed_addr):
+      return ControlType::observed_addr;
     default:
       return std::nullopt;
   }
@@ -270,6 +272,37 @@ std::optional<PingReqMessage> decode_ping_req(std::span<const std::uint8_t> in) 
     return std::nullopt;
   }
   std::copy(target_bytes.begin(), target_bytes.end(), msg.target.begin());
+  return msg;
+}
+
+std::vector<std::uint8_t> encode_observed_addr(std::string_view address) {
+  std::vector<std::uint8_t> out;
+  out.push_back(static_cast<std::uint8_t>(ControlType::observed_addr));
+  const auto len = static_cast<std::uint16_t>(
+      address.size() > kMaxAddressLen ? kMaxAddressLen : address.size());
+  put_u16(out, len);
+  out.insert(out.end(), address.begin(), address.begin() + len);
+  return out;
+}
+
+std::optional<ObservedAddrMessage> decode_observed_addr(
+    std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t type = 0;
+  if (!r.u8(type) ||
+      type != static_cast<std::uint8_t>(ControlType::observed_addr)) {
+    return std::nullopt;
+  }
+  std::uint16_t addr_len = 0;
+  if (!r.u16(addr_len) || addr_len > kMaxAddressLen) {
+    return std::nullopt;
+  }
+  std::span<const std::uint8_t> addr_bytes;
+  if (!r.bytes(addr_len, addr_bytes) || !r.at_end()) {
+    return std::nullopt;
+  }
+  ObservedAddrMessage msg;
+  msg.address.assign(addr_bytes.begin(), addr_bytes.end());
   return msg;
 }
 

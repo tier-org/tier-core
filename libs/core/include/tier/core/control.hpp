@@ -3,6 +3,8 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <vector>
 
 #include "tier/core/membership.hpp"
@@ -10,14 +12,18 @@
 namespace tier::core {
 
 // Control-plane (node-to-node) message types.
-//   membership - an anti-entropy snapshot of the known-peers table.
-//   ping/ack   - SWIM direct liveness probe and its reply.
-//   ping_req   - SWIM indirect probe: "ping this target for me and relay its ack".
+//   membership    - an anti-entropy snapshot of the known-peers table.
+//   ping/ack      - SWIM direct liveness probe and its reply.
+//   ping_req      - SWIM indirect probe: "ping this target for me and relay its ack".
+//   observed_addr - "this is the ip:port I saw your connection come from"; the
+//                   receiver uses it to learn its own externally reachable
+//                   address (it binds a wildcard and cannot know this itself).
 enum class ControlType : std::uint8_t {
   membership = 1,
   ping = 2,
   ack = 3,
   ping_req = 4,
+  observed_addr = 5,
 };
 
 // Peek the control type of a received message without decoding it. Returns
@@ -62,6 +68,18 @@ std::vector<std::uint8_t> encode_ping_req(std::uint64_t seq, const PeerId& targe
 std::optional<PingMessage> decode_ping(std::span<const std::uint8_t> in);
 std::optional<AckMessage> decode_ack(std::span<const std::uint8_t> in);
 std::optional<PingReqMessage> decode_ping_req(std::span<const std::uint8_t> in);
+
+// --- observed-address message ----------------------------------------------
+// [type:1][addr_len:2 BE][addr:addr_len], addr_len <= kMaxAddressLen. The
+// address is an "ip:port" string (IPv6 bracketed, "[::1]:443").
+
+struct ObservedAddrMessage {
+  std::string address;
+};
+
+std::vector<std::uint8_t> encode_observed_addr(std::string_view address);
+std::optional<ObservedAddrMessage> decode_observed_addr(
+    std::span<const std::uint8_t> in);
 
 // Bounds (reject absurd inputs rather than allocate on an attacker's word).
 inline constexpr std::uint32_t kMaxPeersPerMessage = 4096;

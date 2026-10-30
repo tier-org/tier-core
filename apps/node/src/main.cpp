@@ -1,5 +1,6 @@
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -105,7 +106,14 @@ int usage() {
 int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
              const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
   tier::net::Node node(identity, tier::core::Role::client, "0.0.0.0", port);
-  node.on_membership_change([](const tier::core::PeerInfo& peer) {
+  const tier::core::PeerId self = node.peer_id();
+  node.on_membership_change([self](const tier::core::PeerInfo& peer) {
+    if (peer.id == self) {
+      // Our own entry changed: we adopted a reachable address from a peer.
+      std::printf("advertising addr=%s\n", peer.address.c_str());
+      std::fflush(stdout);
+      return;
+    }
     std::fputs("discovered peer ", stdout);
     for (const auto b : peer.id) {
       std::printf("%02x", static_cast<unsigned>(b));
@@ -122,8 +130,18 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   }
   std::fflush(stdout);
 
+  // Periodically report how many peers we know of versus how many we actually
+  // hold a connection to, so mesh formation is visible at a glance.
+  auto last_status = std::chrono::steady_clock::now();
   for (;;) {
     node.poll(200);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last_status >= std::chrono::seconds(2)) {
+      std::printf("status: known=%zu connected=%zu\n", node.membership().size(),
+                  node.connected_peers().size());
+      std::fflush(stdout);
+      last_status = now;
+    }
   }
 }
 

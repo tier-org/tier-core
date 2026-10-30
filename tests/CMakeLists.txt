@@ -43,3 +43,8 @@ add_executable(test_swim_net test_swim_net.cpp)
 target_link_libraries(test_swim_net PRIVATE tier::net tier::core tier::crypto tier::options)
 add_test(NAME swim_net COMMAND test_swim_net)
 set_tests_properties(swim_net PROPERTIES TIMEOUT 60)
+
+add_executable(test_mesh test_mesh.cpp)
+target_link_libraries(test_mesh PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME mesh COMMAND test_mesh)
+set_tests_properties(mesh PROPERTIES TIMEOUT 60)

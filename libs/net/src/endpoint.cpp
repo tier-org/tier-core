@@ -15,7 +15,9 @@
 #include <cstdint>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -83,6 +85,29 @@ PeerId extract_peer_id(WOLFSSL* ssl) {
 bool sockaddr_equal(const sockaddr_storage& a, socklen_t alen,
                     const sockaddr_storage& b, socklen_t blen) noexcept {
   return alen == blen && std::memcmp(&a, &b, alen) == 0;
+}
+
+// Render a connection's remote address as a dialable "ip:port" string. The
+// socket is dual-stack, so the stored address is always AF_INET6; an IPv4 peer
+// arrives as a v4-mapped address and is printed in plain v4 form so the string
+// round-trips back through fill_sockaddr unchanged.
+std::string format_remote(const sockaddr_storage& ss) {
+  const auto* const sin6 = reinterpret_cast<const sockaddr_in6*>(&ss);
+  const unsigned port = ntohs(sin6->sin6_port);
+  if (IN6_IS_ADDR_V4MAPPED(&sin6->sin6_addr)) {
+    in_addr v4{};
+    std::memcpy(&v4, sin6->sin6_addr.s6_addr + 12, sizeof(v4));
+    std::array<char, INET_ADDRSTRLEN> buf{};
+    if (inet_ntop(AF_INET, &v4, buf.data(), buf.size()) == nullptr) {
+      return {};
+    }
+    return std::string(buf.data()) + ":" + std::to_string(port);
+  }
+  std::array<char, INET6_ADDRSTRLEN> buf{};
+  if (inet_ntop(AF_INET6, &sin6->sin6_addr, buf.data(), buf.size()) == nullptr) {
+    return {};
+  }
+  return "[" + std::string(buf.data()) + "]:" + std::to_string(port);
 }
 
 int accept_verify_cb(int /*preverify_ok*/, WOLFSSL_X509_STORE_CTX* /*ctx*/) {
@@ -197,6 +222,7 @@ struct Endpoint::Impl {
   void send(ConnId id, std::span<const Byte> payload);
   void broadcast(std::span<const Byte> payload);
   std::vector<std::pair<ConnId, PeerId>> connections() const;
+  std::optional<std::string> remote_address(ConnId id) const;
 
   std::vector<std::unique_ptr<Connection>> conns;
   std::function<void(ConnId, bool, const PeerId&)> on_handshake;
@@ -789,6 +815,15 @@ std::vector<std::pair<ConnId, PeerId>> Endpoint::Impl::connections() const {
   return out;
 }
 
+std::optional<std::string> Endpoint::Impl::remote_address(ConnId id) const {
+  for (const auto& c : conns) {
+    if (c->id == id && !c->closing) {
+      return format_remote(c->remote);
+    }
+  }
+  return std::nullopt;
+}
+
 void Endpoint::Impl::poll(int timeout_ms) {
   std::array<epoll_event, 2> events{};
   const int n = ::epoll_wait(epoll_fd, events.data(),
@@ -832,6 +867,10 @@ std::size_t Endpoint::completed_handshakes() const noexcept {
 
 std::vector<std::pair<ConnId, PeerId>> Endpoint::connections() const {
   return impl_->connections();
+}
+
+std::optional<std::string> Endpoint::remote_address(ConnId conn) const {
+  return impl_->remote_address(conn);
 }
 
 std::string Endpoint::last_negotiated_group() const { return impl_->last_group; }

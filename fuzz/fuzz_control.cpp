@@ -13,5 +13,6 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
   static_cast<void>(tier::core::decode_ping(in));
   static_cast<void>(tier::core::decode_ack(in));
   static_cast<void>(tier::core::decode_ping_req(in));
+  static_cast<void>(tier::core::decode_observed_addr(in));
   return 0;
 }

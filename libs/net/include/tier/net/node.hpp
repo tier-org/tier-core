@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "tier/core/membership.hpp"
 #include "tier/core/swim.hpp"
@@ -34,12 +36,22 @@ class Node {
 
   [[nodiscard]] const tier::core::Membership& membership() const noexcept;
 
+  // Peers this node currently holds a live connection to (handshake complete).
+  [[nodiscard]] std::vector<tier::core::PeerId> connected_peers() const;
+
   // Invoked whenever a membership entry is newly learned or updated by a merge.
   void on_membership_change(std::function<void(const tier::core::PeerInfo&)> cb);
 
  private:
   void push_membership(ConnId conn);
   void merge_message(std::span<const tier::crypto::Byte> payload);
+  // Record a peer's report of the address it observes us at; adopt it as our
+  // advertised address once enough peers agree.
+  void handle_observed(const tier::core::PeerId& from,
+                       std::span<const tier::crypto::Byte> payload);
+  // Dial known peers we have learned of but are not yet connected to, forming a
+  // mesh out of transitive discovery.
+  void autodial(std::chrono::steady_clock::time_point now);
 
   tier::crypto::NodeIdentity identity_;
   tier::core::PeerId self_id_;
@@ -51,6 +63,11 @@ class Node {
   // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;
+  // Per reporting peer, the address it claims to observe us at (observed_addr).
+  std::map<tier::core::PeerId, std::string> observed_;
+  // Per dialed "ip:port", when we last issued a connect, to rate-limit redials
+  // and avoid a duplicate connection to a peer whose handshake is still pending.
+  std::map<std::string, std::chrono::steady_clock::time_point> dialed_;
   tier::core::FailureDetector fd_;
 };
 

@@ -236,7 +236,8 @@ bool FailureDetector::handle(Clock::time_point now, const PeerId& from,
       return true;
     }
     case ControlType::membership:
-      return false;  // not ours; the caller runs anti-entropy
+    case ControlType::observed_addr:
+      return false;  // not ours; the caller handles these
   }
   return false;
 }

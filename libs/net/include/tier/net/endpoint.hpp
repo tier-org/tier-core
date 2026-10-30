@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <utility>
@@ -56,6 +57,11 @@ class Endpoint {
   // routing and neighbor set from this each cycle, so reaped connections drop
   // out on their own.
   [[nodiscard]] std::vector<std::pair<ConnId, PeerId>> connections() const;
+
+  // The remote address of a connection as this endpoint observes it on the
+  // wire ("ip:port"), or std::nullopt if the handle is unknown. This is what we
+  // report to the peer so it can learn its own reachable address.
+  [[nodiscard]] std::optional<std::string> remote_address(ConnId conn) const;
 
   // Name of the key-exchange group negotiated by the most recently completed
   // handshake (e.g. "X25519MLKEM768"), or empty if none has completed.
