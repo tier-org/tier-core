@@ -61,7 +61,10 @@ std::optional<std::pair<std::string, std::uint16_t>> split_host_port(
 
 // Addresses we never dial: unset, or a wildcard a peer has not yet corrected.
 bool is_dialable(const std::string& addr) {
-  if (addr.empty()) {
+  // A real dial string starts with a host: an IPv4 digit or a bracketed "[".
+  // Anything starting with ':' has no host - ":port" (empty bind) or ":::port"
+  // (the "::" wildcard glued to a port) - and is never a reachable address.
+  if (addr.empty() || addr.front() == ':') {
     return false;
   }
   return addr.rfind("0.0.0.0:", 0) != 0 && addr.rfind("[::]:", 0) != 0;
@@ -93,7 +96,12 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
 
   tier::core::PeerInfo me;
   me.id = self_id_;
-  me.addresses = {self_address_};
+  // Advertise a bind address only if it is concrete. On a wildcard bind ("::"
+  // or "0.0.0.0") self_address_ is not a reachable address, so start with an
+  // empty set and adopt the real one once a peer reports it (handle_observed).
+  if (is_dialable(self_address_)) {
+    me.addresses = {self_address_};
+  }
   me.roles = roles;
   me.incarnation = 1;
   me.liveness = tier::core::Liveness::alive;

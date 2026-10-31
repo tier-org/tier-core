@@ -67,6 +67,10 @@ int main() {
         "server advertises its IPv4 address");
   check(advertises_prefix(server, "[::1]:"),
         "server advertises its IPv6 address");
+  // The wildcard bind address itself (":::port") must never be advertised: it
+  // is not a reachable address, only the concrete observed ones are.
+  check(!advertises_prefix(server, ":"),
+        "server does not advertise the wildcard bind address");
 
   if (g_failures == 0) {
     std::puts("ok");
