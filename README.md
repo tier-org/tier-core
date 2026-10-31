@@ -51,18 +51,19 @@ Build-time:
   enough CMake; Ubuntu 22.04 ships 3.22, so install a newer one there (pip,
   snap, or Kitware's apt repo).
 - Git, for the vendored submodules
+- Perl, to build the vendored OpenSSL (its `Configure` is a Perl script)
 - for packaging a `.deb`: `dpkg-dev` and `file`
 
-On Debian/Ubuntu: `apt-get install build-essential cmake git ninja-build`.
+On Debian/Ubuntu: `apt-get install build-essential cmake git ninja-build perl`.
 
-wolfSSL and ngtcp2 are vendored as git submodules under `vendor/` and built
-from source, so clone with submodules:
+OpenSSL (3.5) and ngtcp2 are vendored as git submodules under `vendor/` and
+built from source, so clone with submodules:
 
     git clone --recurse-submodules <url>
     # or, in an existing checkout:
     git submodule update --init --recursive
 
-Runtime: only `libc6`. wolfSSL, ngtcp2, libstdc++ and libgcc are linked
+Runtime: only `libc6`. OpenSSL, ngtcp2, libstdc++ and libgcc are linked
 statically into the binary.
 
 ## Build
@@ -125,6 +126,18 @@ port 7777; a node that is itself a seed skips its own address, and a connection
 to self is dropped regardless. Seed identities are not pinned: a peer's identity
 is authenticated by the TLS handshake, so a wrong address fails closed rather
 than impersonating a seed (key pinning is a possible later hardening).
+
+## Diagnostics (tierctl)
+
+The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
+`$TIER_ADMIN_SOCK`). `tierctl` talks to it over that socket, read-only for now:
+
+    sudo tierctl peers        # the node's view of the mesh: known vs connected
+
+Each row is a peer: short id, whether a live connection is held, liveness, roles
+and advertised addresses. The socket is local only (service user and root) and
+is never exposed on the network. The wire is the project's compact binary codec,
+one request and one response per connection.
 
 ## Node requirements
 
@@ -192,3 +205,10 @@ Where these come from:
 
 The keeper (paid encrypted storage) and transmitter (relay) roles will get their
 own profiles - storage-heavy and bandwidth-heavy respectively - when they land.
+
+## License
+
+Apache License 2.0 (see `LICENSE` and `NOTICE`). Commercial use, use in open or
+closed source, and redistribution are permitted; keep the `NOTICE` attribution.
+Vendored components keep their own licenses: OpenSSL 3.5 (Apache-2.0) and ngtcp2
+(MIT), both permissive.

@@ -72,3 +72,12 @@ add_executable(test_symmetric test_symmetric.cpp)
 target_link_libraries(test_symmetric PRIVATE tier::net tier::crypto tier::options)
 add_test(NAME symmetric COMMAND test_symmetric)
 set_tests_properties(symmetric PROPERTIES TIMEOUT 30)
+
+add_executable(test_admin test_admin.cpp)
+target_link_libraries(test_admin PRIVATE tier::core tier::options)
+add_test(NAME admin COMMAND test_admin)
+
+add_executable(test_admin_listener test_admin_listener.cpp)
+target_link_libraries(test_admin_listener PRIVATE tier::net tier::core tier::options)
+add_test(NAME admin_listener COMMAND test_admin_listener)
+set_tests_properties(admin_listener PROPERTIES TIMEOUT 30)

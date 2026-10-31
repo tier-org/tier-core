@@ -2,24 +2,37 @@
 
 #include <algorithm>
 #include <cstddef>
-#include <cstdio>
-#include <utility>
+#include <memory>
+#include <stdexcept>
 #include <vector>
 
-// wolf_backend.hpp includes <wolfssl/options.h> first; that must precede every
-// other wolfSSL header, so asn_public.h is included only after it.
-#include "wolf_backend.hpp"
+#include <openssl/evp.h>
+#include <openssl/x509.h>
 
-#include <wolfssl/wolfcrypt/asn_public.h>
-
+#include "openssl_backend.hpp"
 #include "tier/crypto/ed25519.hpp"
 
 namespace tier::crypto {
 namespace {
 
-// Generous upper bound for a DER-encoded Ed25519 self-signed certificate
-// (key + signature are 32/64 bytes; the rest is a small fixed structure).
-constexpr std::size_t kMaxCertificateDer = 2048;
+detail::EvpPkey pkey_from_seed(const Ed25519Seed& seed) {
+  detail::EvpPkey pkey(EVP_PKEY_new_raw_private_key(
+      EVP_PKEY_ED25519, nullptr, seed.data(), seed.size()));
+  if (!pkey) {
+    detail::throw_ossl("EVP_PKEY_new_raw_private_key");
+  }
+  return pkey;
+}
+
+Ed25519PublicKey public_from_pkey(EVP_PKEY* pkey) {
+  Ed25519PublicKey pub{};
+  std::size_t len = pub.size();
+  if (EVP_PKEY_get_raw_public_key(pkey, pub.data(), &len) != 1 ||
+      len != pub.size()) {
+    detail::throw_ossl("EVP_PKEY_get_raw_public_key");
+  }
+  return pub;
+}
 
 }  // namespace
 
@@ -27,113 +40,78 @@ NodeIdentity::NodeIdentity(Ed25519Signer signer) noexcept
     : signer_(std::move(signer)) {}
 
 NodeIdentity NodeIdentity::generate() {
-  detail::Rng rng;
-  detail::Ed25519Key key;
-
-  const int make_rc = wc_ed25519_make_key(rng.get(), ED25519_KEY_SIZE, key.get());
-  if (make_rc != 0) {
-    detail::throw_wolf("wc_ed25519_make_key", make_rc);
+  detail::EvpPkey pkey(EVP_PKEY_Q_keygen(nullptr, nullptr, "ED25519"));
+  if (!pkey) {
+    detail::throw_ossl("EVP_PKEY_Q_keygen");
   }
-
   Ed25519Seed seed{};
-  auto seed_len = static_cast<word32>(seed.size());
-  const int seed_rc = wc_ed25519_export_private_only(key.get(), seed.data(), &seed_len);
-  if (seed_rc != 0) {
-    detail::throw_wolf("wc_ed25519_export_private_only", seed_rc);
+  std::size_t len = seed.size();
+  if (EVP_PKEY_get_raw_private_key(pkey.get(), seed.data(), &len) != 1 ||
+      len != seed.size()) {
+    detail::throw_ossl("EVP_PKEY_get_raw_private_key");
   }
-
-  Ed25519PublicKey pub{};
-  auto pub_len = static_cast<word32>(pub.size());
-  const int pub_rc = wc_ed25519_export_public(key.get(), pub.data(), &pub_len);
-  if (pub_rc != 0) {
-    detail::throw_wolf("wc_ed25519_export_public", pub_rc);
-  }
-
-  return NodeIdentity(Ed25519Signer(seed, pub));
+  return NodeIdentity(Ed25519Signer(seed, public_from_pkey(pkey.get())));
 }
 
 NodeIdentity NodeIdentity::from_seed(ByteSpan seed) {
   if (seed.size() != kEd25519SeedSize) {
     throw std::invalid_argument("Ed25519 seed must be 32 bytes");
   }
-
-  detail::Ed25519Key key;
-  const int import_rc = wc_ed25519_import_private_only(
-      seed.data(), static_cast<word32>(seed.size()), key.get());
-  if (import_rc != 0) {
-    detail::throw_wolf("wc_ed25519_import_private_only", import_rc);
-  }
-
-  Ed25519PublicKey pub{};
-  const int make_pub_rc =
-      wc_ed25519_make_public(key.get(), pub.data(), static_cast<word32>(pub.size()));
-  if (make_pub_rc != 0) {
-    detail::throw_wolf("wc_ed25519_make_public", make_pub_rc);
-  }
-
   Ed25519Seed seed_copy{};
   std::copy(seed.begin(), seed.end(), seed_copy.begin());
-  return NodeIdentity(Ed25519Signer(seed_copy, pub));
+  detail::EvpPkey pkey = pkey_from_seed(seed_copy);
+  return NodeIdentity(Ed25519Signer(seed_copy, public_from_pkey(pkey.get())));
 }
 
 std::vector<Byte> NodeIdentity::self_signed_certificate_der() const {
-  detail::Rng rng;
-  detail::Ed25519Key key;
+  detail::EvpPkey pkey = pkey_from_seed(seed());
 
-  const int import_rc = wc_ed25519_import_private_key(
-      seed().data(), static_cast<word32>(seed().size()),
-      public_key().data(), static_cast<word32>(public_key().size()), key.get());
-  if (import_rc != 0) {
-    detail::throw_wolf("wc_ed25519_import_private_key", import_rc);
+  std::unique_ptr<X509, decltype(&X509_free)> cert(X509_new(), X509_free);
+  if (!cert) {
+    detail::throw_ossl("X509_new");
+  }
+  X509_set_version(cert.get(), 2);  // X.509 v3
+  ASN1_INTEGER_set(X509_get_serialNumber(cert.get()), 1);
+  X509_gmtime_adj(X509_getm_notBefore(cert.get()), 0);
+  X509_gmtime_adj(X509_getm_notAfter(cert.get()), 3650L * 24 * 3600);
+  if (X509_set_pubkey(cert.get(), pkey.get()) != 1) {
+    detail::throw_ossl("X509_set_pubkey");
+  }
+  X509_NAME* name = X509_get_subject_name(cert.get());
+  X509_NAME_add_entry_by_txt(name, "CN", MBSTRING_ASC,
+                             reinterpret_cast<const unsigned char*>("tierd"), -1,
+                             -1, 0);
+  X509_set_issuer_name(cert.get(), name);  // self-signed: issuer == subject
+  // Ed25519 (PureEdDSA) is signed with a NULL message digest.
+  if (X509_sign(cert.get(), pkey.get(), nullptr) == 0) {
+    detail::throw_ossl("X509_sign");
   }
 
-  Cert cert;
-  const int init_rc = wc_InitCert(&cert);
-  if (init_rc != 0) {
-    detail::throw_wolf("wc_InitCert", init_rc);
+  unsigned char* der = nullptr;
+  const int len = i2d_X509(cert.get(), &der);
+  if (len <= 0) {
+    detail::throw_ossl("i2d_X509");
   }
-  cert.sigType = CTC_ED25519;
-  cert.daysValid = 3650;
-  cert.isCA = 0;
-  std::snprintf(cert.subject.commonName, CTC_NAME_SIZE, "%s", "tierd");
-
-  std::vector<Byte> der(kMaxCertificateDer);
-  const int body_sz = wc_MakeCert_ex(&cert, der.data(),
-                                     static_cast<word32>(der.size()),
-                                     ED25519_TYPE, key.get(), rng.get());
-  if (body_sz < 0) {
-    detail::throw_wolf("wc_MakeCert_ex", body_sz);
-  }
-
-  const int total_sz = wc_SignCert_ex(cert.bodySz, cert.sigType, der.data(),
-                                      static_cast<word32>(der.size()),
-                                      ED25519_TYPE, key.get(), rng.get());
-  if (total_sz < 0) {
-    detail::throw_wolf("wc_SignCert_ex", total_sz);
-  }
-
-  der.resize(static_cast<std::size_t>(total_sz));
-  return der;
+  std::vector<Byte> out(der, der + len);
+  OPENSSL_free(der);
+  return out;
 }
 
 std::vector<Byte> NodeIdentity::private_key_pkcs8_der() const {
-  detail::Ed25519Key key;
-  const int import_rc = wc_ed25519_import_private_key(
-      seed().data(), static_cast<word32>(seed().size()),
-      public_key().data(), static_cast<word32>(public_key().size()), key.get());
-  if (import_rc != 0) {
-    detail::throw_wolf("wc_ed25519_import_private_key", import_rc);
+  detail::EvpPkey pkey = pkey_from_seed(seed());
+  std::unique_ptr<PKCS8_PRIV_KEY_INFO, decltype(&PKCS8_PRIV_KEY_INFO_free)> p8(
+      EVP_PKEY2PKCS8(pkey.get()), PKCS8_PRIV_KEY_INFO_free);
+  if (!p8) {
+    detail::throw_ossl("EVP_PKEY2PKCS8");
   }
-
-  // An Ed25519 PKCS#8 private key is well under 128 bytes.
-  std::vector<Byte> der(128);
-  const int len =
-      wc_Ed25519PrivateKeyToDer(key.get(), der.data(), static_cast<word32>(der.size()));
-  if (len < 0) {
-    detail::throw_wolf("wc_Ed25519PrivateKeyToDer", len);
+  unsigned char* der = nullptr;
+  const int len = i2d_PKCS8_PRIV_KEY_INFO(p8.get(), &der);
+  if (len <= 0) {
+    detail::throw_ossl("i2d_PKCS8_PRIV_KEY_INFO");
   }
-  der.resize(static_cast<std::size_t>(len));
-  return der;
+  std::vector<Byte> out(der, der + len);
+  OPENSSL_free(der);
+  return out;
 }
 
 }  // namespace tier::crypto
