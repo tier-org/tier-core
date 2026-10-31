@@ -17,7 +17,7 @@ using Ed25519PublicKey = std::array<Byte, kEd25519PublicKeySize>;
 using Ed25519Seed = std::array<Byte, kEd25519SeedSize>;
 
 // Ed25519 signature verifier. Holds only the 32-byte public key; the backend
-// key object is rebuilt per call, so no wolfSSL type appears in this header.
+// key object is rebuilt per call, so no OpenSSL type appears in this header.
 class Ed25519Verifier final : public Verifier {
  public:
   explicit Ed25519Verifier(const Ed25519PublicKey& public_key) noexcept;

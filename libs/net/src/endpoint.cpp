@@ -22,12 +22,17 @@
 #include <utility>
 #include <vector>
 
-#include <wolfssl/options.h>
-#include <wolfssl/ssl.h>
+#include <mutex>
+
+#include <openssl/err.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <ngtcp2/ngtcp2.h>
 #include <ngtcp2/ngtcp2_crypto.h>
-#include <ngtcp2/ngtcp2_crypto_wolfssl.h>
+#include <ngtcp2/ngtcp2_crypto_ossl.h>
 
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/identity.hpp"
@@ -39,7 +44,8 @@ using Byte = tier::crypto::Byte;
 namespace {
 
 constexpr std::size_t kCidLen = 16;
-constexpr char kAlpn[] = "tier/0";  // wire ALPN identifier for v0
+// ALPN in TLS wire form: a length-prefixed protocol name. "tier/0" is v0.
+constexpr unsigned char kAlpnWire[] = {6, 't', 'i', 'e', 'r', '/', '0'};
 constexpr std::size_t kMaxUdpPayload = 1452;
 
 // Application framing: a 4-byte big-endian length prefix followed by the
@@ -63,23 +69,23 @@ ngtcp2_tstamp timestamp() noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
 }
 
-PeerId extract_peer_id(WOLFSSL* ssl) {
+PeerId extract_peer_id(SSL* ssl) {
   PeerId id{};
-  WOLFSSL_X509* const cert = wolfSSL_get_peer_certificate(ssl);
+  X509* const cert = SSL_get1_peer_certificate(ssl);
   if (cert == nullptr) {
     return id;
   }
-  std::array<unsigned char, 256> buf{};
-  int sz = static_cast<int>(buf.size());
-  // The SubjectPublicKeyInfo of an Ed25519 certificate ends with the 32-byte
-  // raw public key, which is the peer's identity.
-  if (wolfSSL_X509_get_pubkey_buffer(cert, buf.data(), &sz) == WOLFSSL_SUCCESS &&
-      sz >= static_cast<int>(tier::crypto::kEd25519PublicKeySize)) {
-    const auto offset = static_cast<std::size_t>(sz) - tier::crypto::kEd25519PublicKeySize;
-    std::copy_n(buf.begin() + static_cast<std::ptrdiff_t>(offset),
-                tier::crypto::kEd25519PublicKeySize, id.begin());
+  // The peer's identity is the raw Ed25519 public key in the certificate.
+  EVP_PKEY* const pkey = X509_get0_pubkey(cert);  // not owned by us
+  if (pkey != nullptr) {
+    std::array<unsigned char, tier::crypto::kEd25519PublicKeySize> buf{};
+    std::size_t len = buf.size();
+    if (EVP_PKEY_get_raw_public_key(pkey, buf.data(), &len) == 1 &&
+        len == tier::crypto::kEd25519PublicKeySize) {
+      std::copy_n(buf.begin(), tier::crypto::kEd25519PublicKeySize, id.begin());
+    }
   }
-  wolfSSL_X509_free(cert);
+  X509_free(cert);
   return id;
 }
 
@@ -106,10 +112,21 @@ std::string format_remote(const sockaddr_storage& ss) {
   return "[" + std::string(buf.data()) + "]:" + std::to_string(port);
 }
 
-int accept_verify_cb(int /*preverify_ok*/, WOLFSSL_X509_STORE_CTX* /*ctx*/) {
+int accept_verify_cb(int /*preverify_ok*/, X509_STORE_CTX* /*ctx*/) {
   // Self-signed node certificates never chain to a CA. Identity is checked out
   // of band from the key in the certificate, so accept the chain here.
   return 1;
+}
+
+// ALPN selection on the server: pick "tier/0" if the client offered it.
+int alpn_select_cb(SSL* /*ssl*/, const unsigned char** out, unsigned char* outlen,
+                   const unsigned char* in, unsigned int inlen, void* /*arg*/) {
+  if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, kAlpnWire,
+                            sizeof(kAlpnWire), in,
+                            inlen) != OPENSSL_NPN_NEGOTIATED) {
+    return SSL_TLSEXT_ERR_ALERT_FATAL;
+  }
+  return SSL_TLSEXT_ERR_OK;
 }
 
 }  // namespace
@@ -119,7 +136,8 @@ struct Endpoint::Impl {
     Impl* ep = nullptr;
     ConnId id = 0;
     ngtcp2_conn* conn = nullptr;
-    WOLFSSL* ssl = nullptr;
+    SSL* ssl = nullptr;
+    ngtcp2_crypto_ossl_ctx* ossl_ctx = nullptr;  // ngtcp2 ossl per-conn wrapper
     ngtcp2_crypto_conn_ref conn_ref{};
     sockaddr_storage remote{};
     socklen_t remotelen = 0;
@@ -158,8 +176,13 @@ struct Endpoint::Impl {
       if (conn != nullptr) {
         ngtcp2_conn_del(conn);
       }
+      // ngtcp2_crypto_ossl_ctx_del frees only its own buffers, not the SSL,
+      // which we own and free ourselves.
+      if (ossl_ctx != nullptr) {
+        ngtcp2_crypto_ossl_ctx_del(ossl_ctx);
+      }
       if (ssl != nullptr) {
-        wolfSSL_free(ssl);
+        SSL_free(ssl);
       }
     }
     Connection(const Connection&) = delete;
@@ -228,8 +251,8 @@ struct Endpoint::Impl {
   sockaddr_storage local_addr{};
   socklen_t local_addrlen = 0;
 
-  WOLFSSL_CTX* server_ctx = nullptr;
-  WOLFSSL_CTX* client_ctx = nullptr;
+  SSL_CTX* server_ctx = nullptr;
+  SSL_CTX* client_ctx = nullptr;
   std::vector<Byte> cert_der;
   std::vector<Byte> key_der;
   PeerId self_pubkey{};  // our own identity, to drop connections to self
@@ -254,7 +277,7 @@ struct Endpoint::Impl {
 namespace {
 
 void rand_cb(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) {
-  wolfSSL_RAND_bytes(dest, static_cast<int>(destlen));
+  RAND_bytes(dest, static_cast<int>(destlen));
 }
 
 // Grant enough stream/flow-control budget that a peer can open an application
@@ -297,46 +320,62 @@ void fill_sockaddr(sockaddr_storage& ss, socklen_t& len, const std::string& ip,
   throw std::runtime_error("invalid IP address: " + ip);
 }
 
-WOLFSSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
-                      const std::vector<Byte>& key_der) {
-  WOLFSSL_CTX* const ctx = wolfSSL_CTX_new(
-      server ? wolfTLSv1_3_server_method() : wolfTLSv1_3_client_method());
+SSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
+                  const std::vector<Byte>& key_der) {
+  SSL_CTX* const ctx =
+      SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
   if (ctx == nullptr) {
-    throw std::runtime_error("wolfSSL_CTX_new failed");
+    throw std::runtime_error("SSL_CTX_new failed");
   }
-
-  const int cfg_rc = server ? ngtcp2_crypto_wolfssl_configure_server_context(ctx)
-                            : ngtcp2_crypto_wolfssl_configure_client_context(ctx);
-  if (cfg_rc != 0) {
-    wolfSSL_CTX_free(ctx);
-    throw std::runtime_error("ngtcp2_crypto_wolfssl_configure_*_context failed");
-  }
+  SSL_CTX_set_min_proto_version(ctx, TLS1_3_VERSION);
+  SSL_CTX_set_max_proto_version(ctx, TLS1_3_VERSION);
 
   // Post-quantum key exchange: hybrid X25519 + ML-KEM-768. Classical X25519 is
   // offered as a fallback so a peer without ML-KEM can still connect.
-  if (wolfSSL_CTX_set1_groups_list(ctx, "X25519MLKEM768:X25519") != WOLFSSL_SUCCESS) {
-    wolfSSL_CTX_free(ctx);
-    throw std::runtime_error("wolfSSL_CTX_set1_groups_list failed");
+  if (SSL_CTX_set1_groups_list(ctx, "X25519MLKEM768:X25519") != 1) {
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("SSL_CTX_set1_groups_list failed");
   }
 
-  if (wolfSSL_CTX_use_certificate_buffer(ctx, cert_der.data(),
-                                         static_cast<long>(cert_der.size()),
-                                         WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS ||
-      wolfSSL_CTX_use_PrivateKey_buffer(ctx, key_der.data(),
-                                        static_cast<long>(key_der.size()),
-                                        WOLFSSL_FILETYPE_ASN1) != WOLFSSL_SUCCESS) {
-    wolfSSL_CTX_free(ctx);
-    throw std::runtime_error("loading node certificate/key into wolfSSL failed");
+  // Load the node's self-signed certificate and Ed25519 key (DER from
+  // tier::crypto). SSL_CTX_use_* take their own references, so we free ours.
+  const unsigned char* cp = cert_der.data();
+  X509* const cert = d2i_X509(nullptr, &cp, static_cast<long>(cert_der.size()));
+  if (cert == nullptr || SSL_CTX_use_certificate(ctx, cert) != 1) {
+    if (cert != nullptr) {
+      X509_free(cert);
+    }
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("loading node certificate failed");
   }
+  X509_free(cert);
+
+  const unsigned char* kp = key_der.data();
+  PKCS8_PRIV_KEY_INFO* const p8 =
+      d2i_PKCS8_PRIV_KEY_INFO(nullptr, &kp, static_cast<long>(key_der.size()));
+  EVP_PKEY* const pkey = p8 != nullptr ? EVP_PKCS82PKEY(p8) : nullptr;
+  if (p8 != nullptr) {
+    PKCS8_PRIV_KEY_INFO_free(p8);
+  }
+  if (pkey == nullptr || SSL_CTX_use_PrivateKey(ctx, pkey) != 1) {
+    if (pkey != nullptr) {
+      EVP_PKEY_free(pkey);
+    }
+    SSL_CTX_free(ctx);
+    throw std::runtime_error("loading node private key failed");
+  }
+  EVP_PKEY_free(pkey);
 
   if (server) {
     // Request the peer's certificate (mutual auth); the key in it is the
-    // identity. The chain itself is self-signed, so accept it unconditionally.
-    wolfSSL_CTX_set_verify(
-        ctx, WOLFSSL_VERIFY_PEER | WOLFSSL_VERIFY_FAIL_IF_NO_PEER_CERT,
-        accept_verify_cb);
+    // identity. The chain is self-signed, so accept it unconditionally.
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
+                       accept_verify_cb);
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, nullptr);
   } else {
-    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, nullptr);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
+    // Client advertises its single ALPN protocol (0 = success here).
+    SSL_CTX_set_alpn_protos(ctx, kAlpnWire, sizeof(kAlpnWire));
   }
 
   return ctx;
@@ -399,11 +438,11 @@ int Endpoint::Impl::get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid,
                                              ngtcp2_stateless_reset_token* token,
                                              std::size_t cidlen,
                                              void* user_data) {
-  if (wolfSSL_RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) {
+  if (RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
   cid->datalen = cidlen;
-  if (wolfSSL_RAND_bytes(reinterpret_cast<unsigned char*>(token),
+  if (RAND_bytes(reinterpret_cast<unsigned char*>(token),
                          NGTCP2_STATELESS_RESET_TOKENLEN) != 1) {
     return NGTCP2_ERR_CALLBACK_FAILURE;
   }
@@ -452,6 +491,15 @@ Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
     : cert_der(identity.self_signed_certificate_der()),
       key_der(identity.private_key_pkcs8_der()),
       self_pubkey(identity.public_key()) {
+  // The ngtcp2 ossl backend needs a one-time global init (sets up the SSL
+  // ex_data slots it uses); do it once for the whole process.
+  static std::once_flag ossl_once;
+  std::call_once(ossl_once, [] {
+    if (ngtcp2_crypto_ossl_init() != 0) {
+      throw std::runtime_error("ngtcp2_crypto_ossl_init failed");
+    }
+  });
+
   // One AF_INET6 dual-stack socket: with IPV6_V6ONLY off it serves native IPv6
   // and IPv4 (as v4-mapped addresses) at once.
   udp_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -497,9 +545,9 @@ Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
 }
 
 Endpoint::Impl::~Impl() {
-  conns.clear();  // delete ngtcp2 conns / wolfSSL sessions before contexts
-  if (client_ctx != nullptr) wolfSSL_CTX_free(client_ctx);
-  if (server_ctx != nullptr) wolfSSL_CTX_free(server_ctx);
+  conns.clear();  // delete ngtcp2 conns / SSL sessions before contexts
+  if (client_ctx != nullptr) SSL_CTX_free(client_ctx);
+  if (server_ctx != nullptr) SSL_CTX_free(server_ctx);
   if (timer_fd >= 0) ::close(timer_fd);
   if (epoll_fd >= 0) ::close(epoll_fd);
   if (udp_fd >= 0) ::close(udp_fd);
@@ -520,21 +568,29 @@ ngtcp2_path Endpoint::Impl::make_path(Connection& c) noexcept {
 }
 
 void Endpoint::Impl::setup_tls(Connection& c, bool server) {
-  c.ssl = wolfSSL_new(server ? server_ctx : client_ctx);
+  c.ssl = SSL_new(server ? server_ctx : client_ctx);
   if (c.ssl == nullptr) {
-    throw std::runtime_error("wolfSSL_new failed");
+    throw std::runtime_error("SSL_new failed");
   }
-  wolfSSL_set_app_data(c.ssl, &c.conn_ref);
+  // The crypto callbacks reach the ngtcp2_conn through the SSL app data.
+  SSL_set_app_data(c.ssl, &c.conn_ref);
   if (server) {
-    wolfSSL_set_accept_state(c.ssl);
+    SSL_set_accept_state(c.ssl);
   } else {
-    wolfSSL_set_connect_state(c.ssl);
+    SSL_set_connect_state(c.ssl);
   }
-  wolfSSL_UseALPN(c.ssl, const_cast<char*>(kAlpn),
-                  static_cast<unsigned int>(std::strlen(kAlpn)),
-                  WOLFSSL_ALPN_FAILED_ON_MISMATCH);
-  wolfSSL_set_quic_transport_version(c.ssl, 0x39);  // QUIC v1 transport params
-  ngtcp2_conn_set_tls_native_handle(c.conn, c.ssl);
+  // ALPN and the TLS 1.3 / PQ groups are configured on the SSL_CTX; QUIC
+  // transport params are wired by configure_*_session below. The ossl ctx is
+  // the native handle ngtcp2 drives.
+  if (ngtcp2_crypto_ossl_ctx_new(&c.ossl_ctx, c.ssl) != 0) {
+    throw std::runtime_error("ngtcp2_crypto_ossl_ctx_new failed");
+  }
+  ngtcp2_conn_set_tls_native_handle(c.conn, c.ossl_ctx);
+  const int cfg = server ? ngtcp2_crypto_ossl_configure_server_session(c.ssl)
+                         : ngtcp2_crypto_ossl_configure_client_session(c.ssl);
+  if (cfg != 0) {
+    throw std::runtime_error("ngtcp2_crypto_ossl_configure_session failed");
+  }
 }
 
 void Endpoint::Impl::connect(const std::string& ip, std::uint16_t port) {
@@ -548,8 +604,8 @@ void Endpoint::Impl::connect(const std::string& ip, std::uint16_t port) {
   ngtcp2_cid scid{};
   dcid.datalen = kCidLen;
   scid.datalen = kCidLen;
-  wolfSSL_RAND_bytes(dcid.data, static_cast<int>(kCidLen));
-  wolfSSL_RAND_bytes(scid.data, static_cast<int>(kCidLen));
+  RAND_bytes(dcid.data, static_cast<int>(kCidLen));
+  RAND_bytes(scid.data, static_cast<int>(kCidLen));
 
   ngtcp2_settings settings;
   ngtcp2_settings_default(&settings);
@@ -621,7 +677,7 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
 
   ngtcp2_cid scid{};
   scid.datalen = kCidLen;
-  wolfSSL_RAND_bytes(scid.data, static_cast<int>(kCidLen));
+  RAND_bytes(scid.data, static_cast<int>(kCidLen));
 
   ngtcp2_cid dcid{};
   ngtcp2_cid_init(&dcid, vcid.scid, vcid.scidlen);
@@ -817,7 +873,7 @@ void Endpoint::Impl::note_handshake(Connection& c) {
     c.closing = true;
     return;
   }
-  const char* const group = wolfSSL_get_curve_name(c.ssl);
+  const char* const group = SSL_get0_group_name(c.ssl);
   last_group = group != nullptr ? group : "";
   ++completed;
 

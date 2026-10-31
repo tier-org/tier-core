@@ -16,6 +16,9 @@ RestartSec=2
 DynamicUser=yes
 StateDirectory=tier
 StateDirectoryMode=0700
+# Runtime dir for the local admin socket (/run/tierd/tierd.sock), service-owned.
+RuntimeDirectory=tierd
+RuntimeDirectoryMode=0750
 
 # Hardening.
 NoNewPrivileges=yes

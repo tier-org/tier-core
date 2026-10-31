@@ -2,6 +2,7 @@ add_library(tier_core STATIC
   src/version.cpp
   src/membership.cpp
   src/control.cpp
+  src/admin.cpp
   src/swim.cpp)
 add_library(tier::core ALIAS tier_core)
 

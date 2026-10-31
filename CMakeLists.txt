@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
-project(tier-core LANGUAGES C CXX VERSION 0.2.0)
+
+# Single source of truth for the version: the top-level VERSION file. Git-
+# agnostic (no `git describe`), readable by non-CMake tooling (`cat VERSION`),
+# and embedded into the binary via tier::core (TIER_VERSION). The release tag
+# should be v$(cat VERSION); CI may assert they match.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" TIER_VERSION_STR LIMIT_COUNT 1)
+project(tier-core LANGUAGES C CXX VERSION ${TIER_VERSION_STR})
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -31,7 +37,7 @@ include(cmake/Sanitizers.cmake)
 # Vendored dependencies (configured, then built uninstrumented). Added after the
 # Tier interface targets so sanitizer/warning flags on tier::options never reach
 # third-party code.
-include(cmake/Wolfssl.cmake)
+include(cmake/Openssl.cmake)
 include(cmake/Ngtcp2.cmake)
 
 enable_testing()

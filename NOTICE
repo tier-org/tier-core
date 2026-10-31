@@ -1,0 +1,14 @@
+Tier (tier-core)
+Copyright 2026 Eugene Khashin and the Tier contributors
+
+This product includes software developed as part of the Tier project
+(https://github.com/tier-org/tier-core), licensed under the Apache License,
+Version 2.0 (see the LICENSE file).
+
+Attribution: products and services built on Tier should credit "Tier" (the
+tier-core network stack).
+
+This software statically links third-party components, each under its own
+license:
+  - OpenSSL 3.5  -  Apache License 2.0  (https://www.openssl.org/)
+  - ngtcp2       -  MIT License         (https://github.com/ngtcp2/ngtcp2)

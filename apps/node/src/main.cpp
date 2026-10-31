@@ -4,18 +4,22 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <exception>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
 #include <system_error>
 #include <vector>
 
+#include "tier/core/admin.hpp"
 #include "tier/core/membership.hpp"
 #include "tier/core/seeds.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/crypto/primitives.hpp"
+#include "tier/net/admin_listener.hpp"
 #include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
 
@@ -76,6 +80,16 @@ std::string resolve_id_path() {
     return std::string(home) + "/.local/state/tier/node_key";
   }
   return "tier_node_key";
+}
+
+// Where the local admin/diagnostics socket lives. Overridable with
+// TIER_ADMIN_SOCK; the default matches the systemd unit's RuntimeDirectory
+// (/run/tierd, created for the service user).
+std::string resolve_admin_path() {
+  if (const char* const env = std::getenv("TIER_ADMIN_SOCK"); env != nullptr) {
+    return env;
+  }
+  return "/run/tierd/tierd.sock";
 }
 
 // Load the node identity from a 32-byte seed file, creating (and persisting) a
@@ -171,11 +185,35 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   }
   std::fflush(stdout);
 
+  // Local admin/diagnostics socket for tierctl. Optional: if it cannot be set
+  // up (e.g. the runtime directory is missing outside systemd) the node runs
+  // without it rather than failing. The handler answers from the live view.
+  std::optional<tier::net::AdminListener> admin;
+  const std::string admin_path = resolve_admin_path();
+  try {
+    admin.emplace(admin_path);
+    std::printf("admin socket: %s\n", admin_path.c_str());
+  } catch (const std::exception& e) {
+    std::printf("admin socket disabled (%s)\n", e.what());
+  }
+  std::fflush(stdout);
+  const auto admin_handler =
+      [&node](tier::core::AdminOp op) -> std::vector<std::uint8_t> {
+    if (op == tier::core::AdminOp::peers) {
+      return tier::core::encode_admin_peers(node.membership().snapshot(),
+                                            node.connected_peers());
+    }
+    return {};
+  };
+
   // Periodically report how many peers we know of versus how many we actually
   // hold a connection to, so mesh formation is visible at a glance.
   auto last_status = std::chrono::steady_clock::now();
   for (;;) {
     node.poll(200);
+    if (admin) {
+      admin->serve(admin_handler);
+    }
     const auto now = std::chrono::steady_clock::now();
     if (now - last_status >= std::chrono::seconds(2)) {
       std::printf("status: known=%zu connected=%zu\n", node.membership().size(),

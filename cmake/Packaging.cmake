@@ -23,13 +23,14 @@ install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.env"
 set(TIER_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version")
 
 set(CPACK_GENERATOR "DEB")
+set(CPACK_STRIP_FILES TRUE)  # strip symbols from the packaged binary for size
 set(CPACK_PACKAGE_NAME "tierd")
 set(CPACK_PACKAGE_VERSION "${TIER_VERSION}")
 set(CPACK_PACKAGE_CONTACT "Eugene Khashin <adastreamer@gmail.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Node daemon for Tier, a decentralized encrypted messaging/payments network")
 set(CPACK_DEBIAN_PACKAGE_DESCRIPTION
-    "Node daemon for Tier, a decentralized network for encrypted messaging and payments. QUIC transport (ngtcp2 + wolfSSL) with Ed25519 certificate-bound identity, managed by systemd.")
+    "Node daemon for Tier, a decentralized network for encrypted messaging and payments. QUIC transport (ngtcp2 + OpenSSL) with Ed25519 certificate-bound identity, managed by systemd.")
 
 set(CPACK_DEBIAN_PACKAGE_MAINTAINER "Eugene Khashin <adastreamer@gmail.com>")
 set(CPACK_DEBIAN_PACKAGE_SECTION "net")

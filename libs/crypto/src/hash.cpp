@@ -1,26 +1,19 @@
 #include "tier/crypto/hash.hpp"
 
+#include <cstddef>
 #include <stdexcept>
-#include <string>
 
-#include <wolfssl/options.h>
-#include <wolfssl/wolfcrypt/sha256.h>
+#include <openssl/evp.h>
 
 namespace tier::crypto {
 
 Digest256 sha256(ByteSpan data) {
   Digest256 out{};
-  wc_Sha256 sha;
-  int rc = wc_InitSha256(&sha);
-  if (rc == 0) {
-    rc = wc_Sha256Update(&sha, data.data(), static_cast<word32>(data.size()));
-  }
-  if (rc == 0) {
-    rc = wc_Sha256Final(&sha, out.data());
-  }
-  wc_Sha256Free(&sha);
-  if (rc != 0) {
-    throw std::runtime_error("wolfSSL SHA-256 failed: " + std::to_string(rc));
+  std::size_t out_len = out.size();
+  if (EVP_Q_digest(nullptr, "SHA256", nullptr, data.data(), data.size(),
+                   out.data(), &out_len) != 1 ||
+      out_len != out.size()) {
+    throw std::runtime_error("OpenSSL SHA-256 failed");
   }
   return out;
 }

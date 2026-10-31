@@ -1,5 +1,5 @@
 # ASan + UBSan apply to Tier's own code only, carried on the tier::options
-# interface target rather than globally. Vendored dependencies (wolfSSL) must
+# interface target rather than globally. Vendored dependencies (OpenSSL) must
 # stay uninstrumented: UBSan with -fno-sanitize-recover would abort on
 # constructs that are legal in audited C crypto code (intentional unsigned
 # wraparound, type punning), and the fuzzing discipline targets our own
