@@ -19,6 +19,8 @@ StateDirectoryMode=0700
 # Runtime dir for the local admin socket (/run/tierd/tierd.sock), service-owned.
 RuntimeDirectory=tierd
 RuntimeDirectoryMode=0750
+# AF_UNIX below is required for that admin socket; without it socket() fails
+# with EAFNOSUPPORT and the diagnostics socket is silently disabled.
 
 # Hardening.
 NoNewPrivileges=yes
@@ -32,7 +34,7 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
-RestrictAddressFamilies=AF_INET AF_INET6
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
