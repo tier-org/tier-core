@@ -112,6 +112,21 @@ StateDirectory). It joins through the preconfigured seeds below, so no seed
 argument is required; an explicit `<seed_ip> <seed_port>` in `TIER_ARGS` is
 dialed in addition.
 
+### Cutting a release
+
+The top-level `VERSION` file is the single source of truth for the version
+(CMake reads it; the binary reports it). Do not edit `VERSION` by hand: bump it
+only through the script, which also makes the commit and the matching tag so the
+file and the tag can never drift:
+
+    scripts/release.sh <X.Y.Z | patch | minor | major> [--push]
+
+It validates the bump (semver, strictly forward, clean tree on `main` in sync
+with origin, tag not already taken), writes `VERSION`, commits it as `X.Y.Z`,
+and tags the commit `vX.Y.Z`. Without `--push` it stops there and prints the
+push command; `--push` pushes the commit and the tag, which triggers the release
+workflow. That workflow refuses to build if `VERSION` does not match the tag.
+
 ## Network seeds
 
 The bootstrap seeds are compiled into the binary - `libs/core/include/tier/core/seeds.hpp`

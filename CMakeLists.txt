@@ -2,8 +2,10 @@ cmake_minimum_required(VERSION 3.25)
 
 # Single source of truth for the version: the top-level VERSION file. Git-
 # agnostic (no `git describe`), readable by non-CMake tooling (`cat VERSION`),
-# and embedded into the binary via tier::core (TIER_VERSION). The release tag
-# should be v$(cat VERSION); CI may assert they match.
+# and embedded into the binary via tier::core (TIER_VERSION). The release tag is
+# v$(cat VERSION); the release workflow asserts they match. Do not edit VERSION
+# by hand - bump it only through scripts/release.sh (see README "Cutting a
+# release"), which commits and tags it together.
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" TIER_VERSION_STR LIMIT_COUNT 1)
 project(tier-core LANGUAGES C CXX VERSION ${TIER_VERSION_STR})
 

@@ -19,6 +19,17 @@ jobs:
         with:
           submodules: recursive
 
+      # The committed VERSION file is the single source of truth and must match
+      # the tag being released. Bump both atomically with scripts/release.sh;
+      # this guard fails the build if a tag was ever cut by hand out of sync.
+      - name: Guard VERSION matches tag
+        run: |
+          file_ver="v$(head -n1 VERSION | tr -d '[:space:]')"
+          if [ "$file_ver" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::VERSION ($file_ver) != release tag ($GITHUB_REF_NAME); bump via scripts/release.sh"
+            exit 1
+          fi
+
       - name: Install build tooling
         run: |
           sudo apt-get update
