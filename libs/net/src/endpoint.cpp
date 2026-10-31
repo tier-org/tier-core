@@ -14,6 +14,7 @@
 #include <deque>
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -82,11 +83,6 @@ PeerId extract_peer_id(WOLFSSL* ssl) {
   return id;
 }
 
-bool sockaddr_equal(const sockaddr_storage& a, socklen_t alen,
-                    const sockaddr_storage& b, socklen_t blen) noexcept {
-  return alen == blen && std::memcmp(&a, &b, alen) == 0;
-}
-
 // Render a connection's remote address as a dialable "ip:port" string. The
 // socket is dual-stack, so the stored address is always AF_INET6; an IPv4 peer
 // arrives as a v4-mapped address and is printed in plain v4 form so the string
@@ -131,6 +127,13 @@ struct Endpoint::Impl {
     bool handshake_done = false;
     bool closing = false;
     PeerId peer_id{};
+
+    // Connection IDs this endpoint advertises for this connection (the initial
+    // SCID plus any later ones from get_new_connection_id). A peer sends to one
+    // of these as the packet's Destination Connection ID, which is how inbound
+    // packets are routed back to this connection. Kept so they can be removed
+    // from the endpoint's CID index when the connection is reaped.
+    std::vector<std::string> cids;
 
     // One application stream per connection in v0. Outbound bytes live in a
     // queue of immovable chunks: ngtcp2 does not copy stream data when we hand
@@ -179,7 +182,14 @@ struct Endpoint::Impl {
   // --- internals ---
   void setup_tls(Connection& c, bool server);
   ngtcp2_path make_path(Connection& c) noexcept;
-  Connection* find_by_remote(const sockaddr_storage& ra, socklen_t ral) noexcept;
+  // Route inbound packets by QUIC Destination Connection ID, not by peer
+  // address: a single socket both dials and accepts, so two peers can hold
+  // connections to each other's address at once and only the CID tells them
+  // apart. register_cid/unregister_cid maintain the index as ngtcp2 issues and
+  // retires the SCIDs we advertise.
+  void register_cid(Connection& c, const std::uint8_t* cid, std::size_t len);
+  void unregister_cid(const std::uint8_t* cid, std::size_t len) noexcept;
+  Connection* find_by_cid(const std::uint8_t* cid, std::size_t len) noexcept;
   void drain_reads();
   void route_packet(const std::uint8_t* data, std::size_t len,
                     const sockaddr_storage& ra, socklen_t ral);
@@ -205,6 +215,11 @@ struct Endpoint::Impl {
                                          std::uint64_t offset,
                                          std::uint64_t datalen, void* user_data,
                                          void* stream_user_data);
+  static int get_new_connection_id_cb(ngtcp2_conn* conn, ngtcp2_cid* cid,
+                                      ngtcp2_stateless_reset_token* token,
+                                      std::size_t cidlen, void* user_data);
+  static int remove_connection_id_cb(ngtcp2_conn* conn, const ngtcp2_cid* cid,
+                                     void* user_data);
   static ngtcp2_callbacks make_callbacks(bool server);
 
   int udp_fd = -1;
@@ -217,6 +232,10 @@ struct Endpoint::Impl {
   WOLFSSL_CTX* client_ctx = nullptr;
   std::vector<Byte> cert_der;
   std::vector<Byte> key_der;
+  PeerId self_pubkey{};  // our own identity, to drop connections to self
+
+  // Destination Connection ID (as raw bytes) -> owning connection.
+  std::map<std::string, ConnId> conn_by_cid;
 
   Connection* find_by_id(ConnId id) noexcept;
   void send(ConnId id, std::span<const Byte> payload);
@@ -236,20 +255,6 @@ namespace {
 
 void rand_cb(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) {
   wolfSSL_RAND_bytes(dest, static_cast<int>(destlen));
-}
-
-int get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid,
-                             ngtcp2_stateless_reset_token* token, std::size_t cidlen,
-                             void*) {
-  if (wolfSSL_RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) {
-    return NGTCP2_ERR_CALLBACK_FAILURE;
-  }
-  cid->datalen = cidlen;
-  if (wolfSSL_RAND_bytes(reinterpret_cast<unsigned char*>(token),
-                         NGTCP2_STATELESS_RESET_TOKENLEN) != 1) {
-    return NGTCP2_ERR_CALLBACK_FAILURE;
-  }
-  return 0;
 }
 
 // Grant enough stream/flow-control budget that a peer can open an application
@@ -390,6 +395,32 @@ int Endpoint::Impl::recv_stream_data_cb(ngtcp2_conn* conn, std::uint32_t,
   return 0;
 }
 
+int Endpoint::Impl::get_new_connection_id_cb(ngtcp2_conn*, ngtcp2_cid* cid,
+                                             ngtcp2_stateless_reset_token* token,
+                                             std::size_t cidlen,
+                                             void* user_data) {
+  if (wolfSSL_RAND_bytes(cid->data, static_cast<int>(cidlen)) != 1) {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+  cid->datalen = cidlen;
+  if (wolfSSL_RAND_bytes(reinterpret_cast<unsigned char*>(token),
+                         NGTCP2_STATELESS_RESET_TOKENLEN) != 1) {
+    return NGTCP2_ERR_CALLBACK_FAILURE;
+  }
+  // Index this CID so inbound packets carrying it as DCID route to this conn.
+  auto* const c = static_cast<Connection*>(user_data);
+  c->ep->register_cid(*c, cid->data, cid->datalen);
+  return 0;
+}
+
+int Endpoint::Impl::remove_connection_id_cb(ngtcp2_conn*, const ngtcp2_cid* cid,
+                                            void* user_data) {
+  // A CID we advertised has been retired by the peer: drop it from the index.
+  auto* const c = static_cast<Connection*>(user_data);
+  c->ep->unregister_cid(cid->data, cid->datalen);
+  return 0;
+}
+
 ngtcp2_callbacks Endpoint::Impl::make_callbacks(bool server) {
   ngtcp2_callbacks cb{};
   if (server) {
@@ -411,6 +442,7 @@ ngtcp2_callbacks Endpoint::Impl::make_callbacks(bool server) {
   cb.version_negotiation = ngtcp2_crypto_version_negotiation_cb;
   cb.handshake_completed = handshake_completed_cb;
   cb.get_new_connection_id2 = get_new_connection_id_cb;
+  cb.remove_connection_id = remove_connection_id_cb;
   cb.get_path_challenge_data2 = ngtcp2_crypto_get_path_challenge_data2_cb;
   return cb;
 }
@@ -418,7 +450,8 @@ ngtcp2_callbacks Endpoint::Impl::make_callbacks(bool server) {
 Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
                      const std::string& ip, std::uint16_t port)
     : cert_der(identity.self_signed_certificate_der()),
-      key_der(identity.private_key_pkcs8_der()) {
+      key_der(identity.private_key_pkcs8_der()),
+      self_pubkey(identity.public_key()) {
   // One AF_INET6 dual-stack socket: with IPV6_V6ONLY off it serves native IPv6
   // and IPv4 (as v4-mapped addresses) at once.
   udp_fd = ::socket(AF_INET6, SOCK_DGRAM | SOCK_NONBLOCK, 0);
@@ -540,17 +573,31 @@ void Endpoint::Impl::connect(const std::string& ip, std::uint16_t port) {
   }
 
   setup_tls(*c, false);
+  // Peers address their reply packets to our SCID; index it so they route back.
+  register_cid(*c, scid.data, scid.datalen);
   conns.push_back(std::move(c));
 }
 
-Endpoint::Impl::Connection* Endpoint::Impl::find_by_remote(
-    const sockaddr_storage& ra, socklen_t ral) noexcept {
-  for (auto& c : conns) {
-    if (!c->closing && sockaddr_equal(c->remote, c->remotelen, ra, ral)) {
-      return c.get();
-    }
+void Endpoint::Impl::register_cid(Connection& c, const std::uint8_t* cid,
+                                  std::size_t len) {
+  std::string key(reinterpret_cast<const char*>(cid), len);
+  conn_by_cid[key] = c.id;
+  c.cids.push_back(std::move(key));
+}
+
+void Endpoint::Impl::unregister_cid(const std::uint8_t* cid,
+                                    std::size_t len) noexcept {
+  conn_by_cid.erase(std::string(reinterpret_cast<const char*>(cid), len));
+}
+
+Endpoint::Impl::Connection* Endpoint::Impl::find_by_cid(
+    const std::uint8_t* cid, std::size_t len) noexcept {
+  const auto it = conn_by_cid.find(
+      std::string(reinterpret_cast<const char*>(cid), len));
+  if (it == conn_by_cid.end()) {
+    return nullptr;
   }
-  return nullptr;
+  return find_by_id(it->second);  // nullptr if the conn is closing/reaped
 }
 
 Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
@@ -600,6 +647,11 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
   }
 
   setup_tls(*c, true);
+  // Index both our SCID (which the client uses once it sees our reply) and the
+  // client's original DCID (which its retransmitted Initials still carry until
+  // then), so every packet of this handshake routes back to this connection.
+  register_cid(*c, scid.data, scid.datalen);
+  register_cid(*c, vcid.dcid, vcid.dcidlen);
   Connection* const raw = c.get();
   conns.push_back(std::move(c));
   return raw;
@@ -607,8 +659,21 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
 
 void Endpoint::Impl::route_packet(const std::uint8_t* data, std::size_t len,
                                   const sockaddr_storage& ra, socklen_t ral) {
-  Connection* c = find_by_remote(ra, ral);
+  // Demultiplex by Destination Connection ID. A short-header packet has no
+  // version and its DCID length is implicit, so kCidLen is supplied.
+  ngtcp2_version_cid vcid{};
+  const int drc = ngtcp2_pkt_decode_version_cid(&vcid, data, len, kCidLen);
+  if (drc == NGTCP2_ERR_VERSION_NEGOTIATION) {
+    return;  // v0 speaks one QUIC version; we do not negotiate
+  }
+  if (drc != 0) {
+    return;  // malformed header
+  }
+
+  Connection* c = find_by_cid(vcid.dcid, vcid.dcidlen);
   if (c == nullptr) {
+    // Unknown DCID: a new peer-initiated handshake if it is an Initial we can
+    // accept, otherwise a stray packet (e.g. for a reaped connection) we drop.
     c = accept_server(data, len, ra, ral);
     if (c == nullptr) {
       return;
@@ -727,6 +792,13 @@ void Endpoint::Impl::arm_timer() {
 }
 
 void Endpoint::Impl::reap_closed() {
+  for (const auto& c : conns) {
+    if (c->closing) {
+      for (const std::string& key : c->cids) {
+        conn_by_cid.erase(key);
+      }
+    }
+  }
   std::erase_if(conns, [](const std::unique_ptr<Connection>& c) {
     return c->closing;
   });
@@ -738,6 +810,13 @@ void Endpoint::Impl::note_handshake(Connection& c) {
   }
   c.handshake_done = true;
   c.peer_id = extract_peer_id(c.ssl);
+  if (c.peer_id == self_pubkey) {
+    // A connection to ourselves (a seed can dial its own public address before
+    // it knows that address is its own). Drop it rather than count or surface
+    // it; nothing above this layer should ever see a self peer.
+    c.closing = true;
+    return;
+  }
   const char* const group = wolfSSL_get_curve_name(c.ssl);
   last_group = group != nullptr ? group : "";
   ++completed;

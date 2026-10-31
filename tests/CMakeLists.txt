@@ -67,3 +67,8 @@ add_executable(test_seeds test_seeds.cpp)
 target_link_libraries(test_seeds PRIVATE tier::net tier::core tier::crypto tier::options)
 add_test(NAME seeds COMMAND test_seeds)
 set_tests_properties(seeds PROPERTIES TIMEOUT 60)
+
+add_executable(test_symmetric test_symmetric.cpp)
+target_link_libraries(test_symmetric PRIVATE tier::net tier::crypto tier::options)
+add_test(NAME symmetric COMMAND test_symmetric)
+set_tests_properties(symmetric PROPERTIES TIMEOUT 30)
