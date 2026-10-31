@@ -95,7 +95,7 @@ std::vector<Byte> NodeIdentity::self_signed_certificate_der() const {
   cert.sigType = CTC_ED25519;
   cert.daysValid = 3650;
   cert.isCA = 0;
-  std::snprintf(cert.subject.commonName, CTC_NAME_SIZE, "%s", "tier-node");
+  std::snprintf(cert.subject.commonName, CTC_NAME_SIZE, "%s", "tierd");
 
   std::vector<Byte> der(kMaxCertificateDer);
   const int body_sz = wc_MakeCert_ex(&cert, der.data(),

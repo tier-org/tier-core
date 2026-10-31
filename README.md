@@ -81,7 +81,7 @@ AddressSanitizer and UndefinedBehaviorSanitizer are on by default
       -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
     cmake --build build -j
 
-`build/apps/node/tier-node` then links only against glibc (`ldd` shows just
+`build/apps/node/tierd` then links only against glibc (`ldd` shows just
 `libc`/`libm`). glibc stays dynamic on purpose - a fully static glibc binary
 breaks NSS name resolution.
 
@@ -102,9 +102,9 @@ Docker (or CI) path for artifacts you distribute.
 Pushing a `vX.Y.Z` tag triggers `.github/workflows/release.yml`, which builds
 the package and attaches the `.deb` to a GitHub Release. To install and run:
 
-    sudo dpkg -i tier-node_X.Y.Z_amd64.deb
-    sudoedit /etc/tier/tier-node.env      # set TIER_ARGS: listen port, optional seed
-    sudo systemctl start tier-node
+    sudo dpkg -i tierd_X.Y.Z_amd64.deb
+    sudoedit /etc/tier/tierd.env      # set TIER_ARGS: listen port, optional seed
+    sudo systemctl start tierd
 
 The node stores its Ed25519 identity under `/var/lib/tier` (systemd
 StateDirectory). It joins through the preconfigured seeds below, so no seed

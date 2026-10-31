@@ -2,7 +2,7 @@
 set -e
 
 if [ "$1" = "remove" ] || [ "$1" = "purge" ]; then
-    systemctl disable tier-node.service >/dev/null 2>&1 || true
+    systemctl disable tierd.service >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 fi
 

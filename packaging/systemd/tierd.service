@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-EnvironmentFile=/etc/tier/tier-node.env
+EnvironmentFile=/etc/tier/tierd.env
 # Long-term Ed25519 seed lives under the systemd StateDirectory (/var/lib/tier).
 Environment=TIER_ID_FILE=%S/tier/node_key
-ExecStart=/usr/bin/tier-node $TIER_ARGS
+ExecStart=/usr/bin/tierd $TIER_ARGS
 Restart=on-failure
 RestartSec=2
 

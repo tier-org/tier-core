@@ -32,5 +32,5 @@ RUN cmake -S . -B build -G Ninja \
  && cmake --build build \
  && ctest --test-dir build --output-on-failure \
  && ( cd build && cpack -G DEB ) \
- && echo "=== ldd ===" && ldd build/apps/node/tier-node \
+ && echo "=== ldd ===" && ldd build/apps/node/tierd \
  && echo "=== deb contents ===" && dpkg -c build/*.deb

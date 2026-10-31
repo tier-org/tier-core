@@ -1,5 +1,5 @@
 # Debian packaging via CPack. Produces a single .deb carrying the statically
-# linked tier-node binary, a hardened systemd unit, and a default environment
+# linked tierd binary, a hardened systemd unit, and a default environment
 # file. Driven by `cpack -G DEB` from the build tree after a Release build.
 #
 # The vendored transport/crypto (ngtcp2, wolfSSL) and the C++ runtime are linked
@@ -13,9 +13,9 @@ include(GNUInstallDirs)
 # systemd unit and the operator-editable environment file. The unit goes to
 # ${libdir}/systemd/system (/usr/lib/systemd/system under the /usr prefix CPack
 # uses); the env file is an absolute-path conffile under /etc.
-install(FILES "${CMAKE_SOURCE_DIR}/packaging/systemd/tier-node.service"
+install(FILES "${CMAKE_SOURCE_DIR}/packaging/systemd/tierd.service"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/system")
-install(FILES "${CMAKE_SOURCE_DIR}/packaging/tier-node.env"
+install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.env"
         DESTINATION "/etc/tier")
 
 # Package version: PROJECT_VERSION by default, overridden from the git tag in CI
@@ -23,7 +23,7 @@ install(FILES "${CMAKE_SOURCE_DIR}/packaging/tier-node.env"
 set(TIER_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version")
 
 set(CPACK_GENERATOR "DEB")
-set(CPACK_PACKAGE_NAME "tier-node")
+set(CPACK_PACKAGE_NAME "tierd")
 set(CPACK_PACKAGE_VERSION "${TIER_VERSION}")
 set(CPACK_PACKAGE_CONTACT "Eugene Khashin <adastreamer@gmail.com>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
@@ -36,7 +36,7 @@ set(CPACK_DEBIAN_PACKAGE_SECTION "net")
 set(CPACK_DEBIAN_PACKAGE_PRIORITY "optional")
 # Derive the libc6 (>= X) dependency from the built ELF rather than hardcoding.
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)
-# tier-node_<version>_<arch>.deb
+# tierd_<version>_<arch>.deb
 set(CPACK_DEBIAN_FILE_NAME "DEB-DEFAULT")
 
 set(_tier_debian "${CMAKE_SOURCE_DIR}/packaging/debian")

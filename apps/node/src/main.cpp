@@ -123,9 +123,9 @@ void print_hex(const char* label, std::span<const tier::crypto::Byte> bytes) {
 int usage() {
   std::fputs(
       "usage:\n"
-      "  tier-node run <port> [<seed_ip> <seed_port>]\n"
-      "  tier-node listen <port>\n"
-      "  tier-node connect <ip> <port>\n",
+      "  tierd run <port> [<seed_ip> <seed_port>]\n"
+      "  tierd listen <port>\n"
+      "  tierd connect <ip> <port>\n",
       stderr);
   return 2;
 }
