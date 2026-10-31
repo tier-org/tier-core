@@ -35,6 +35,15 @@ class Node {
   [[nodiscard]] const tier::core::PeerId& peer_id() const noexcept;
 
   void connect(const std::string& ip, std::uint16_t port);
+
+  // Dial a set of bootstrap addresses ("ip:port", IPv6 bracketed) once at
+  // startup, typically tier::core::default_seed_addresses(). Addresses this
+  // node already advertises (its own) are skipped so a seed does not dial
+  // itself; any other address is fine even for an unknown peer, since peer
+  // identities are learned from the handshake and membership fills in from
+  // there. Malformed addresses are ignored.
+  void bootstrap(const std::vector<std::string>& seeds);
+
   void poll(int timeout_ms);
 
   [[nodiscard]] const tier::core::Membership& membership() const noexcept;

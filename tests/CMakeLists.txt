@@ -62,3 +62,8 @@ add_executable(test_dualstack test_dualstack.cpp)
 target_link_libraries(test_dualstack PRIVATE tier::net tier::core tier::crypto tier::options)
 add_test(NAME dualstack COMMAND test_dualstack)
 set_tests_properties(dualstack PROPERTIES TIMEOUT 60)
+
+add_executable(test_seeds test_seeds.cpp)
+target_link_libraries(test_seeds PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME seeds COMMAND test_seeds)
+set_tests_properties(seeds PROPERTIES TIMEOUT 60)

@@ -107,8 +107,24 @@ the package and attaches the `.deb` to a GitHub Release. To install and run:
     sudo systemctl start tier-node
 
 The node stores its Ed25519 identity under `/var/lib/tier` (systemd
-StateDirectory). Bootstrap by pointing `TIER_ARGS` at one reachable seed; the
-rest of the mesh is learned via gossip.
+StateDirectory). It joins through the preconfigured seeds below, so no seed
+argument is required; an explicit `<seed_ip> <seed_port>` in `TIER_ARGS` is
+dialed in addition.
+
+## Network seeds
+
+The bootstrap seeds are compiled into the binary - `libs/core/include/tier/core/seeds.hpp`
+is the single source of truth. There is no runtime fetch (no DNS seed list, no
+HTTPS), so joining the network adds no extra point of failure; the seed set
+changes only by editing that file and cutting a new release.
+
+A fresh node dials every seed at startup over whichever family it has (IPv6
+preferred). Reaching one seed is enough - the rest of the membership arrives by
+anti-entropy. Each seed is listed with both an IPv4 and an IPv6 address on UDP
+port 7777; a node that is itself a seed skips its own address, and a connection
+to self is dropped regardless. Seed identities are not pinned: a peer's identity
+is authenticated by the TLS handshake, so a wrong address fails closed rather
+than impersonating a seed (key pinning is a possible later hardening).
 
 ## Node requirements
 

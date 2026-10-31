@@ -137,6 +137,39 @@ void Node::connect(const std::string& ip, std::uint16_t port) {
   dialed_[ip + ":" + std::to_string(port)] = std::chrono::steady_clock::now();
 }
 
+void Node::bootstrap(const std::vector<std::string>& seeds) {
+  const auto now = std::chrono::steady_clock::now();
+  const auto self = membership_.find(self_id_);
+  for (const std::string& addr : seeds) {
+    if (!is_dialable(addr)) {
+      continue;
+    }
+    // Do not dial ourselves. We only know our own address if we were bound to a
+    // concrete IP (self_address_) or have already adopted advertised ones; on a
+    // wildcard bind neither matches our public address yet, so a self-dial is
+    // still possible here and is dropped later by the self guard in poll().
+    if (addr == self_address_) {
+      continue;
+    }
+    if (self && std::find(self->addresses.begin(), self->addresses.end(),
+                          addr) != self->addresses.end()) {
+      continue;
+    }
+    const auto hp = split_host_port(addr);
+    if (!hp) {
+      continue;
+    }
+    try {
+      endpoint_.connect(hp->first, hp->second);
+    } catch (const std::exception&) {
+      continue;  // an unroutable seed must not take us down
+    }
+    // Key the backoff by the canonical bracketed address so a seed we later
+    // learn over gossip is not immediately redialed by autodial.
+    dialed_[addr] = now;
+  }
+}
+
 std::vector<tier::core::PeerId> Node::connected_peers() const {
   std::vector<tier::core::PeerId> ids;
   ids.reserve(conn_by_peer_.size());
@@ -160,6 +193,12 @@ void Node::poll(int timeout_ms) {
   std::vector<tier::core::PeerId> neighbors;
   for (const auto& [conn, key] : endpoint_.connections()) {
     const tier::core::PeerId id = tier::crypto::sha256(key);
+    // Never route to or treat ourselves as a neighbor. A node that is itself a
+    // seed can dial its own public address before it knows that address is its
+    // own; drop any such self-connection here rather than probe or gossip to it.
+    if (id == self_id_) {
+      continue;
+    }
     conn_by_peer_[id] = conn;
     neighbors.push_back(id);
   }

@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "tier/core/membership.hpp"
+#include "tier/core/seeds.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/crypto/primitives.hpp"
 #include "tier/net/endpoint.hpp"
@@ -155,6 +156,15 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
 
   print_hex("node id:  ", node.peer_id());
   std::printf("listening on [::]:%u\n", static_cast<unsigned>(node.local_port()));
+
+  // Join via the preconfigured seeds baked into the binary. One reachable seed
+  // is enough; the rest of the membership arrives by anti-entropy. A node that
+  // is itself a seed skips its own address.
+  const auto seeds = tier::core::default_seed_addresses();
+  std::printf("dialing %zu preconfigured seed address(es)\n", seeds.size());
+  node.bootstrap(seeds);
+
+  // An optional explicit seed on the command line is dialed in addition.
   if (has_seed) {
     std::printf("dialing seed %s:%u\n", seed_ip, static_cast<unsigned>(seed_port));
     node.connect(seed_ip, seed_port);
