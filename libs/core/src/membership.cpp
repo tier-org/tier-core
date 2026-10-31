@@ -15,6 +15,14 @@ bool supersedes(const PeerInfo& candidate, const PeerInfo& current) noexcept {
 }  // namespace
 
 bool Membership::apply(const PeerInfo& update) {
+  const auto tomb = tombstones_.find(update.id);
+  if (tomb != tombstones_.end()) {
+    if (update.incarnation <= tomb->second) {
+      return false;  // suppressed: a stale report about a buried peer
+    }
+    tombstones_.erase(tomb);  // a strictly newer report lifts the tombstone
+  }
+
   const auto it = peers_.find(update.id);
   if (it == peers_.end()) {
     peers_.emplace(update.id, update);
@@ -35,6 +43,20 @@ bool Membership::apply(const PeerInfo& update) {
 }
 
 bool Membership::remove(const PeerId& id) { return peers_.erase(id) > 0; }
+
+void Membership::bury(const PeerId& id, std::uint64_t incarnation) {
+  peers_.erase(id);
+  auto [it, inserted] = tombstones_.try_emplace(id, incarnation);
+  if (!inserted && incarnation > it->second) {
+    it->second = incarnation;  // keep the highest buried incarnation
+  }
+}
+
+void Membership::forget(const PeerId& id) { tombstones_.erase(id); }
+
+bool Membership::is_tombstoned(const PeerId& id) const {
+  return tombstones_.count(id) != 0;
+}
 
 std::optional<PeerInfo> Membership::find(const PeerId& id) const {
   const auto it = peers_.find(id);

@@ -26,6 +26,10 @@ struct SwimConfig {
   // A dead peer is kept (and gossiped) this long before being removed, so the
   // death disseminates before the entry disappears.
   std::chrono::milliseconds dead_cleanup{30000};
+  // After a dead peer is removed, its id is tombstoned for this long so that
+  // gossip still in flight naming it cannot resurrect it. Must comfortably
+  // outlast the time a death takes to reach every node; generous by default.
+  std::chrono::milliseconds tombstone_ttl{120000};
   // Number of relays asked to probe a target indirectly.
   std::size_t indirect_probes{3};
 };
@@ -69,10 +73,13 @@ class FailureDetector {
   void refute_if_accused();
   void scan_membership(Clock::time_point now);
   void advance_suspicions(Clock::time_point now);
+  void sweep_tombstones(Clock::time_point now);
   void expire_relays(Clock::time_point now);
   void check_probe_timeouts(Clock::time_point now,
                             const std::vector<PeerId>& neighbors);
-  void start_probe(Clock::time_point now, const std::vector<PeerId>& neighbors);
+  // Targets are drawn from the whole membership, not just `neighbors`; relays
+  // for indirect probes still come from the connected neighbors.
+  void start_probe(Clock::time_point now);
   void suspect(const PeerId& id, Clock::time_point now);
 
   PeerId self_;
@@ -109,6 +116,10 @@ class FailureDetector {
 
   // Peers held as dead, with when we first saw them dead (for cleanup).
   std::map<PeerId, Clock::time_point> dead_since_;
+
+  // Peers we have buried, with when, so their tombstones are lifted after
+  // tombstone_ttl rather than kept forever.
+  std::map<PeerId, Clock::time_point> buried_at_;
 
   Clock::time_point last_probe_{};
   bool probing_started_ = false;

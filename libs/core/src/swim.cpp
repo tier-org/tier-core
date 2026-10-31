@@ -17,9 +17,10 @@ void FailureDetector::tick(Clock::time_point now,
   expire_relays(now);
   check_probe_timeouts(now, neighbors);
   advance_suspicions(now);
+  sweep_tombstones(now);
 
   if (!probing_started_ || now - last_probe_ >= cfg_.probe_period) {
-    start_probe(now, neighbors);
+    start_probe(now);
     last_probe_ = now;
     probing_started_ = true;
   }
@@ -156,7 +157,10 @@ void FailureDetector::advance_suspicions(Clock::time_point now) {
       continue;
     }
     if (now - it->second >= cfg_.dead_cleanup) {
-      m_.remove(it->first);
+      // Bury rather than plainly remove: a tombstone keeps a laggard's gossip
+      // from re-inserting the peer the instant we drop it.
+      m_.bury(it->first, cur->incarnation);
+      buried_at_[it->first] = now;
       it = dead_since_.erase(it);
       continue;
     }
@@ -164,21 +168,36 @@ void FailureDetector::advance_suspicions(Clock::time_point now) {
   }
 }
 
-void FailureDetector::start_probe(Clock::time_point now,
-                                  const std::vector<PeerId>& neighbors) {
-  const std::size_t n = neighbors.size();
+void FailureDetector::sweep_tombstones(Clock::time_point now) {
+  for (auto it = buried_at_.begin(); it != buried_at_.end();) {
+    if (now - it->second >= cfg_.tombstone_ttl) {
+      m_.forget(it->first);  // suppression window over; learnable again
+      it = buried_at_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void FailureDetector::start_probe(Clock::time_point now) {
+  // Draw targets from the whole membership, not just directly connected
+  // neighbors: a peer we know of but hold no connection to (never dialed, or
+  // dead) must still be probed or it would never be suspected and would linger
+  // forever. A reachable such peer is refuted by an indirect probe a neighbor
+  // relays for us (check_probe_timeouts); a truly gone one ages out to dead.
+  std::vector<PeerId> targets;
+  for (const PeerInfo& p : m_.snapshot()) {
+    if (p.id == self_ || p.liveness == Liveness::dead) {
+      continue;  // never probe ourselves or a peer we have already buried
+    }
+    targets.push_back(p.id);
+  }
+  const std::size_t n = targets.size();
   if (n == 0) {
     return;
   }
   for (std::size_t off = 0; off < n; ++off) {
-    const PeerId& cand = neighbors[(rr_ + off) % n];
-    if (cand == self_) {
-      continue;
-    }
-    const auto cur = m_.find(cand);
-    if (!cur || cur->liveness == Liveness::dead) {
-      continue;  // only probe peers we actually know and have not buried
-    }
+    const PeerId& cand = targets[(rr_ + off) % n];
     bool already = false;
     for (const auto& [seq, pr] : pending_) {
       if (pr.target == cand) {

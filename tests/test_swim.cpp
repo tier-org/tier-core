@@ -47,6 +47,7 @@ SwimConfig fast_config() {
   cfg.ping_timeout = std::chrono::milliseconds(40);
   cfg.suspicion_timeout = std::chrono::milliseconds(200);
   cfg.dead_cleanup = std::chrono::milliseconds(200);
+  cfg.tombstone_ttl = std::chrono::milliseconds(400);
   cfg.indirect_probes = 3;
   return cfg;
 }
@@ -207,6 +208,72 @@ int main() {
           "ping: answered with an ack");
     const auto ack = tier::core::decode_ack(h.outbox[0].second);
     check(ack && ack->seq == 77, "ping: the ack echoes the seq");
+  }
+
+  // 7. A known peer we hold no connection to (never a neighbor) is still probed
+  //    and, staying silent, ages out all the way to removed. This is the fix for
+  //    a membership entry that can never be reaped because it is never directly
+  //    connected: tick is given an empty neighbor set throughout.
+  {
+    Harness h;
+    const PeerId z = mk(0x07);
+    h.m.apply(alive_peer(z));
+
+    h.fd.tick(h.at(0), {});  // no neighbors at all
+    bool pinged = false;
+    for (const auto& msg : h.outbox) {
+      if (is_to(msg, z, ControlType::ping)) {
+        pinged = true;
+      }
+    }
+    check(pinged, "zombie: a non-neighbor known peer is still probed");
+
+    h.fd.tick(h.at(100), {});  // period elapsed -> suspect
+    const auto s = h.m.find(z);
+    check(s && s->liveness == Liveness::suspect, "zombie: non-neighbor -> suspect");
+
+    h.fd.tick(h.at(310), {});  // suspicion_timeout -> dead
+    const auto d = h.m.find(z);
+    check(d && d->liveness == Liveness::dead, "zombie: suspect -> dead");
+
+    h.fd.tick(h.at(520), {});  // dead_cleanup -> buried (removed)
+    check(!h.m.find(z).has_value(), "zombie: dead -> removed");
+    check(h.m.is_tombstoned(z), "zombie: removal leaves a tombstone");
+  }
+
+  // 8. Stale gossip cannot resurrect a buried peer, but a genuine rejoin at a
+  //    strictly higher incarnation can (and lifts the tombstone).
+  {
+    Harness h;
+    const PeerId z = mk(0x08);
+    h.m.bury(z, 5);
+    check(h.m.is_tombstoned(z), "tombstone: buried");
+    check(!h.m.apply(alive_peer(z, 5)),
+          "tombstone: same-incarnation gossip rejected");
+    check(!h.m.apply(alive_peer(z, 3)), "tombstone: older gossip rejected");
+    check(!h.m.find(z).has_value(), "tombstone: not resurrected by stale gossip");
+    check(h.m.apply(alive_peer(z, 6)),
+          "tombstone: higher-incarnation rejoin accepted");
+    const auto info = h.m.find(z);
+    check(info && info->liveness == Liveness::alive, "tombstone: rejoined peer present");
+    check(!h.m.is_tombstoned(z), "tombstone: lifted on rejoin");
+  }
+
+  // 9. A tombstone is lifted after tombstone_ttl, so a long-silent id becomes
+  //    learnable again and the detector stops tracking it.
+  {
+    Harness h;
+    const PeerId z = mk(0x0A);
+    h.m.apply(alive_peer(z));
+    h.fd.tick(h.at(0), {});
+    h.fd.tick(h.at(100), {});  // suspect
+    h.fd.tick(h.at(310), {});  // dead
+    h.fd.tick(h.at(520), {});  // buried (~520)
+    check(h.m.is_tombstoned(z), "ttl: tombstoned after burial");
+
+    h.fd.tick(h.at(950), {});  // past tombstone_ttl (400ms) from burial
+    check(!h.m.is_tombstoned(z), "ttl: tombstone lifted after tombstone_ttl");
+    check(h.m.apply(alive_peer(z, 1)), "ttl: id learnable again after the lift");
   }
 
   if (g_failures == 0) {

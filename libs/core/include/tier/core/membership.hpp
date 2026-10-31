@@ -58,12 +58,27 @@ class Membership {
  public:
   // Merge one received update. Returns true if local state changed.
   // A higher incarnation always wins; at an equal incarnation a worse liveness
-  // (dead > suspect > alive) wins; a lower incarnation is ignored.
+  // (dead > suspect > alive) wins; a lower incarnation is ignored. An update for
+  // a tombstoned id (see bury) is ignored unless its incarnation is strictly
+  // greater than the tombstone's, which lifts the tombstone (a genuine rejoin).
   bool apply(const PeerInfo& update);
 
   // Drop an entry (e.g. a dead peer past its cleanup grace). Returns true if an
   // entry was removed.
   bool remove(const PeerId& id);
+
+  // Bury a peer: remove its entry and record a tombstone at `incarnation`, so a
+  // stale gossip report about it (at the same or a lower incarnation) cannot
+  // re-insert it. Without this, a just-removed peer is resurrected the moment a
+  // laggard node gossips it back. A later report at a strictly higher
+  // incarnation (a real rejoin) lifts the tombstone and is applied normally.
+  void bury(const PeerId& id, std::uint64_t incarnation);
+
+  // Lift a tombstone (its suppression window has elapsed), so the id can be
+  // learned fresh again.
+  void forget(const PeerId& id);
+
+  [[nodiscard]] bool is_tombstoned(const PeerId& id) const;
 
   [[nodiscard]] std::optional<PeerInfo> find(const PeerId& id) const;
   [[nodiscard]] std::size_t size() const noexcept;
@@ -73,6 +88,9 @@ class Membership {
 
  private:
   std::map<PeerId, PeerInfo> peers_;
+  // Buried ids mapped to the incarnation they were buried at. An apply for such
+  // an id is suppressed unless it carries a strictly higher incarnation.
+  std::map<PeerId, std::uint64_t> tombstones_;
 };
 
 }  // namespace tier::core

@@ -289,6 +289,12 @@ void set_stream_limits(ngtcp2_transport_params& params) noexcept {
   params.initial_max_stream_data_bidi_remote = 256 * 1024;
   params.initial_max_stream_data_uni = 256 * 1024;
   params.initial_max_data = 1024 * 1024;
+  // Reap a connection with no traffic for this long. The effective timeout is
+  // the min of both peers' advertised values. A live peer is never idle (we
+  // gossip every ~100ms), so this only fires on a dead/unreachable peer,
+  // dropping its lingering connection instead of holding it open forever
+  // (ngtcp2's default of 0 disables the timeout).
+  params.max_idle_timeout = 30 * NGTCP2_SECONDS;
 }
 
 // Build an IPv6 sockaddr for the dual-stack socket. Accepts native IPv6, the
