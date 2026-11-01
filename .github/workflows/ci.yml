@@ -2,8 +2,9 @@ name: ci
 
 # Build and test on every push to main and every pull request targeting it.
 # This is the test gate; publishing a .deb is a separate, tag-only workflow
-# (release.yml). Kept to the unit/integration tests (ctest) - fast and needing
-# no Docker; the Docker mesh e2e stays in the release gate.
+# (release.yml). Two jobs run in parallel:
+#   - test: the fast unit/integration suite (ctest), Debug + sanitizers.
+#   - e2e:  the Docker four-node dual-stack mesh gate (the same one release runs).
 on:
   push:
     branches: [main]
@@ -44,3 +45,54 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  e2e:
+    # The Docker mesh runs a container-shaped binary, so this job builds the
+    # static Release (sanitizers off) exactly as release.yml does - an ASan
+    # Debug binary would not start in the thin ubuntu:22.04 image. Separate job
+    # so the unit suite never waits on the Docker build.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DTIER_SANITIZE=OFF \
+            -DTIER_WERROR=OFF \
+            -DCMAKE_EXE_LINKER_FLAGS="-static-libgcc -static-libstdc++"
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Enable Docker IPv6
+        run: |
+          sudo mkdir -p /etc/docker
+          # Merge the IPv6 settings into any existing daemon.json rather than
+          # overwriting it. ip6tables is still an EXPERIMENTAL daemon feature on
+          # the runner's Docker (< 27), so "experimental" must be enabled too or
+          # the daemon refuses to start.
+          [ -f /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+          merged="$(sudo jq '. + {experimental: true, ipv6: true, "fixed-cidr-v6": "fd00:d0cc::/64", ip6tables: true}' /etc/docker/daemon.json)"
+          echo "$merged" | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker \
+            || { sudo journalctl -xeu docker.service --no-pager | tail -n 60; exit 1; }
+          for _ in $(seq 1 15); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info >/dev/null
+
+      - name: E2E mesh gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+        run: ./test/net/e2e.sh
