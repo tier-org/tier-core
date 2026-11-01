@@ -146,8 +146,9 @@ even if they share a seed address, and even on the same host. The network choice
 also selects which preconfigured seeds a node dials (below). Isolation does not
 depend on seed separation; it is enforced by the handshake.
 
-For now the network affects only seed selection and this handshake isolation;
-more per-network parameters may be added later. Private networks are first-class:
+The network selects which preconfigured seeds a node dials, its handshake
+isolation, and its software-version policy (below); more per-network parameters
+may be added later. Private networks are first-class:
 pick a name, point the nodes at each other with `TIER_SEEDS`, and the cluster is
 isolated from mainnet by construction.
 
@@ -182,6 +183,49 @@ to dial, the second sets *which cluster* a node belongs to (and thus which peers
 it will handshake with). A private network is typically both - a name plus the
 addresses of its own nodes.
 
+## Version policy (per network)
+
+Each node advertises its software version (`tier::core::version()`), and it is
+gossiped mesh-wide, so `tierctl peers` shows every peer's version. On top of that
+each network carries a **version window** - the range of versions allowed to
+participate - expressed as `min,max` with **min inclusive and max exclusive**.
+So `1.4.0,1.5.0` accepts every `1.4.x` and rejects `1.5.0`: the pessimistic
+"pin the minor, take the patches" window (like a bundler `~> 1.4.0`). Either
+bound may be empty for an open side (`1.4.0,` is `>= 1.4.0`, `,2.0.0` is
+`< 2.0.0`); empty is unconstrained.
+
+The window for each public network lives in a dedicated file under the top-level
+[`networks/`](networks/) directory (one file per network) - the single source of
+truth. These files are both **baked into the binary at build time** (CMake reads
+them and generates a compiled table; the binary never reads them at runtime, the
+same discipline as the seeds) and **parsed directly by external tooling** - e.g.
+an automation job that watches whether a freshly released version falls inside a
+public network's window. `tierd networks` prints what the running binary baked:
+
+    $ tierd networks
+    NETWORK               VERSION POLICY
+    mainnet               unconstrained
+    testnet               unconstrained
+
+A private network has no file there; it is unconstrained unless its operator sets
+`TIER_VERSION_RANGE` (the override also serves local testing). No public network
+is pinned yet - the files are unconstrained so the running production nodes
+(0.2.4) are not locked out, and governance sets real windows by editing those
+files and cutting a release.
+
+The policy is enforced in two places: a node whose own version is outside its
+network's window **refuses to start** (fails closed), and a gossiped peer outside
+the window is **not admitted** to membership (an unknown or pre-version peer is
+admitted leniently, so a mixed fleet is never partitioned by it).
+
+This is cluster **governance, not a security boundary**: a version is
+self-reported, so the window gates honest misconfiguration and lets governance
+freeze or retire a version. Hard protocol incompatibility between builds that
+genuinely cannot interoperate is a separate concern, enforced at the handshake by
+the network's ALPN token, not here. The window is local policy and is never sent
+on the wire, so changing it needs no coordinated flag day. It is orthogonal to
+`TIER_NETWORK` and `TIER_SEEDS`.
+
 ### Local mesh and the e2e gate
 
 `test/net/` brings up a four-node, dual-stack mesh on an internal (no-internet)
@@ -205,10 +249,12 @@ The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
 
     sudo tierctl peers        # the node's view of the mesh: known vs connected
 
-Each row is a peer: short id, whether a live connection is held, liveness, roles
-and advertised addresses. The socket is local only (service user and root) and
-is never exposed on the network. The wire is the project's compact binary codec,
-one request and one response per connection.
+Each row is a peer: short id, whether a live connection is held, liveness, roles,
+the peer's advertised software version (gossiped mesh-wide, so skew is visible at
+a glance; `-` for a peer too old to advertise one) and advertised addresses. The
+socket is local only (service user and root) and is never exposed on the network.
+The wire is the project's compact binary codec, one request and one response per
+connection.
 
 ## Node requirements
 

@@ -12,6 +12,7 @@
 
 #include "tier/core/membership.hpp"
 #include "tier/core/swim.hpp"
+#include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/net/endpoint.hpp"
 
@@ -29,9 +30,13 @@ class Node {
   // `network` is the cluster this node joins (mainnet by default). It is folded
   // into the transport ALPN, so a node only ever connects to, and gossips with,
   // peers on the same network - even if they share a seed address.
+  // `version_range` is this network's software-version policy: a gossiped peer
+  // whose advertised version falls outside it is not admitted to membership.
+  // Default (unconstrained) admits every version.
   Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
        const std::string& ip, std::uint16_t port,
-       tier::core::SwimConfig swim = {}, std::string network = "mainnet");
+       tier::core::SwimConfig swim = {}, std::string network = "mainnet",
+       tier::core::VersionRange version_range = {});
 
   [[nodiscard]] std::uint16_t local_port() const noexcept;
 
@@ -106,6 +111,9 @@ class Node {
   // Per dialed "ip:port", when we last issued a connect, to rate-limit redials
   // and avoid a duplicate connection to a peer whose handshake is still pending.
   std::map<std::string, std::chrono::steady_clock::time_point> dialed_;
+  // This network's version policy; a gossiped peer outside it is not admitted
+  // (see merge_message). Unconstrained by default.
+  tier::core::VersionRange version_range_;
   tier::core::FailureDetector fd_;
 };
 

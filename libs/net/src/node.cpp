@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "tier/core/control.hpp"
+#include "tier/core/version.hpp"
 #include "tier/crypto/hash.hpp"
 
 namespace tier::net {
@@ -81,10 +82,12 @@ bool is_ipv6(const std::string& addr) {
 
 Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
            const std::string& ip, std::uint16_t port,
-           tier::core::SwimConfig swim, std::string network)
+           tier::core::SwimConfig swim, std::string network,
+           tier::core::VersionRange version_range)
     : identity_(std::move(identity)),
       self_id_(tier::crypto::sha256(identity_.public_key())),
       endpoint_(identity_, ip, port, network),
+      version_range_(std::move(version_range)),
       fd_(self_id_, membership_, swim,
           [this](const tier::core::PeerId& to,
                  const std::vector<std::uint8_t>& msg) {
@@ -104,6 +107,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
     me.addresses = {self_address_};
   }
   me.roles = roles;
+  me.version = std::string(tier::core::version());
   me.incarnation = 1;
   me.liveness = tier::core::Liveness::alive;
   membership_.apply(me);
@@ -237,6 +241,13 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     return;
   }
   for (const tier::core::PeerInfo& peer : *decoded) {
+    // Network version policy: do not admit a peer whose advertised version is
+    // outside this network's window (an unconstrained range admits all; an
+    // unknown/old version is admitted leniently). This gates membership only;
+    // it is cooperative governance, not a security boundary.
+    if (!tier::core::version_admitted(version_range_, peer.version)) {
+      continue;
+    }
     if (membership_.apply(peer) && on_change_) {
       on_change_(peer);
     }

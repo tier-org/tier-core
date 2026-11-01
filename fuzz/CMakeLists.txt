@@ -21,3 +21,10 @@ add_executable(fuzz_control fuzz_control.cpp)
 target_link_libraries(fuzz_control PRIVATE tier::core tier::options)
 target_compile_options(fuzz_control PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_control PRIVATE -fsanitize=fuzzer)
+
+# Parsers of the version string (gossiped PeerInfo::version) and the version
+# range (TIER_VERSION_RANGE) - untrusted / operator input.
+add_executable(fuzz_semver fuzz_semver.cpp)
+target_link_libraries(fuzz_semver PRIVATE tier::core tier::options)
+target_compile_options(fuzz_semver PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_semver PRIVATE -fsanitize=fuzzer)

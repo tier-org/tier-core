@@ -1,0 +1,20 @@
+#pragma once
+
+// GENERATED - do not edit. Produced at build time from the files in the
+// top-level networks/ directory (see libs/core/CMakeLists.txt). The single
+// source of truth is those files; this header bakes them into the binary so
+// nothing is read at runtime.
+
+#include <string_view>
+
+namespace tier::core::generated {
+
+struct NetworkPolicy {
+  std::string_view name;
+  std::string_view version_range;  // raw "min,max" spec; parsed by the caller
+};
+
+inline constexpr NetworkPolicy kNetworkPolicies[] = {
+@TIER_NETWORK_ENTRIES@};
+
+}  // namespace tier::core::generated

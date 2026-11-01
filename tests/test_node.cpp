@@ -5,6 +5,9 @@
 #include <string>
 
 #include "tier/core/membership.hpp"
+#include "tier/core/semver.hpp"
+#include "tier/core/version.hpp"
+#include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/net/node.hpp"
 
@@ -59,6 +62,10 @@ int main() {
   check(b_sees_a.has_value() && tier::core::has_role(b_sees_a->roles, Role::keeper),
         "B sees A as a keeper too (multi-role survived gossip)");
 
+  // A node advertises its own software version, and it propagates via gossip.
+  check(b_sees_a.has_value() && b_sees_a->version == tier::core::version(),
+        "B sees A's version (propagated through gossip)");
+
   // Address confirmation: a single dual-stack peer that has observed us over
   // both IPv4 and IPv6 must yield BOTH addresses, not just the last reported.
   // Regression: observed_ once stored one address per peer and overwrote it, so
@@ -90,6 +97,39 @@ int main() {
     const auto quorum = tier::net::Node::confirmed_addresses(sparse, 2);
     check(quorum.size() == 1 && quorum.front() == "10.0.0.1:7777",
           "only an address backed by >= threshold distinct peers is confirmed");
+  }
+
+  // Version policy: a node refuses to admit a gossiped peer whose advertised
+  // version is outside its network's window. Both nodes run this build's
+  // version; D's range excludes it, so D never learns C, while C (unconstrained)
+  // learns D. This is the membership-admission half of the version pin.
+  {
+    const auto current = tier::core::parse_semver(std::string(tier::core::version()));
+    check(current.has_value(), "this build's version is valid semver");
+
+    // A window that cannot contain the current version (far in the future).
+    const auto exclude = tier::core::VersionRange{
+        tier::core::parse_semver("9000.0.0"),
+        tier::core::parse_semver("9000.1.0")};
+
+    tier::net::Node c(tier::crypto::NodeIdentity::generate(),
+                      tier::core::role_bit(Role::client), "127.0.0.1", 0);
+    tier::net::Node d(tier::crypto::NodeIdentity::generate(),
+                      tier::core::role_bit(Role::client), "127.0.0.1", 0, {},
+                      "mainnet", exclude);
+
+    d.connect("127.0.0.1", c.local_port());
+    for (int i = 0; i < 2000 && c.membership().size() < 2; ++i) {
+      c.poll(2);
+      d.poll(2);
+    }
+
+    check(c.membership().size() == 2,
+          "C (unconstrained) admits D despite D's own policy");
+    check(d.membership().size() == 1,
+          "D refuses C: C's version is outside D's version window");
+    check(!d.membership().find(c.peer_id()).has_value(),
+          "D never recorded C in membership");
   }
 
   if (g_failures == 0) {

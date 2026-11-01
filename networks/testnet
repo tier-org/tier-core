@@ -1,0 +1,9 @@
+# testnet - the public test network.
+#
+# Single source of truth for testnet's per-network policy, baked into the binary
+# at build time and parsed by external tooling - see README "Version policy
+# (per network)" and networks/mainnet for the format.
+#
+# Unconstrained for now; governance sets a window here once testnet is pinned
+# (this is the file that tooling watches to admit new test releases).
+version_range =

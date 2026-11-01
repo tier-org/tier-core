@@ -152,12 +152,14 @@ int cmd_peers(const std::string& path) {
     }
   }
   std::printf("known=%zu connected=%zu\n\n", peers->size(), connected);
-  std::printf("%-16s  %-4s  %-8s  %-22s  %s\n", "PEER", "CONN", "LIVENESS",
-              "ROLES", "ADDRESSES");
+  std::printf("%-16s  %-4s  %-8s  %-22s  %-10s  %s\n", "PEER", "CONN",
+              "LIVENESS", "ROLES", "VERSION", "ADDRESSES");
   for (const auto& p : *peers) {
-    std::printf("%-16s  %-4s  %-8s  %-22s  %s\n", short_id(p.info.id).c_str(),
-                p.connected ? "yes" : "no", liveness_string(p.info.liveness),
+    std::printf("%-16s  %-4s  %-8s  %-22s  %-10s  %s\n",
+                short_id(p.info.id).c_str(), p.connected ? "yes" : "no",
+                liveness_string(p.info.liveness),
                 roles_string(p.info.roles).c_str(),
+                p.info.version.empty() ? "-" : p.info.version.c_str(),
                 join_addresses(p.info.addresses).c_str());
   }
   return 0;

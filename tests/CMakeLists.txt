@@ -10,6 +10,14 @@ add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)
 
+add_executable(test_semver test_semver.cpp)
+target_link_libraries(test_semver PRIVATE tier::core tier::options)
+add_test(NAME semver COMMAND test_semver)
+
+add_executable(test_version_range test_version_range.cpp)
+target_link_libraries(test_version_range PRIVATE tier::core tier::options)
+add_test(NAME version_range COMMAND test_version_range)
+
 add_executable(test_control test_control.cpp)
 target_link_libraries(test_control PRIVATE tier::core tier::options)
 add_test(NAME control COMMAND test_control)

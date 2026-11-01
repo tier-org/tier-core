@@ -1,0 +1,15 @@
+# mainnet - the production network and the default (TIER_NETWORK unset).
+#
+# This file is the single source of truth for mainnet's per-network policy. It
+# is baked into the binary at build time (never read at runtime), and external
+# tooling parses it directly - see README "Version policy (per network)".
+#
+# version_range: the window of software versions allowed on this network, as
+# "min,max" with min INCLUSIVE and max EXCLUSIVE (same grammar as the
+# TIER_VERSION_RANGE override), e.g. 1.4.0,1.5.0 accepts every 1.4.x and rejects
+# 1.5.0. Either side may be empty for an open bound; an empty value is
+# unconstrained. Comments live on their own line (no trailing inline comments).
+#
+# Left unconstrained for now so the running production nodes (0.2.4) are not
+# locked out; governance sets a real window here when it pins mainnet.
+version_range =

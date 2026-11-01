@@ -120,6 +120,10 @@ std::vector<std::uint8_t> encode_membership_message(
       put_u16(out, addr_len);
       out.insert(out.end(), addr.begin(), addr.begin() + addr_len);
     }
+    const auto ver_len = static_cast<std::uint8_t>(
+        p.version.size() > kMaxVersionLen ? kMaxVersionLen : p.version.size());
+    out.push_back(ver_len);
+    out.insert(out.end(), p.version.begin(), p.version.begin() + ver_len);
   }
   return out;
 }
@@ -184,6 +188,24 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
       }
       p.addresses.emplace_back(addr_bytes.begin(), addr_bytes.end());
     }
+
+    std::uint8_t ver_len = 0;
+    if (!r.u8(ver_len) || ver_len > kMaxVersionLen) {
+      return std::nullopt;
+    }
+    std::span<const std::uint8_t> ver_bytes;
+    if (!r.bytes(ver_len, ver_bytes)) {
+      return std::nullopt;
+    }
+    // The version is rendered by diagnostics tools; reject control characters
+    // so a hostile peer cannot smuggle terminal escapes through it. Printable
+    // ASCII only (space through '~').
+    for (const std::uint8_t b : ver_bytes) {
+      if (b < 0x20 || b > 0x7E) {
+        return std::nullopt;
+      }
+    }
+    p.version.assign(ver_bytes.begin(), ver_bytes.end());
 
     peers.push_back(std::move(p));
   }

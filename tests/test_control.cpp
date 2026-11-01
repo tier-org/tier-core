@@ -43,6 +43,11 @@ int main() {
                     tier::core::role_bit(Role::validator) |
                         tier::core::role_bit(Role::keeper),
                     9, Liveness::dead, {"10.0.0.1:7777", "[2001:db8::1]:7777"}));
+  // Versions: empty (a peer too old to advertise one), a plain release, and a
+  // semver with a pre-release/build suffix.
+  in[0].version = "";
+  in[1].version = "0.2.4";
+  in[2].version = "1.0.0-rc.1+build.7";
 
   const auto encoded = tier::core::encode_membership_message(in);
   check(tier::core::peek_control_type(encoded) ==
@@ -61,6 +66,7 @@ int main() {
       check(a.liveness == b.liveness, "liveness round-trips");
       check(a.roles == b.roles, "role set round-trips");
       check(a.addresses == b.addresses, "address set round-trips");
+      check(a.version == b.version, "version round-trips");
     }
   }
 
@@ -107,6 +113,31 @@ int main() {
     bad[37] = static_cast<std::uint8_t>(tier::core::kAllRoles | 0x10U);
     check(!tier::core::decode_membership_message(bad).has_value(),
           "unknown role bit is rejected");
+  }
+
+  // A version carrying a control character is rejected (it would be rendered by
+  // diagnostics tools, so no terminal escapes may ride through it).
+  {
+    auto evil = peer(0x05, tier::core::role_bit(Role::client), 1,
+                     Liveness::alive, {});
+    evil.version = std::string("1.0") + '\x1b' + "[31m";
+    check(!tier::core::decode_membership_message(
+               tier::core::encode_membership_message({evil}))
+               .has_value(),
+          "version with a control character is rejected");
+  }
+
+  // A version longer than the bound is clamped on encode (never overflows the
+  // one-byte length), and what encodes still decodes.
+  {
+    auto big = peer(0x06, tier::core::role_bit(Role::client), 1,
+                    Liveness::alive, {});
+    big.version.assign(tier::core::kMaxVersionLen + 50U, 'v');
+    const auto round = tier::core::decode_membership_message(
+        tier::core::encode_membership_message({big}));
+    check(round.has_value() && round->size() == 1 &&
+              (*round)[0].version.size() == tier::core::kMaxVersionLen,
+          "over-long version is clamped to the bound");
   }
 
   if (g_failures == 0) {

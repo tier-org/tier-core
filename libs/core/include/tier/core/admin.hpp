@@ -19,7 +19,10 @@ enum class AdminOp : std::uint8_t {
   peers = 1,  // dump the known-peers table and which of them are connected
 };
 
-inline constexpr std::uint8_t kAdminVersion = 1;
+// Bumped to 2 when the embedded membership record grew a version field; tierctl
+// and tierd ship together in one package, so the admin plane need not stay
+// compatible across versions, but the bump makes a mismatched pair fail cleanly.
+inline constexpr std::uint8_t kAdminVersion = 2;
 
 // A peer as the admin plane reports it: its membership record plus whether the
 // daemon currently holds a live connection to it (known vs connected).

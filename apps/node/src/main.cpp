@@ -17,6 +17,8 @@
 #include "tier/core/admin.hpp"
 #include "tier/core/membership.hpp"
 #include "tier/core/seeds.hpp"
+#include "tier/core/version.hpp"
+#include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/crypto/primitives.hpp"
 #include "tier/net/admin_listener.hpp"
@@ -139,9 +141,31 @@ int usage() {
       "usage:\n"
       "  tierd run <port> [<seed_ip> <seed_port>]\n"
       "  tierd listen <port>\n"
-      "  tierd connect <ip> <port>\n",
+      "  tierd connect <ip> <port>\n"
+      "  tierd networks            list the baked per-network version policy\n",
       stderr);
   return 2;
+}
+
+// Print the per-network version policy baked into this binary (from the
+// top-level networks/ files). Read-only, needs no identity; lets an operator
+// see what version each public network admits before joining.
+int run_networks() {
+  std::string err;
+  if (!tier::core::validate_baked_networks(&err)) {
+    std::fprintf(stderr, "baked networks table invalid: %s\n", err.c_str());
+    return 1;
+  }
+  std::printf("%-20s  %s\n", "NETWORK", "VERSION POLICY");
+  for (const auto& n : tier::core::baked_networks()) {
+    std::printf("%-20s  %s\n", n.name.c_str(),
+                tier::core::to_string(n.range).c_str());
+  }
+  std::fputs(
+      "\nPrivate networks have no baked policy (unconstrained); set "
+      "TIER_VERSION_RANGE to pin one.\n",
+      stdout);
+  return 0;
 }
 
 // Long-lived participant: gossips membership and logs every peer it learns of.
@@ -163,10 +187,43 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   }
   std::printf("network: %s\n", network.c_str());
 
+  // Resolve this network's software-version policy: the baked per-network
+  // default, overridden by TIER_VERSION_RANGE ("min,max", min inclusive, max
+  // exclusive). The range is local policy, never sent on the wire. A malformed
+  // override is an operator error - fail fast rather than join unconstrained.
+  tier::core::VersionRange version_range =
+      tier::core::network_version_range(network);
+  if (const char* const env = std::getenv("TIER_VERSION_RANGE");
+      env != nullptr && *env != '\0') {
+    const auto parsed = tier::core::parse_version_range(env);
+    if (!parsed) {
+      std::fprintf(stderr,
+                   "invalid TIER_VERSION_RANGE '%s' (expected \"min,max\", "
+                   "min inclusive and max exclusive, e.g. \"1.4.0,1.5.0\")\n",
+                   env);
+      return 2;
+    }
+    version_range = *parsed;
+  }
+  // Self-check: refuse to join a network this build is not allowed on, so an
+  // out-of-policy node fails closed instead of being silently ignored by peers.
+  if (!tier::core::version_admitted(version_range, tier::core::version())) {
+    std::fprintf(stderr,
+                 "version %.*s is not allowed on network %s (policy %s)\n",
+                 static_cast<int>(tier::core::version().size()),
+                 tier::core::version().data(), network.c_str(),
+                 tier::core::to_string(version_range).c_str());
+    return 2;
+  }
+  if (!version_range.unconstrained()) {
+    std::printf("version policy: %s\n",
+                tier::core::to_string(version_range).c_str());
+  }
+
   // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
   tier::net::Node node(identity, tier::core::role_bit(tier::core::Role::client),
-                       "::", port, {}, network);
+                       "::", port, {}, network, version_range);
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -324,6 +381,15 @@ int run_connect(const tier::crypto::NodeIdentity& identity, const char* ip,
 int main(int argc, char** argv) {
   if (argc < 2) {
     return usage();
+  }
+
+  // Read-only diagnostics that need no node identity (so they do not create a
+  // key file as a side effect).
+  if (std::string_view(argv[1]) == "networks") {
+    if (argc != 2) {
+      return usage();
+    }
+    return run_networks();
   }
 
   const std::string id_path = resolve_id_path();

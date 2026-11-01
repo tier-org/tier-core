@@ -38,6 +38,11 @@ bool Membership::apply(const PeerInfo& update) {
   if (merged.addresses.empty()) {
     merged.addresses = it->second.addresses;
   }
+  // Likewise keep a known version when an update carries none (an older peer or
+  // a liveness-only report), rather than blanking it.
+  if (merged.version.empty()) {
+    merged.version = it->second.version;
+  }
   it->second = std::move(merged);
   return true;
 }

@@ -48,6 +48,11 @@ struct PeerInfo {
   // family it can use; a peer with a single address behaves as before.
   std::vector<std::string> addresses;
   RoleSet roles = role_bit(Role::client);  // one or more roles this node holds
+  // The peer's advertised software version (tier::core::version(), e.g.
+  // "0.2.4"). Carried through gossip so the mesh can be inspected for version
+  // skew. Empty when unknown: a peer too old to advertise one, or a
+  // liveness-only update that omitted it (the known value is then kept).
+  std::string version;
   std::uint64_t incarnation = 0;    // a peer raises its own to refute suspicion
   Liveness liveness = Liveness::alive;
 };

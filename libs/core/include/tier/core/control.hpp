@@ -32,7 +32,8 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in);
 
 // Encode a membership snapshot as a control message:
 //   [type:1][count:4 BE]( [id:32][role:1][incarnation:8 BE][liveness:1]
-//                          [addr_count:1]( [addr_len:2 BE][addr:addr_len] )* )*
+//                          [addr_count:1]( [addr_len:2 BE][addr:addr_len] )*
+//                          [ver_len:1][ver:ver_len] )*
 std::vector<std::uint8_t> encode_membership_message(
     const std::vector<PeerInfo>& peers);
 
@@ -87,5 +88,9 @@ inline constexpr std::uint16_t kMaxAddressLen = 256;
 // Addresses advertised per peer: enough for a handful of interfaces/families
 // (IPv4 + IPv6, a couple of each), fits the single count byte on the wire.
 inline constexpr std::uint8_t kMaxAddressesPerPeer = 8;
+// Advertised version string ("major.minor.patch" plus optional pre-release/
+// build suffix). Bounded so a hostile peer cannot inflate a message, and fits
+// the single length byte on the wire.
+inline constexpr std::uint8_t kMaxVersionLen = 64;
 
 }  // namespace tier::core

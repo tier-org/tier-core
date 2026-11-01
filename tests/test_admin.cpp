@@ -40,7 +40,7 @@ int main() {
     check(op.has_value() && *op == AdminOp::peers, "request round-trips");
 
     check(!tier::core::decode_admin_request({}).has_value(), "empty request rejected");
-    std::vector<std::uint8_t> bad_ver{0x02, 0x01};
+    std::vector<std::uint8_t> bad_ver{0x01, 0x01};  // version 1 is no longer spoken
     check(!tier::core::decode_admin_request(bad_ver).has_value(),
           "wrong version rejected");
     std::vector<std::uint8_t> bad_op{tier::core::kAdminVersion, 0x7F};
@@ -60,6 +60,9 @@ int main() {
                        {}));
   peers.push_back(peer(0x03, tier::core::role_bit(Role::transmitter),
                        Liveness::dead, {"[2001:db8::3]:7777"}));
+  peers[0].version = "0.2.4";
+  peers[1].version = "";  // an older peer that advertised no version
+  peers[2].version = "0.3.0";
 
   std::vector<tier::core::PeerId> connected;
   connected.push_back(peers[0].id);
@@ -75,6 +78,7 @@ int main() {
       check((*decoded)[i].info.roles == peers[i].roles, "roles round-trip");
       check((*decoded)[i].info.liveness == peers[i].liveness, "liveness round-trips");
       check((*decoded)[i].info.addresses == peers[i].addresses, "addresses round-trip");
+      check((*decoded)[i].info.version == peers[i].version, "version round-trips");
     }
     check((*decoded)[0].connected, "peer 1 reported connected");
     check(!(*decoded)[1].connected, "peer 2 reported not connected");
