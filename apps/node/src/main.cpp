@@ -147,10 +147,26 @@ int usage() {
 // Long-lived participant: gossips membership and logs every peer it learns of.
 int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
              const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
+  // Resolve the network (cluster) this node joins. TIER_NETWORK selects it;
+  // unset means mainnet. Networks are isolated at the handshake, so a typo would
+  // silently strand the node on a cluster of one - validate and fail fast.
+  std::string network(tier::core::kDefaultNetwork);
+  if (const char* const env = std::getenv("TIER_NETWORK");
+      env != nullptr && *env != '\0') {
+    network = env;
+  }
+  if (!tier::core::is_valid_network_name(network)) {
+    std::fprintf(stderr,
+                 "invalid TIER_NETWORK '%s' (expected [a-z0-9-], 1..32 chars)\n",
+                 network.c_str());
+    return 2;
+  }
+  std::printf("network: %s\n", network.c_str());
+
   // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
   tier::net::Node node(identity, tier::core::role_bit(tier::core::Role::client),
-                       "::", port);
+                       "::", port, {}, network);
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -174,8 +190,22 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   // Join via the preconfigured seeds baked into the binary. One reachable seed
   // is enough; the rest of the membership arrives by anti-entropy. A node that
   // is itself a seed skips its own address.
-  const auto seeds = tier::core::default_seed_addresses();
-  std::printf("dialing %zu preconfigured seed address(es)\n", seeds.size());
+  //
+  // TIER_SEEDS, when set and non-empty, FULLY replaces the baked list (private
+  // networks, localnet, e2e tests): the node then dials only those addresses and
+  // never the production seeds. An override that parses to nothing is honored as
+  // an isolated node rather than silently falling back, so a test net can never
+  // leak onto the real network.
+  std::vector<std::string> seeds;
+  if (const char* const env = std::getenv("TIER_SEEDS");
+      env != nullptr && *env != '\0') {
+    seeds = tier::core::parse_seed_list(env);
+    std::printf("TIER_SEEDS override: %zu seed address(es)\n", seeds.size());
+  } else {
+    seeds = tier::core::seed_addresses(network);
+    std::printf("dialing %zu preconfigured seed address(es) for %s\n",
+                seeds.size(), network.c_str());
+  }
   node.bootstrap(seeds);
 
   // An optional explicit seed on the command line is dialed in addition.

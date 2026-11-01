@@ -127,12 +127,38 @@ and tags the commit `vX.Y.Z`. Without `--push` it stops there and prints the
 push command; `--push` pushes the commit and the tag, which triggers the release
 workflow. That workflow refuses to build if `VERSION` does not match the tag.
 
+## Networks
+
+Every node belongs to exactly one **network** (cluster). `mainnet` is the
+default and the production network; `testnet` is reserved for a public test
+network; any other name is a **private** network. The four nodes the project
+runs today are `mainnet`.
+
+The network is chosen by the `TIER_NETWORK` environment variable (unset =
+`mainnet`). A name is a short DNS-style label - lowercase letters, digits and
+hyphens, 1-32 characters - and an invalid value is rejected at startup rather
+than silently stranding the node.
+
+Networks are **isolated at the transport layer**: the network name is folded
+into the QUIC/TLS ALPN token (`tier/0/<network>`), so two nodes on different
+networks cannot complete a handshake and therefore never exchange membership -
+even if they share a seed address, and even on the same host. The network choice
+also selects which preconfigured seeds a node dials (below). Isolation does not
+depend on seed separation; it is enforced by the handshake.
+
+For now the network affects only seed selection and this handshake isolation;
+more per-network parameters may be added later. Private networks are first-class:
+pick a name, point the nodes at each other with `TIER_SEEDS`, and the cluster is
+isolated from mainnet by construction.
+
 ## Network seeds
 
-The bootstrap seeds are compiled into the binary - `libs/core/include/tier/core/seeds.hpp`
-is the single source of truth. There is no runtime fetch (no DNS seed list, no
-HTTPS), so joining the network adds no extra point of failure; the seed set
-changes only by editing that file and cutting a new release.
+The bootstrap seeds are compiled into the binary **per network** -
+`libs/core/include/tier/core/seeds.hpp` is the single source of truth. `mainnet`
+ships the production seeds; `testnet` and private networks have none baked in and
+join via `TIER_SEEDS`. There is no runtime fetch (no DNS seed list, no HTTPS), so
+joining adds no extra point of failure; the baked set changes only by editing
+that file and cutting a new release.
 
 A fresh node dials every seed at startup over whichever family it has (IPv6
 preferred). Reaching one seed is enough - the rest of the membership arrives by
@@ -141,6 +167,36 @@ port 7777; a node that is itself a seed skips its own address, and a connection
 to self is dropped regardless. Seed identities are not pinned: a peer's identity
 is authenticated by the TLS handshake, so a wrong address fails closed rather
 than impersonating a seed (key pinning is a possible later hardening).
+
+The `TIER_SEEDS` environment variable **fully replaces** the compiled-in list
+for private networks and local testing: when set and non-empty the node dials
+only those addresses and never the production seeds (an override that parses to
+nothing leaves the node isolated rather than falling back, so a test net can
+never leak onto the real network). It is comma/space separated, `ip:port` with
+IPv6 bracketed, e.g. `TIER_SEEDS="[fd00::2]:7777 10.0.0.2:7777"`. This is local
+static configuration, not a runtime fetch, so it preserves the no-extra-point-of-
+failure property.
+
+`TIER_SEEDS` and `TIER_NETWORK` are orthogonal: the first sets *which addresses*
+to dial, the second sets *which cluster* a node belongs to (and thus which peers
+it will handshake with). A private network is typically both - a name plus the
+addresses of its own nodes.
+
+### Local mesh and the e2e gate
+
+`test/net/` brings up a four-node, dual-stack mesh on an internal (no-internet)
+Docker network, on the private `localnet` network and seeded via `TIER_SEEDS`,
+so it is doubly isolated from production (no route to it, and a different ALPN):
+
+    make localnet-up      # start a local mesh to poke by hand
+    make localnet-status  # `tierctl peers` on every node
+    make localnet-down
+
+    make e2e              # converge, assert full discovery + dual-stack, tear down
+
+`make e2e` exits non-zero unless every node discovers the whole mesh and
+advertises both address families; run it before cutting a release. It needs
+Docker with IPv6 enabled on the daemon - see `test/net/README.md`.
 
 ## Diagnostics (tierctl)
 

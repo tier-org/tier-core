@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <vector>
@@ -25,9 +26,12 @@ class Node {
  public:
   // `roles` is the set of roles this node holds (tier::core::role_bit(...),
   // OR'd for several). A plain participant passes role_bit(Role::client).
+  // `network` is the cluster this node joins (mainnet by default). It is folded
+  // into the transport ALPN, so a node only ever connects to, and gossips with,
+  // peers on the same network - even if they share a seed address.
   Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
        const std::string& ip, std::uint16_t port,
-       tier::core::SwimConfig swim = {});
+       tier::core::SwimConfig swim = {}, std::string network = "mainnet");
 
   [[nodiscard]] std::uint16_t local_port() const noexcept;
 
@@ -66,6 +70,14 @@ class Node {
       std::chrono::steady_clock::time_point now,
       std::chrono::steady_clock::duration retry);
 
+  // Addresses observed by at least `threshold` distinct peers, sorted and
+  // unique. A single dual-stack peer that has seen us over both families
+  // contributes both, so a node reachable over IPv4 and IPv6 advertises both
+  // (not just whichever family it was most recently dialed over).
+  static std::vector<std::string> confirmed_addresses(
+      const std::map<tier::core::PeerId, std::set<std::string>>& observed,
+      std::size_t threshold);
+
  private:
   void push_membership(ConnId conn);
   void merge_message(std::span<const tier::crypto::Byte> payload);
@@ -87,8 +99,10 @@ class Node {
   // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;
-  // Per reporting peer, the address it claims to observe us at (observed_addr).
-  std::map<tier::core::PeerId, std::string> observed_;
+  // Per reporting peer, the set of addresses it has observed us at
+  // (observed_addr). A peer that has connected to us over both IPv4 and IPv6
+  // reports each, so this accumulates rather than overwrites.
+  std::map<tier::core::PeerId, std::set<std::string>> observed_;
   // Per dialed "ip:port", when we last issued a connect, to rate-limit redials
   // and avoid a duplicate connection to a peer whose handshake is still pending.
   std::map<std::string, std::chrono::steady_clock::time_point> dialed_;

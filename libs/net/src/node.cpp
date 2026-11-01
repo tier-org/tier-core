@@ -7,6 +7,7 @@
 #include <exception>
 #include <map>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <string_view>
@@ -80,10 +81,10 @@ bool is_ipv6(const std::string& addr) {
 
 Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
            const std::string& ip, std::uint16_t port,
-           tier::core::SwimConfig swim)
+           tier::core::SwimConfig swim, std::string network)
     : identity_(std::move(identity)),
       self_id_(tier::crypto::sha256(identity_.public_key())),
-      endpoint_(identity_, ip, port),
+      endpoint_(identity_, ip, port, network),
       fd_(self_id_, membership_, swim,
           [this](const tier::core::PeerId& to,
                  const std::vector<std::uint8_t>& msg) {
@@ -242,28 +243,44 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
   }
 }
 
+std::vector<std::string> Node::confirmed_addresses(
+    const std::map<tier::core::PeerId, std::set<std::string>>& observed,
+    std::size_t threshold) {
+  // Count distinct reporting peers per address. A peer's set contributes each
+  // of its addresses once, so a single dual-stack peer backs both families.
+  std::map<std::string, std::size_t> tally;
+  for (const auto& [peer, addrs] : observed) {
+    for (const std::string& addr : addrs) {
+      ++tally[addr];
+    }
+  }
+  std::vector<std::string> confirmed;
+  for (const auto& [addr, n] : tally) {
+    if (n >= threshold) {
+      confirmed.push_back(addr);  // std::map keeps these sorted and unique
+    }
+  }
+  return confirmed;
+}
+
 void Node::handle_observed(const tier::core::PeerId& from,
                            std::span<const tier::crypto::Byte> payload) {
   const auto msg = tier::core::decode_observed_addr(payload);
   if (!msg || !is_dialable(msg->address)) {
     return;
   }
-  observed_[from] = msg->address;
+  // Accumulate every address a peer reports, not just the last one. A peer that
+  // has connected to us over both families reports each; overwriting here would
+  // collapse a dial-only node (one that only ever receives connections, e.g. the
+  // highest-id peer) to whichever family it was most recently dialed over, so it
+  // would advertise a single family even though both are reachable.
+  observed_[from].insert(msg->address);
 
   // Advertise every address confirmed by enough peers, not just one: a
   // dual-stack node is seen at its IPv4 address by IPv4 peers and at its IPv6
-  // address by IPv6 peers, and must advertise both so either family can reach
-  // it. Tally the reports and keep each address at or above the threshold.
-  std::map<std::string, std::size_t> tally;
-  for (const auto& [peer, addr] : observed_) {
-    ++tally[addr];
-  }
-  std::vector<std::string> confirmed;
-  for (const auto& [addr, n] : tally) {
-    if (n >= kAddressConfirmations) {
-      confirmed.push_back(addr);  // std::map keeps these sorted and unique
-    }
-  }
+  // address by IPv6 peers, and must advertise both so either family can reach it.
+  std::vector<std::string> confirmed =
+      confirmed_addresses(observed_, kAddressConfirmations);
   if (confirmed.empty()) {
     return;
   }

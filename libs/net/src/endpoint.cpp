@@ -19,6 +19,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -44,9 +45,25 @@ using Byte = tier::crypto::Byte;
 namespace {
 
 constexpr std::size_t kCidLen = 16;
-// ALPN in TLS wire form: a length-prefixed protocol name. "tier/0" is v0.
-constexpr unsigned char kAlpnWire[] = {6, 't', 'i', 'e', 'r', '/', '0'};
 constexpr std::size_t kMaxUdpPayload = 1452;
+
+// ALPN protocol name in TLS wire form: a single length-prefixed token
+// "tier/<proto-version>/<network>" ("0" is protocol v0). The network segment
+// isolates clusters: a peer on a different network - or protocol version -
+// offers a different token, so SSL_select_next_proto finds no match and the
+// handshake fails closed (no_application_protocol). Nodes on different networks
+// therefore never complete a connection and never exchange membership, even when
+// they share a seed address. The network name is validated upstream
+// (tier::core::is_valid_network_name), so the token stays well under 255 bytes.
+std::vector<unsigned char> make_alpn_wire(std::string_view network) {
+  std::string name = "tier/0/";
+  name += network;
+  std::vector<unsigned char> wire;
+  wire.reserve(name.size() + 1);
+  wire.push_back(static_cast<unsigned char>(name.size()));
+  wire.insert(wire.end(), name.begin(), name.end());
+  return wire;
+}
 
 // Application framing: a 4-byte big-endian length prefix followed by the
 // payload. The cap bounds a single frame from an untrusted peer (this decoder
@@ -118,11 +135,15 @@ int accept_verify_cb(int /*preverify_ok*/, X509_STORE_CTX* /*ctx*/) {
   return 1;
 }
 
-// ALPN selection on the server: pick "tier/0" if the client offered it.
+// ALPN selection on the server: accept the peer only if it offered this node's
+// exact protocol+network token. `arg` is the Endpoint's ALPN wire (stable for
+// the Endpoint's lifetime).
 int alpn_select_cb(SSL* /*ssl*/, const unsigned char** out, unsigned char* outlen,
-                   const unsigned char* in, unsigned int inlen, void* /*arg*/) {
-  if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen, kAlpnWire,
-                            sizeof(kAlpnWire), in,
+                   const unsigned char* in, unsigned int inlen, void* arg) {
+  const auto* const wire = static_cast<const std::vector<unsigned char>*>(arg);
+  if (SSL_select_next_proto(const_cast<unsigned char**>(out), outlen,
+                            wire->data(),
+                            static_cast<unsigned int>(wire->size()), in,
                             inlen) != OPENSSL_NPN_NEGOTIATED) {
     return SSL_TLSEXT_ERR_ALERT_FATAL;
   }
@@ -192,7 +213,7 @@ struct Endpoint::Impl {
   };
 
   Impl(const tier::crypto::NodeIdentity& identity, const std::string& ip,
-       std::uint16_t port);
+       std::uint16_t port, const std::string& network);
   ~Impl();
   Impl(const Impl&) = delete;
   Impl& operator=(const Impl&) = delete;
@@ -255,6 +276,9 @@ struct Endpoint::Impl {
   SSL_CTX* client_ctx = nullptr;
   std::vector<Byte> cert_der;
   std::vector<Byte> key_der;
+  // ALPN wire ("tier/0/<network>"); a stable address is handed to the server's
+  // alpn_select_cb, so this must outlive the SSL_CTX (both are freed in ~Impl).
+  std::vector<unsigned char> alpn;
   PeerId self_pubkey{};  // our own identity, to drop connections to self
 
   // Destination Connection ID (as raw bytes) -> owning connection.
@@ -327,7 +351,8 @@ void fill_sockaddr(sockaddr_storage& ss, socklen_t& len, const std::string& ip,
 }
 
 SSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
-                  const std::vector<Byte>& key_der) {
+                  const std::vector<Byte>& key_der,
+                  const std::vector<unsigned char>& alpn) {
   SSL_CTX* const ctx =
       SSL_CTX_new(server ? TLS_server_method() : TLS_client_method());
   if (ctx == nullptr) {
@@ -377,11 +402,13 @@ SSL_CTX* make_ctx(bool server, const std::vector<Byte>& cert_der,
     // identity. The chain is self-signed, so accept it unconditionally.
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER | SSL_VERIFY_FAIL_IF_NO_PEER_CERT,
                        accept_verify_cb);
-    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb, nullptr);
+    SSL_CTX_set_alpn_select_cb(ctx, alpn_select_cb,
+                               const_cast<std::vector<unsigned char>*>(&alpn));
   } else {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, nullptr);
     // Client advertises its single ALPN protocol (0 = success here).
-    SSL_CTX_set_alpn_protos(ctx, kAlpnWire, sizeof(kAlpnWire));
+    SSL_CTX_set_alpn_protos(ctx, alpn.data(),
+                            static_cast<unsigned int>(alpn.size()));
   }
 
   return ctx;
@@ -493,9 +520,11 @@ ngtcp2_callbacks Endpoint::Impl::make_callbacks(bool server) {
 }
 
 Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
-                     const std::string& ip, std::uint16_t port)
+                     const std::string& ip, std::uint16_t port,
+                     const std::string& network)
     : cert_der(identity.self_signed_certificate_der()),
       key_der(identity.private_key_pkcs8_der()),
+      alpn(make_alpn_wire(network)),
       self_pubkey(identity.public_key()) {
   // The ngtcp2 ossl backend needs a one-time global init (sets up the SSL
   // ex_data slots it uses); do it once for the whole process.
@@ -546,8 +575,8 @@ Endpoint::Impl::Impl(const tier::crypto::NodeIdentity& identity,
   ev.data.fd = timer_fd;
   ::epoll_ctl(epoll_fd, EPOLL_CTL_ADD, timer_fd, &ev);
 
-  server_ctx = make_ctx(true, cert_der, key_der);
-  client_ctx = make_ctx(false, cert_der, key_der);
+  server_ctx = make_ctx(true, cert_der, key_der, alpn);
+  client_ctx = make_ctx(false, cert_der, key_der, alpn);
 }
 
 Endpoint::Impl::~Impl() {
@@ -989,8 +1018,9 @@ void Endpoint::Impl::poll(int timeout_ms) {
 }
 
 Endpoint::Endpoint(const tier::crypto::NodeIdentity& identity,
-                   const std::string& ip, std::uint16_t port)
-    : impl_(std::make_unique<Impl>(identity, ip, port)) {}
+                   const std::string& ip, std::uint16_t port,
+                   const std::string& network)
+    : impl_(std::make_unique<Impl>(identity, ip, port, network)) {}
 
 Endpoint::~Endpoint() = default;
 

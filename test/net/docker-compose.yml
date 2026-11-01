@@ -1,0 +1,65 @@
+# A local, INTERNAL dual-stack mesh of four tier nodes. Used two ways:
+#   - localnet.sh: bring it up and poke it by hand.
+#   - e2e.sh:      bring it up, assert discovery + dual-stack, tear it down.
+#
+# The mesh is doubly isolated from production. (1) The network is
+# `internal: true`, so containers have NO route off the bridge; the baked
+# production seeds are unreachable and TIER_SEEDS (below) replaces them anyway.
+# (2) The image sets TIER_NETWORK=localnet, a private cluster, so even a stray
+# address overlap could not complete a handshake with a mainnet node. No
+# internet, no prod contamination.
+#
+# Requires Docker with IPv6 enabled on the daemon (see test/net/README.md).
+
+name: tier-localnet
+
+networks:
+  tiernet:
+    driver: bridge
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.77.0.0/24
+        - subnet: fd00:7177::/64
+
+# node1 is the bootstrap seed; it is pointed at node2 so it too has a peer to
+# dial. node2-4 join through node1 and the full membership spreads by gossip, so
+# the harness exercises real transitive discovery, not a preconfigured full mesh.
+services:
+  node1:
+    image: tier-localnet:latest
+    container_name: tier-node1
+    environment:
+      TIER_SEEDS: "[fd00:7177::21]:7777 10.77.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.77.0.11
+        ipv6_address: fd00:7177::11
+  node2:
+    image: tier-localnet:latest
+    container_name: tier-node2
+    environment:
+      TIER_SEEDS: "[fd00:7177::11]:7777 10.77.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.77.0.21
+        ipv6_address: fd00:7177::21
+  node3:
+    image: tier-localnet:latest
+    container_name: tier-node3
+    environment:
+      TIER_SEEDS: "[fd00:7177::11]:7777 10.77.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.77.0.31
+        ipv6_address: fd00:7177::31
+  node4:
+    image: tier-localnet:latest
+    container_name: tier-node4
+    environment:
+      TIER_SEEDS: "[fd00:7177::11]:7777 10.77.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.77.0.41
+        ipv6_address: fd00:7177::41

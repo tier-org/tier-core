@@ -33,6 +33,11 @@ target_link_libraries(test_gossip PRIVATE tier::net tier::core tier::crypto tier
 add_test(NAME gossip COMMAND test_gossip)
 set_tests_properties(gossip PROPERTIES TIMEOUT 60)
 
+add_executable(test_network test_network.cpp)
+target_link_libraries(test_network PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME network COMMAND test_network)
+set_tests_properties(network PROPERTIES TIMEOUT 60)
+
 add_executable(test_ipv6 test_ipv6.cpp)
 target_link_libraries(test_ipv6 PRIVATE tier::net tier::crypto tier::options)
 add_test(NAME ipv6 COMMAND test_ipv6)

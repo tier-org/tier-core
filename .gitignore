@@ -22,5 +22,8 @@ cmake-build-*/
 .cache/
 compile_commands.json
 
+# Docker mesh harness: binaries staged into the image build context
+/test/net/bin/
+
 # Прочее
 *.log

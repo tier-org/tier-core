@@ -54,6 +54,21 @@ jobs:
       - name: Test
         run: ctest --test-dir build --output-on-failure
 
+      # Pre-publish gate: a four-node dual-stack mesh must converge and advertise
+      # both address families before the .deb is built. Needs Docker IPv6, which
+      # the hosted runner does not enable by default.
+      - name: Enable Docker IPv6
+        run: |
+          sudo mkdir -p /etc/docker
+          echo '{"ipv6": true, "fixed-cidr-v6": "fd00:d0ck::/64", "ip6tables": true}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
+      - name: E2E mesh gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+        run: ./test/net/e2e.sh
+
       - name: Package
         run: cd build && cpack -G DEB
 

@@ -34,7 +34,7 @@ tier::net::Node make_node(const char* ip, std::uint16_t port) {
 int main() {
   // The baked seed list: two dialable "ip:port" per seed, IPv6 bracketed.
   const auto seeds = tier::core::default_seed_addresses();
-  check(seeds.size() == std::size(tier::core::kSeedNodes) * 2,
+  check(seeds.size() == std::size(tier::core::kMainnetSeeds) * 2,
         "two addresses per seed node");
   check(contains(seeds, "[2a0b:8c40:1::143]:7777"), "tier-01 IPv6 bracketed");
   check(contains(seeds, "66.220.12.143:7777"), "tier-01 IPv4 with port");
@@ -88,6 +88,24 @@ int main() {
     }
     check(!saw_self, "a self-connection is never routed as a neighbor");
     check(d.membership().size() == 1, "a self-dial adds no membership peer");
+  }
+
+  // TIER_SEEDS override parsing: comma and/or whitespace separated, empty tokens
+  // dropped, IPv6 brackets preserved, order kept.
+  {
+    const auto p = tier::core::parse_seed_list(
+        "[fd00::2]:7777, 10.0.0.2:7777\t10.0.0.3:7777");
+    check(p.size() == 3, "parse_seed_list splits on commas and whitespace");
+    check(p.size() == 3 && p[0] == "[fd00::2]:7777", "first token, brackets kept");
+    check(p.size() == 3 && p[1] == "10.0.0.2:7777", "second token");
+    check(p.size() == 3 && p[2] == "10.0.0.3:7777", "order preserved");
+
+    check(tier::core::parse_seed_list("").empty(), "empty spec yields no seeds");
+    check(tier::core::parse_seed_list("  , ,\n ").empty(),
+          "separators only yields no seeds");
+    const auto one = tier::core::parse_seed_list(",,[::1]:7777,,");
+    check(one.size() == 1 && one[0] == "[::1]:7777",
+          "surrounding separators are dropped");
   }
 
   if (g_failures == 0) {

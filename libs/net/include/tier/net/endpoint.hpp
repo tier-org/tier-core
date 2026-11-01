@@ -29,9 +29,11 @@ using ConnId = std::uint64_t;
 class Endpoint {
  public:
   // Bind a UDP socket to ip:port (port 0 = ephemeral). Throws std::runtime_error
-  // on socket or TLS setup failure.
+  // on socket or TLS setup failure. `network` selects the cluster: it is folded
+  // into the ALPN token, so peers on different networks cannot complete a
+  // handshake (see tier::core networks). Defaults to the mainnet cluster.
   Endpoint(const tier::crypto::NodeIdentity& identity, const std::string& ip,
-           std::uint16_t port);
+           std::uint16_t port, const std::string& network = "mainnet");
   ~Endpoint();
 
   Endpoint(const Endpoint&) = delete;

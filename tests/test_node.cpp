@@ -1,4 +1,8 @@
+#include <algorithm>
 #include <cstdio>
+#include <map>
+#include <set>
+#include <string>
 
 #include "tier/core/membership.hpp"
 #include "tier/crypto/identity.hpp"
@@ -54,6 +58,39 @@ int main() {
         "B sees A as a validator");
   check(b_sees_a.has_value() && tier::core::has_role(b_sees_a->roles, Role::keeper),
         "B sees A as a keeper too (multi-role survived gossip)");
+
+  // Address confirmation: a single dual-stack peer that has observed us over
+  // both IPv4 and IPv6 must yield BOTH addresses, not just the last reported.
+  // Regression: observed_ once stored one address per peer and overwrote it, so
+  // a dial-only node (highest id, only receives IPv6 autodials) collapsed to a
+  // single family - in the field tier-04 advertised only IPv6 though its IPv4
+  // was reachable.
+  {
+    using tier::core::PeerId;
+    PeerId p1{};
+    p1[0] = 1;
+    PeerId p2{};
+    p2[0] = 2;
+
+    std::map<PeerId, std::set<std::string>> observed;
+    observed[p1] = {"[2604:4500:9:7::2]:7777", "66.165.245.6:7777"};
+    const auto both = tier::net::Node::confirmed_addresses(observed, 1);
+    check(both.size() == 2, "one dual-stack peer confirms both families");
+    check(std::find(both.begin(), both.end(), "66.165.245.6:7777") != both.end(),
+          "IPv4 confirmed from a dual-stack peer");
+    check(std::find(both.begin(), both.end(), "[2604:4500:9:7::2]:7777") !=
+              both.end(),
+          "IPv6 confirmed from a dual-stack peer");
+
+    // Threshold still honored: an address seen by too few distinct peers is
+    // withheld, and one seen by enough is kept.
+    std::map<PeerId, std::set<std::string>> sparse;
+    sparse[p1] = {"10.0.0.1:7777", "10.0.0.9:7777"};
+    sparse[p2] = {"10.0.0.1:7777"};
+    const auto quorum = tier::net::Node::confirmed_addresses(sparse, 2);
+    check(quorum.size() == 1 && quorum.front() == "10.0.0.1:7777",
+          "only an address backed by >= threshold distinct peers is confirmed");
+  }
 
   if (g_failures == 0) {
     std::puts("ok");
