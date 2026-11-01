@@ -1,0 +1,46 @@
+name: ci
+
+# Build and test on every push to main and every pull request targeting it.
+# This is the test gate; publishing a .deb is a separate, tag-only workflow
+# (release.yml). Kept to the unit/integration tests (ctest) - fast and needing
+# no Docker; the Docker mesh e2e stays in the release gate.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# A newer push to the same branch/PR supersedes an in-flight run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Match the release runner so the test environment tracks what ships.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build
+          # The hosted ubuntu-22.04 runner already provides CMake >= 3.25.
+
+      # Debug build with the project defaults: AddressSanitizer +
+      # UndefinedBehaviorSanitizer on, warnings as errors. This is stricter than
+      # the release build (which turns both off) and is the point of the gate.
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure

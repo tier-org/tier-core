@@ -20,7 +20,7 @@ Docker with IPv6 enabled on the daemon. One-time setup in
 `/etc/docker/daemon.json`:
 
 ```json
-{ "experimental": true, "ipv6": true, "fixed-cidr-v6": "fd00:d0ck::/64", "ip6tables": true }
+{ "experimental": true, "ipv6": true, "fixed-cidr-v6": "fd00:d0cc::/64", "ip6tables": true }
 ```
 
 then `sudo systemctl restart docker`. (`ip6tables` is an experimental daemon
