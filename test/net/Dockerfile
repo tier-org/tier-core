@@ -3,6 +3,10 @@
 # enough. tierd and tierctl are staged into ./bin by build.sh before the build.
 FROM ubuntu:22.04
 
+# Labelled so build.sh can prune only this harness's dangling layers (the label
+# survives on an image after a rebuild moves its tag away).
+LABEL tier.harness=localnet
+
 COPY bin/tierd bin/tierctl /usr/local/bin/
 
 # Admin socket (for tierctl) and the node identity live inside the container;

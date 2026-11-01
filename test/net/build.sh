@@ -35,3 +35,10 @@ fi
 
 echo "== building image tier-localnet:latest =="
 docker build -t tier-localnet:latest -f "$here/Dockerfile" "$here"
+
+# Rebuilding the images above moves the tags onto fresh images and leaves the
+# previous layers dangling. Prune only ours (matched by the LABEL baked into
+# both Dockerfiles), so repeated runs do not accumulate <none> images and no
+# unrelated dangling images on the host are touched.
+echo "== pruning this harness's dangling images =="
+docker image prune -f --filter label=tier.harness=localnet >/dev/null 2>&1 || true

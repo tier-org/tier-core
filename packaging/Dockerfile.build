@@ -9,6 +9,10 @@
 # Ubuntu 22.04 ships CMake 3.22 (< the required 3.25), so CMake comes from pip.
 FROM ubuntu:22.04
 
+# Labelled so the localnet harness (build.sh) can prune only its own dangling
+# layers; the label survives on an image after a rebuild moves its tag away.
+LABEL tier.harness=localnet
+
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
