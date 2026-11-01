@@ -60,8 +60,22 @@ jobs:
       - name: Enable Docker IPv6
         run: |
           sudo mkdir -p /etc/docker
-          echo '{"ipv6": true, "fixed-cidr-v6": "fd00:d0ck::/64", "ip6tables": true}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
+          # Merge the IPv6 settings into any existing daemon.json rather than
+          # overwriting it (the hosted daemon may rely on other keys). ip6tables
+          # is still an EXPERIMENTAL daemon feature on the runner's Docker
+          # (< 27), so "experimental" must be enabled alongside it or the daemon
+          # refuses to start - which is what failed before.
+          [ -f /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+          merged="$(sudo jq '. + {experimental: true, ipv6: true, "fixed-cidr-v6": "fd00:d0ck::/64", ip6tables: true}' /etc/docker/daemon.json)"
+          echo "$merged" | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker \
+            || { sudo journalctl -xeu docker.service --no-pager | tail -n 60; exit 1; }
+          # Wait for the daemon to accept connections again before the gate runs.
+          for _ in $(seq 1 15); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info >/dev/null
 
       - name: E2E mesh gate
         env:

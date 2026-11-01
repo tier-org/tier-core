@@ -20,11 +20,13 @@ Docker with IPv6 enabled on the daemon. One-time setup in
 `/etc/docker/daemon.json`:
 
 ```json
-{ "ipv6": true, "fixed-cidr-v6": "fd00:d0ck::/64", "ip6tables": true }
+{ "experimental": true, "ipv6": true, "fixed-cidr-v6": "fd00:d0ck::/64", "ip6tables": true }
 ```
 
-then `sudo systemctl restart docker`. (The release workflow configures this
-automatically for CI.)
+then `sudo systemctl restart docker`. (`ip6tables` is an experimental daemon
+feature before Docker 27, so `experimental` must be set too or the daemon will
+not start; it is harmless to leave on with newer Docker. The release workflow
+configures this automatically for CI.)
 
 ## Use
 
