@@ -37,6 +37,7 @@
 
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/net/framing.hpp"
 
 namespace tier::net {
 
@@ -46,6 +47,14 @@ namespace {
 
 constexpr std::size_t kCidLen = 16;
 constexpr std::size_t kMaxUdpPayload = 1452;
+
+// Cap on bytes queued but not yet acknowledged on one connection's send stream.
+// A peer that keeps the connection open but stops extending its flow-control
+// window would otherwise let periodic gossip pile up without bound. On overflow
+// we first drop still-unsent chunks (never bytes already handed to ngtcp2, which
+// holds pointers to them until acked), then, if in-flight data alone exceeds the
+// cap, close the too-slow connection. See Impl::send.
+constexpr std::uint64_t kMaxSendQueueBytes = 4ULL * 1024 * 1024;
 
 // ALPN protocol name in TLS wire form: a single length-prefixed token
 // "tier/<proto-version>/<network>" ("0" is protocol v0). The network segment
@@ -66,10 +75,8 @@ std::vector<unsigned char> make_alpn_wire(std::string_view network) {
 }
 
 // Application framing: a 4-byte big-endian length prefix followed by the
-// payload. The cap bounds a single frame from an untrusted peer (this decoder
-// is a prime fuzz target).
-constexpr std::uint32_t kMaxFrameLen = 65536;
-
+// payload. The length cap (framing::kMaxFrameLen) bounds a single frame from an
+// untrusted peer; the frame decoder is framing::take_frame (a fuzz target).
 void append_frame(std::vector<Byte>& out, std::span<const Byte> payload) {
   const auto len = static_cast<std::uint32_t>(payload.size());
   out.push_back(static_cast<Byte>((len >> 24) & 0xFFU));
@@ -442,26 +449,23 @@ int Endpoint::Impl::recv_stream_data_cb(ngtcp2_conn* conn, std::uint32_t,
 
   c->in_buf.insert(c->in_buf.end(), data, data + datalen);
 
-  // Extract whole length-prefixed frames.
+  // Extract whole length-prefixed frames with the shared, fuzzed decoder.
   for (;;) {
-    if (c->in_buf.size() < 4) {
+    const auto f = framing::take_frame(c->in_buf);
+    if (f.status == framing::FrameStatus::incomplete) {
       break;
     }
-    const std::uint32_t len = (static_cast<std::uint32_t>(c->in_buf[0]) << 24) |
-                              (static_cast<std::uint32_t>(c->in_buf[1]) << 16) |
-                              (static_cast<std::uint32_t>(c->in_buf[2]) << 8) |
-                              static_cast<std::uint32_t>(c->in_buf[3]);
-    if (len > kMaxFrameLen) {
+    if (f.status == framing::FrameStatus::oversize) {
       c->closing = true;  // oversized frame from an untrusted peer
       return NGTCP2_ERR_CALLBACK_FAILURE;
     }
-    if (c->in_buf.size() < 4 + len) {
-      break;
-    }
-    std::vector<Byte> payload(c->in_buf.begin() + 4,
-                              c->in_buf.begin() + 4 + static_cast<std::ptrdiff_t>(len));
-    c->in_buf.erase(c->in_buf.begin(),
-                    c->in_buf.begin() + 4 + static_cast<std::ptrdiff_t>(len));
+    std::vector<Byte> payload(
+        c->in_buf.begin() + static_cast<std::ptrdiff_t>(f.payload_off),
+        c->in_buf.begin() +
+            static_cast<std::ptrdiff_t>(f.payload_off + f.payload_len));
+    c->in_buf.erase(
+        c->in_buf.begin(),
+        c->in_buf.begin() + static_cast<std::ptrdiff_t>(f.consumed));
     c->ep->handle_message(*c, payload);
   }
   return 0;
@@ -958,11 +962,37 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
     }
     c->stream_id = stream_id;
   }
+  // Frame the payload first so its size is known for the queue budget.
+  std::vector<Byte> framed;
+  append_frame(framed, payload);
+
+  // Bound the send queue. Bytes still queued but unacknowledged are
+  // `appended - total_acked`. If this frame would push the queue over the cap,
+  // first drop chunks from the back that ngtcp2 has not been handed yet (those
+  // whose base is at or past write_cursor) - dropping a stale, unsent gossip
+  // snapshot is harmless; the next one carries fresh state. Only once the
+  // unsent tail is gone and in-flight data alone still exceeds the cap do we
+  // give up on a peer that will not drain and close the connection.
+  const auto queued = [&]() -> std::uint64_t {
+    return c->appended - c->total_acked;
+  };
+  while (queued() + framed.size() > kMaxSendQueueBytes && !c->out.empty() &&
+         c->out.back().base >= c->write_cursor) {
+    c->out.pop_back();
+    c->appended = c->out.empty()
+                      ? c->write_cursor
+                      : c->out.back().base + c->out.back().data.size();
+  }
+  if (queued() + framed.size() > kMaxSendQueueBytes) {
+    c->closing = true;  // in-flight backlog alone over budget: drop the peer
+    return;
+  }
+
   // Queue the framed payload as a fresh chunk. Appending never touches chunks
   // already handed to ngtcp2, so their bytes stay put until acknowledged.
   Connection::OutChunk chunk;
   chunk.base = c->appended;
-  append_frame(chunk.data, payload);
+  chunk.data = std::move(framed);
   c->appended += chunk.data.size();
   c->out.push_back(std::move(chunk));
 }

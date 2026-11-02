@@ -2,7 +2,7 @@
 
 Core node for Tier, a decentralized network for encrypted messaging and payments.
 
-**Status:** early scaffold. The QUIC transport (ngtcp2 + wolfSSL) with mutual
+**Status:** early scaffold. The QUIC transport (ngtcp2 + OpenSSL) with mutual
 TLS 1.3 authentication and certificate-bound node identity handshakes, and the
 gossip/membership layer (SWIM) runs on top of it. NAT traversal (hole punching)
 and the relay node role are not implemented yet.
@@ -10,8 +10,8 @@ and the relay node role are not implemented yet.
 ## Layout
 
 - `libs/core` - transport-agnostic core (sans-I/O state machines)
-- `libs/crypto` - cryptographic seam (signing / KEX / hash), backed by wolfSSL
-- `libs/net` - QUIC networking (ngtcp2 + wolfSSL)
+- `libs/crypto` - cryptographic seam (signing / KEX / hash), backed by OpenSSL
+- `libs/net` - QUIC networking (ngtcp2 + OpenSSL)
 - `apps/node` - node daemon
 - `apps/cli` - command-line client
 - `tests` - unit tests (CTest)
@@ -27,11 +27,19 @@ TLS 1.3 / X.509 stack the certificate-bound identity relies on, and fast to
 batch-verify. Blockchain-ecosystem compatibility, secp256k1's main draw, is a
 non-goal here.
 
-Post-quantum algorithms are **experimental and unsupported**. ML-DSA
-(signatures) and a hybrid ML-KEM key exchange are planned behind the same
-algorithm-agnostic interfaces, but they are **not** enabled by default and
-**no guarantees whatsoever** are made about them - on-wire formats,
-interoperability, and security properties may change or break at any time.
+The TLS 1.3 **key exchange is post-quantum hybrid by default**: the handshake
+offers `X25519MLKEM768:X25519`, so it prefers hybrid X25519 + ML-KEM-768 and
+falls back to classical X25519 only against a peer that cannot do the hybrid
+group (`test_endpoint` asserts the hybrid group is negotiated). This protects
+session confidentiality against "harvest now, decrypt later": recorded traffic
+is not decryptable by a future quantum adversary even though the long-term
+identity keys are classical.
+
+Post-quantum **signatures**, by contrast, are **experimental and unsupported**.
+Node identity stays Ed25519; ML-DSA is planned behind the same
+algorithm-agnostic signing interface but is **not** enabled, and **no guarantees
+whatsoever** are made about it - on-wire formats, interoperability, and security
+properties may change or break at any time.
 
 The design goal is crypto-agility: every key, signature, and certificate is
 meant to carry an explicit algorithm identifier; a verifier supports a *set* of

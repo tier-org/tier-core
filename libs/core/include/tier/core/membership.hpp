@@ -42,6 +42,17 @@ enum class Liveness : std::uint8_t { alive = 0, suspect = 1, dead = 2 };
 
 struct PeerInfo {
   PeerId id{};
+  // The owner's 32-byte Ed25519 public key. The id is SHA-256 of this key, so a
+  // record is authentic only if sha256(public_key) == id and `signature` below
+  // verifies against this key. All-zero when unknown (a locally built record
+  // that has not been sealed yet, or a legacy/unsigned test record).
+  std::array<std::uint8_t, 32> public_key{};
+  // The owner's signature over its owner-asserted fields (see
+  // tier::core::membership_signing_payload). Empty when the record is unsigned.
+  // The network layer verifies this before trusting a gossiped record, so a peer
+  // cannot forge another peer's roles, version, addresses or incarnation. It is
+  // carried through gossip so a relayed record stays verifiable transitively.
+  std::vector<std::uint8_t> signature;
   // Candidate "ip:port" endpoints to dial, one per reachable interface/family
   // (e.g. an IPv4 and an IPv6 address). Empty if none is known yet. A node
   // advertises every address it is reachable at so a dialer can pick one of a

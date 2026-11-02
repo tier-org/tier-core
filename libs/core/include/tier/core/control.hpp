@@ -30,16 +30,56 @@ enum class ControlType : std::uint8_t {
 // std::nullopt on an empty message or an unknown type byte.
 std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in);
 
+// Owner public key carried with each membership record: a 32-byte Ed25519 key.
+// The owner's id is SHA-256 of this key, so a verifier recomputes the id and
+// rejects a record whose key does not hash to its claimed id.
+inline constexpr std::uint8_t kPublicKeyLen = 32;
+// Upper bound on the signature length byte. Ed25519 is 64 bytes; the extra room
+// leaves space without forcing a wire change the day a larger scheme is added
+// (a post-quantum signature will need this and the message budget revisited).
+inline constexpr std::uint8_t kMaxSignatureLen = 128;
+// Target cap on one membership message. Kept below the transport frame limit
+// (tier::net framing rejects frames over 65536 bytes) with margin, so a split
+// snapshot always fits a single frame. A table larger than this is sent as
+// several messages (see encode_membership_messages).
+inline constexpr std::size_t kMaxMembershipMessageBytes = 60000;
+
 // Encode a membership snapshot as a control message:
-//   [type:1][count:4 BE]( [id:32][role:1][incarnation:8 BE][liveness:1]
+//   [type:1][count:4 BE]( [id:32][pubkey:32][sig_len:1][sig:sig_len]
+//                          [role:1][incarnation:8 BE][liveness:1]
 //                          [addr_count:1]( [addr_len:2 BE][addr:addr_len] )*
 //                          [ver_len:1][ver:ver_len] )*
+// `pubkey` is the owner's Ed25519 public key and `sig` its signature over the
+// owner-asserted fields (see membership_signing_payload). The signature is not
+// checked here - the codec only moves bytes; the network layer verifies it
+// against the owner's id before trusting a record (owner-signed membership).
 std::vector<std::uint8_t> encode_membership_message(
     const std::vector<PeerInfo>& peers);
 
+// Encode a snapshot as one or more membership messages, each no larger than
+// `max_bytes`, so a table too big for a single transport frame is split into
+// self-contained, individually valid messages a peer merges incrementally. Each
+// returned message decodes on its own; peers are packed greedily and never
+// split across messages. The caller sends each in its own frame.
+std::vector<std::vector<std::uint8_t>> encode_membership_messages(
+    const std::vector<PeerInfo>& peers,
+    std::size_t max_bytes = kMaxMembershipMessageBytes);
+
+// The canonical byte string an owner signs to authenticate its own membership
+// record: a domain-separation tag, the network name, and the owner-asserted
+// fields (id, public key, roles, incarnation, addresses, version). Liveness is
+// deliberately excluded - it is a third-party SWIM assertion (suspect/dead) that
+// any peer may make and the owner refutes by raising its incarnation, so it must
+// not be bound by the owner's signature. Binding the network name stops a record
+// signed for one network from being replayed into another.
+std::vector<std::uint8_t> membership_signing_payload(std::string_view network,
+                                                      const PeerInfo& peer);
+
 // Decode a membership control message. Returns std::nullopt on any malformed or
 // out-of-bounds input (this is a decoder of untrusted bytes; it must never
-// crash and never trust a length). Trailing bytes are rejected.
+// crash and never trust a length). Trailing bytes are rejected. The signature is
+// returned verbatim for the caller to verify; a decoded record is not yet
+// trusted.
 std::optional<std::vector<PeerInfo>> decode_membership_message(
     std::span<const std::uint8_t> in);
 

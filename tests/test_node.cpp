@@ -4,11 +4,13 @@
 #include <set>
 #include <string>
 
+#include "tier/core/control.hpp"
 #include "tier/core/membership.hpp"
 #include "tier/core/semver.hpp"
 #include "tier/core/version.hpp"
 #include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
 
 namespace {
@@ -130,6 +132,74 @@ int main() {
           "D refuses C: C's version is outside D's version window");
     check(!d.membership().find(c.peer_id()).has_value(),
           "D never recorded C in membership");
+  }
+
+  // Owner-signed membership (A1 regression). A peer that completes the handshake
+  // but is not the owner of a record cannot inject or alter that record: the
+  // node verifies each gossiped record against the owner's key before merging.
+  {
+    using tier::core::Liveness;
+    tier::net::Node victim(tier::crypto::NodeIdentity::generate(),
+                           tier::core::role_bit(Role::client), "127.0.0.1", 0);
+    const auto victim_id = victim.peer_id();
+
+    // A bare endpoint with a different identity, standing in for a hostile peer.
+    tier::net::Endpoint attacker(tier::crypto::NodeIdentity::generate(),
+                                 "127.0.0.1", 0);
+    tier::net::ConnId conn = 0;
+    bool handshook = false;
+    attacker.on_handshake(
+        [&](tier::net::ConnId c, bool, const tier::net::PeerId&) {
+          conn = c;
+          handshook = true;
+        });
+    attacker.connect("127.0.0.1", victim.local_port());
+
+    for (int i = 0; i < 4000 && !handshook; ++i) {
+      attacker.poll(2);
+      victim.poll(2);
+    }
+    check(handshook, "forgery: attacker completes the handshake");
+
+    // Forge two records with no valid owner signature: a fabricated validator
+    // peer, and a rewrite of the victim's own record (new roles, high
+    // incarnation) - exactly the A1 scenario. Empty addresses so nothing is
+    // dialed.
+    tier::core::PeerInfo fake;
+    fake.id.fill(0x77);
+    fake.roles = tier::core::role_bit(Role::validator);
+    fake.version = "1.0.0";
+    fake.incarnation = 5;
+    fake.liveness = Liveness::alive;
+
+    tier::core::PeerInfo forged_self;
+    forged_self.id = victim_id;
+    forged_self.public_key.fill(0xAB);          // not the victim's key
+    forged_self.signature.assign(64, 0xCD);     // garbage signature
+    forged_self.roles = tier::core::role_bit(Role::validator) |
+                        tier::core::role_bit(Role::keeper);
+    forged_self.incarnation = 1000;             // tries to outrank the real one
+    forged_self.version = std::string(tier::core::version());
+    forged_self.liveness = Liveness::dead;      // tries to kill the victim
+
+    const auto msg = tier::core::encode_membership_message({fake, forged_self});
+    for (int i = 0; i < 400; ++i) {
+      attacker.send(conn, msg);
+      attacker.poll(2);
+      victim.poll(2);
+    }
+
+    check(victim.membership().size() == 1,
+          "forgery: victim admits no forged peer (still only itself)");
+    check(!victim.membership().find(fake.id).has_value(),
+          "forgery: fabricated peer rejected (id is not the hash of its key)");
+    const auto self = victim.membership().find(victim_id);
+    check(self.has_value() && self->roles == tier::core::role_bit(Role::client),
+          "forgery: victim's own roles unchanged by the forged record");
+    check(self.has_value() && self->liveness == Liveness::alive,
+          "forgery: victim not marked dead by the forged record");
+    check(self.has_value() && self->incarnation < 1000,
+          "forgery: forged high incarnation did not take");
   }
 
   if (g_failures == 0) {

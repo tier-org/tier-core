@@ -14,8 +14,11 @@
 #include <utility>
 #include <vector>
 
+#include <random>
+
 #include "tier/core/control.hpp"
 #include "tier/core/version.hpp"
+#include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/hash.hpp"
 
 namespace tier::net {
@@ -86,7 +89,9 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
            tier::core::VersionRange version_range)
     : identity_(std::move(identity)),
       self_id_(tier::crypto::sha256(identity_.public_key())),
-      endpoint_(identity_, ip, port, network),
+      network_(std::move(network)),
+      endpoint_(identity_, ip, port, network_),
+      rng_(std::random_device{}()),
       version_range_(std::move(version_range)),
       fd_(self_id_, membership_, swim,
           [this](const tier::core::PeerId& to,
@@ -110,7 +115,17 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
   me.version = std::string(tier::core::version());
   me.incarnation = 1;
   me.liveness = tier::core::Liveness::alive;
+  seal_self(me);
   membership_.apply(me);
+
+  // The failure detector refutes a suspicion of ourselves by raising our own
+  // incarnation; that changes an owner-signed field, so it must re-seal the
+  // record. Hand it a sealer rather than teach core about crypto.
+  fd_.set_self_sealer([this](const tier::core::PeerInfo& p) {
+    tier::core::PeerInfo sealed = p;
+    seal_self(sealed);
+    return sealed;
+  });
 
   endpoint_.on_handshake([this](ConnId conn, bool, const PeerId&) {
     push_membership(conn);
@@ -152,6 +167,15 @@ void Node::connect(const std::string& ip, std::uint16_t port) {
 
 void Node::bootstrap(const std::vector<std::string>& seeds) {
   const auto now = std::chrono::steady_clock::now();
+  // Keep the seed list for re-dialing: autodial only walks the membership, so a
+  // seed that never completed a handshake leaves no entry to retry from. The
+  // backoff clock starts after this first attempt (retry_seeds grows it).
+  seeds_ = seeds;
+  for (const std::string& addr : seeds_) {
+    if (is_dialable(addr)) {
+      seed_retry_[addr];  // default: next=now-epoch (eligible), attempts=0
+    }
+  }
   const auto self = membership_.find(self_id_);
   for (const std::string& addr : seeds) {
     if (!is_dialable(addr)) {
@@ -180,6 +204,12 @@ void Node::bootstrap(const std::vector<std::string>& seeds) {
     // Key the backoff by the canonical bracketed address so a seed we later
     // learn over gossip is not immediately redialed by autodial.
     dialed_[addr] = now;
+    // First attempt made: arm the seed retry clock so retry_seeds waits a
+    // backoff before trying this seed again.
+    if (const auto it = seed_retry_.find(addr); it != seed_retry_.end()) {
+      it->second.attempts = 1;
+      it->second.next = now + std::chrono::seconds(1);
+    }
   }
 }
 
@@ -222,17 +252,23 @@ void Node::poll(int timeout_ms) {
 
   // Periodic anti-entropy: push the current snapshot to all peers so the view
   // (including liveness changes the detector made) stays fresh and propagates
-  // transitively through a seed.
+  // transitively through a seed. A snapshot too large for one transport frame
+  // is split into several self-contained messages.
   constexpr auto kGossipInterval = std::chrono::milliseconds(100);
   if (now - last_gossip_ >= kGossipInterval) {
-    endpoint_.broadcast(tier::core::encode_membership_message(membership_.snapshot()));
+    for (const auto& msg :
+         tier::core::encode_membership_messages(membership_.snapshot())) {
+      endpoint_.broadcast(msg);
+    }
     last_gossip_ = now;
   }
 }
 
 void Node::push_membership(ConnId conn) {
-  endpoint_.send(conn,
-                 tier::core::encode_membership_message(membership_.snapshot()));
+  for (const auto& msg :
+       tier::core::encode_membership_messages(membership_.snapshot())) {
+    endpoint_.send(conn, msg);
+  }
 }
 
 void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
@@ -241,6 +277,15 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     return;
   }
   for (const tier::core::PeerInfo& peer : *decoded) {
+    // Authenticity first: a record is trusted only if it carries the owner's
+    // public key (hashing to its id) and a valid signature over the owner's
+    // fields for this network. This is the security boundary - a peer that
+    // relays membership cannot forge another peer's roles, version, addresses or
+    // incarnation, including the receiver's own record. An unverifiable record
+    // is dropped, never merged.
+    if (!verify_owner(peer)) {
+      continue;
+    }
     // Network version policy: do not admit a peer whose advertised version is
     // outside this network's window (an unconstrained range admits all; an
     // unknown/old version is admitted leniently). This gates membership only;
@@ -252,6 +297,25 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
       on_change_(peer);
     }
   }
+}
+
+void Node::seal_self(tier::core::PeerInfo& me) const {
+  const auto& pk = identity_.public_key();
+  std::copy(pk.begin(), pk.end(), me.public_key.begin());
+  me.signature =
+      identity_.signer().sign(tier::core::membership_signing_payload(network_, me));
+}
+
+bool Node::verify_owner(const tier::core::PeerInfo& p) const {
+  // The id must be the hash of the key the record carries, or the key is not
+  // the owner's and the signature below would be meaningless.
+  const tier::core::PeerId derived = tier::crypto::sha256(p.public_key);
+  if (derived != p.id) {
+    return false;
+  }
+  const tier::crypto::Ed25519Verifier verifier(p.public_key);
+  const auto payload = tier::core::membership_signing_payload(network_, p);
+  return verifier.verify(payload, p.signature);
 }
 
 std::vector<std::string> Node::confirmed_addresses(
@@ -314,6 +378,7 @@ void Node::handle_observed(const tier::core::PeerId& from,
   me.addresses = std::move(confirmed);
   me.incarnation += 1;
   me.liveness = tier::core::Liveness::alive;
+  seal_self(me);  // addresses and incarnation changed: re-sign
   membership_.apply(me);
   if (on_change_) {
     on_change_(me);
@@ -374,7 +439,50 @@ std::optional<std::string> Node::select_dial_candidate(
   return *best;
 }
 
+void Node::retry_seeds(std::chrono::steady_clock::time_point now) {
+  // Only retry while we have no live neighbor: once connected, anti-entropy and
+  // autodial over the learned membership take over. This is the recovery path
+  // for a node that outlived every connection or started before its seed.
+  if (!conn_by_peer_.empty()) {
+    return;
+  }
+  const auto self = membership_.find(self_id_);
+  for (auto& [addr, state] : seed_retry_) {
+    if (now < state.next || !is_dialable(addr) || addr == self_address_) {
+      continue;
+    }
+    if (self && std::find(self->addresses.begin(), self->addresses.end(),
+                          addr) != self->addresses.end()) {
+      continue;  // this seed is one of our own advertised addresses
+    }
+    const auto hp = split_host_port(addr);
+    if (!hp) {
+      continue;
+    }
+    try {
+      endpoint_.connect(hp->first, hp->second);
+    } catch (const std::exception&) {
+      // Unroutable right now; the backoff below still advances so we do not spin.
+    }
+    dialed_[addr] = now;
+    // Capped exponential backoff with jitter: 1s, 2s, 4s, ... up to 30s, each
+    // spread +/-25% so a fleet restarting together does not synchronize its
+    // reconnect attempts.
+    const unsigned shift = state.attempts < 5 ? state.attempts : 5;
+    const auto base = std::chrono::seconds(1) * (1U << shift);
+    const auto capped = std::min<std::chrono::steady_clock::duration>(
+        base, std::chrono::seconds(30));
+    std::uniform_int_distribution<int> jitter(-25, 25);
+    const auto delay = capped + (capped * jitter(rng_)) / 100;
+    state.next = now + delay;
+    if (state.attempts < 1000) {
+      ++state.attempts;
+    }
+  }
+}
+
 void Node::autodial(std::chrono::steady_clock::time_point now) {
+  retry_seeds(now);
   for (const tier::core::PeerInfo& p : membership_.snapshot()) {
     if (p.id == self_id_ || p.liveness == tier::core::Liveness::dead ||
         conn_by_peer_.count(p.id) != 0) {

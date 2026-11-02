@@ -96,3 +96,41 @@ jobs:
           TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
           TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
         run: ./test/net/e2e.sh
+
+  fuzz:
+    # Short smoke run of the libFuzzer targets for the untrusted-input decoders
+    # (membership, SWIM control, version, wire frame). libFuzzer needs Clang. The
+    # targets link only tier::core / header-only framing - no transport or
+    # OpenSSL - so this builds and runs fast. A crash fails the job.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-fuzz -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTIER_FUZZ=ON \
+            -DTIER_SANITIZE=OFF \
+            -DTIER_WERROR=OFF \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build fuzz targets
+        run: |
+          cmake --build build-fuzz -j \
+            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver
+
+      - name: Run each fuzzer briefly
+        run: |
+          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver; do
+            echo "== $t =="
+            ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1
+          done

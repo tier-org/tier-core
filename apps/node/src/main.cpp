@@ -1,12 +1,17 @@
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include <array>
+#include <cerrno>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
-#include <fstream>
 #include <optional>
 #include <span>
 #include <string>
@@ -94,37 +99,155 @@ std::string resolve_admin_path() {
   return "/run/tierd/tierd.sock";
 }
 
-// Load the node identity from a 32-byte seed file, creating (and persisting) a
-// fresh one if the file is absent. The seed is secret: file 0600, dir 0700.
-tier::crypto::NodeIdentity load_or_create_identity(const std::string& path) {
-  namespace fs = std::filesystem;
+// fsync the directory that holds `path` so a freshly created file is durable
+// across a crash (the rename below is only guaranteed after the directory entry
+// is flushed). Best effort: a failure here is reported by the caller's checks.
+bool fsync_parent_dir(const std::string& path) {
+  const std::filesystem::path p(path);
+  const std::string dir =
+      p.has_parent_path() ? p.parent_path().string() : std::string(".");
+  const int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0) {
+    return false;
+  }
+  const bool ok = ::fsync(fd) == 0;
+  ::close(fd);
+  return ok;
+}
 
-  std::error_code ec;
-  if (fs::exists(path, ec) &&
-      fs::file_size(path, ec) == tier::crypto::kEd25519SeedSize) {
-    std::array<tier::crypto::Byte, tier::crypto::kEd25519SeedSize> seed{};
-    std::ifstream in(path, std::ios::binary);
-    in.read(reinterpret_cast<char*>(seed.data()),
-            static_cast<std::streamsize>(seed.size()));
-    if (in.gcount() == static_cast<std::streamsize>(seed.size())) {
-      return tier::crypto::NodeIdentity::from_seed(seed);
+// Atomically persist the 32-byte seed to `path`: write a sibling temp file
+// (created 0600, before any secret byte is written), flush it, then rename it
+// into place and flush the directory. Returns false, leaving no new key in
+// place, on any failure. Never truncates an existing key file.
+bool persist_seed(const std::string& path,
+                  std::span<const tier::crypto::Byte> seed) {
+  const std::string tmp = path + ".tmp";
+  ::unlink(tmp.c_str());  // clear a leftover from a previous crash (ignore ENOENT)
+  const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+  if (fd < 0) {
+    std::fprintf(stderr, "cannot create key temp file %s: %s\n", tmp.c_str(),
+                 std::strerror(errno));
+    return false;
+  }
+  // Guarantee 0600 regardless of umask, before writing the secret.
+  if (::fchmod(fd, 0600) != 0) {
+    std::fprintf(stderr, "cannot set key file mode: %s\n", std::strerror(errno));
+    ::close(fd);
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  std::size_t written = 0;
+  while (written < seed.size()) {
+    const ssize_t n =
+        ::write(fd, seed.data() + written, seed.size() - written);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      std::fprintf(stderr, "cannot write key: %s\n", std::strerror(errno));
+      ::close(fd);
+      ::unlink(tmp.c_str());
+      return false;
     }
+    written += static_cast<std::size_t>(n);
+  }
+  if (::fsync(fd) != 0 || ::close(fd) != 0) {
+    std::fprintf(stderr, "cannot flush key file: %s\n", std::strerror(errno));
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  if (::rename(tmp.c_str(), path.c_str()) != 0) {
+    std::fprintf(stderr, "cannot install key file %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    ::unlink(tmp.c_str());
+    return false;
+  }
+  fsync_parent_dir(path);  // make the rename durable; non-fatal if unsupported
+  return true;
+}
+
+// Load the node identity from a 32-byte seed file, creating (and persisting) a
+// fresh one only when the file is confirmed absent. The seed is the node's
+// permanent network name, so this fails closed rather than silently minting a
+// new identity: a corrupt, wrong-sized, unreadable or otherwise present-but-bad
+// file aborts startup and is left untouched, and a new key is not used unless it
+// was durably written. Returns std::nullopt on any such error.
+std::optional<tier::crypto::NodeIdentity> load_or_create_identity(
+    const std::string& path) {
+  struct stat st {};
+  if (::stat(path.c_str(), &st) == 0) {
+    // The file exists: it must be a regular file of exactly the seed size and
+    // fully readable, or we stop. We never regenerate over an existing file.
+    if (!S_ISREG(st.st_mode)) {
+      std::fprintf(stderr, "key file %s is not a regular file\n", path.c_str());
+      return std::nullopt;
+    }
+    if (static_cast<std::uintmax_t>(st.st_size) != tier::crypto::kEd25519SeedSize) {
+      std::fprintf(stderr,
+                   "key file %s has wrong size (%lld bytes, expected %zu); "
+                   "refusing to overwrite - move it aside to mint a new key\n",
+                   path.c_str(), static_cast<long long>(st.st_size),
+                   static_cast<std::size_t>(tier::crypto::kEd25519SeedSize));
+      return std::nullopt;
+    }
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+      std::fprintf(stderr, "cannot open key file %s: %s\n", path.c_str(),
+                   std::strerror(errno));
+      return std::nullopt;
+    }
+    std::array<tier::crypto::Byte, tier::crypto::kEd25519SeedSize> seed{};
+    std::size_t got = 0;
+    bool read_ok = true;
+    while (got < seed.size()) {
+      const ssize_t n = ::read(fd, seed.data() + got, seed.size() - got);
+      if (n < 0) {
+        if (errno == EINTR) {
+          continue;
+        }
+        std::fprintf(stderr, "cannot read key file %s: %s\n", path.c_str(),
+                     std::strerror(errno));
+        read_ok = false;
+        break;
+      }
+      if (n == 0) {
+        break;  // short file despite the size check (raced); treated as an error
+      }
+      got += static_cast<std::size_t>(n);
+    }
+    ::close(fd);
+    if (!read_ok || got != seed.size()) {
+      std::fprintf(stderr, "key file %s could not be fully read; not starting\n",
+                   path.c_str());
+      return std::nullopt;
+    }
+    return tier::crypto::NodeIdentity::from_seed(seed);
+  }
+  if (errno != ENOENT) {
+    // Present but unstattable (e.g. a permission or I/O error): do not mask it
+    // by minting a new identity on top of a file we simply cannot see.
+    std::fprintf(stderr, "cannot access key file %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    return std::nullopt;
   }
 
-  const auto identity = tier::crypto::NodeIdentity::generate();
-  const fs::path file(path);
+  // Confirmed absent: create the parent directory (0700) and a fresh identity.
+  std::error_code ec;
+  const std::filesystem::path file(path);
   if (file.has_parent_path()) {
-    fs::create_directories(file.parent_path(), ec);
-    fs::permissions(file.parent_path(), fs::perms::owner_all,
-                    fs::perm_options::replace, ec);
+    std::filesystem::create_directories(file.parent_path(), ec);
+    if (ec) {
+      std::fprintf(stderr, "cannot create key directory %s: %s\n",
+                   file.parent_path().string().c_str(), ec.message().c_str());
+      return std::nullopt;
+    }
+    std::filesystem::permissions(file.parent_path(), std::filesystem::perms::owner_all,
+                                 std::filesystem::perm_options::replace, ec);
   }
-  std::ofstream out(path, std::ios::binary | std::ios::trunc);
-  const auto& seed = identity.seed();
-  out.write(reinterpret_cast<const char*>(seed.data()),
-            static_cast<std::streamsize>(seed.size()));
-  out.close();
-  fs::permissions(path, fs::perms::owner_read | fs::perms::owner_write,
-                  fs::perm_options::replace, ec);
+  const auto identity = tier::crypto::NodeIdentity::generate();
+  if (!persist_seed(path, identity.seed())) {
+    return std::nullopt;  // do not run with an unsaved identity
+  }
   return identity;
 }
 
@@ -393,7 +516,11 @@ int main(int argc, char** argv) {
   }
 
   const std::string id_path = resolve_id_path();
-  const auto identity = load_or_create_identity(id_path);
+  const auto identity_opt = load_or_create_identity(id_path);
+  if (!identity_opt) {
+    return 2;  // identity could not be loaded or safely created
+  }
+  const tier::crypto::NodeIdentity& identity = *identity_opt;
   std::printf("id file:  %s\n", id_path.c_str());
   const std::string_view cmd = argv[1];
 

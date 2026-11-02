@@ -35,8 +35,18 @@ void FailureDetector::refute_if_accused() {
     return;
   }
   PeerInfo me = *self;
-  me.incarnation = self->incarnation + 1;
+  // Saturate rather than wrap at the ceiling: a wrapped-to-zero incarnation
+  // would lose to the stored accusation and leave us stuck dead. With
+  // owner-signed membership no peer can push our incarnation here (only our own
+  // signed records change it), so the ceiling is unreachable in practice; this
+  // only makes the edge defined.
+  if (me.incarnation != UINT64_MAX) {
+    me.incarnation = self->incarnation + 1;
+  }
   me.liveness = Liveness::alive;
+  if (self_sealer_) {
+    me = self_sealer_(me);  // re-sign: incarnation is a signed field
+  }
   m_.apply(me);
   suspects_.erase(self_);
   dead_since_.erase(self_);

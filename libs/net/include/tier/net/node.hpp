@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <span>
 #include <string>
@@ -86,6 +87,16 @@ class Node {
  private:
   void push_membership(ConnId conn);
   void merge_message(std::span<const tier::crypto::Byte> payload);
+  // Seal our own record: stamp our public key and sign the owner-asserted fields
+  // for this network, so peers can verify the record we gossip is ours. Called
+  // whenever our own id/roles/version/addresses/incarnation change.
+  void seal_self(tier::core::PeerInfo& me) const;
+  // Verify a gossiped record is authentic: its id is the hash of the public key
+  // it carries, and its signature over the owner-asserted fields checks out
+  // against that key for this network. A record that fails is dropped, not
+  // merged, so no peer can forge another's roles, version, addresses or
+  // incarnation. Liveness is not signed (it is a third-party SWIM assertion).
+  [[nodiscard]] bool verify_owner(const tier::core::PeerInfo& p) const;
   // Record a peer's report of the address it observes us at; adopt it as our
   // advertised address once enough peers agree.
   void handle_observed(const tier::core::PeerId& from,
@@ -93,9 +104,16 @@ class Node {
   // Dial known peers we have learned of but are not yet connected to, forming a
   // mesh out of transitive discovery.
   void autodial(std::chrono::steady_clock::time_point now);
+  // Re-dial the bootstrap seeds while we have no neighbors, with capped
+  // exponential backoff and jitter, so a node that started before its seed (or
+  // lost every connection) reconnects without a restart or a manual bootstrap.
+  void retry_seeds(std::chrono::steady_clock::time_point now);
 
   tier::crypto::NodeIdentity identity_;
   tier::core::PeerId self_id_;
+  // The cluster this node joins; bound into each record's signature so a record
+  // signed for one network cannot be replayed into another.
+  std::string network_;
   tier::core::Membership membership_;
   Endpoint endpoint_;
   std::string self_address_;
@@ -111,6 +129,16 @@ class Node {
   // Per dialed "ip:port", when we last issued a connect, to rate-limit redials
   // and avoid a duplicate connection to a peer whose handshake is still pending.
   std::map<std::string, std::chrono::steady_clock::time_point> dialed_;
+  // Bootstrap seed addresses kept for re-dialing (see retry_seeds), with per
+  // seed backoff state: when it may next be attempted and how many attempts have
+  // failed (to grow the delay).
+  std::vector<std::string> seeds_;
+  struct SeedRetry {
+    std::chrono::steady_clock::time_point next{};
+    unsigned attempts = 0;
+  };
+  std::map<std::string, SeedRetry> seed_retry_;
+  std::mt19937 rng_;
   // This network's version policy; a gossiped peer outside it is not admitted
   // (see merge_message). Unconstrained by default.
   tier::core::VersionRange version_range_;

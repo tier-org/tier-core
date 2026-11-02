@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <string_view>
 #include <utility>
 
 namespace tier::core {
@@ -97,6 +98,84 @@ class Reader {
   std::size_t pos_ = 0;
 };
 
+// How many addresses of this peer are put on the wire (clamped to the bound).
+std::size_t wire_addr_count(const PeerInfo& p) noexcept {
+  return p.addresses.size() > kMaxAddressesPerPeer ? kMaxAddressesPerPeer
+                                                   : p.addresses.size();
+}
+
+// Append the owner-asserted fields (everything but liveness) that the signature
+// covers. Shared by the wire encoder and the signing-payload builder so the
+// bytes an owner signs are exactly the bytes a verifier reconstructs.
+void append_owner_fields(std::vector<std::uint8_t>& out, const PeerInfo& p) {
+  out.insert(out.end(), p.id.begin(), p.id.end());
+  out.insert(out.end(), p.public_key.begin(), p.public_key.end());
+  out.push_back(static_cast<std::uint8_t>(p.roles));
+  put_u64(out, p.incarnation);
+  const std::size_t addr_count = wire_addr_count(p);
+  out.push_back(static_cast<std::uint8_t>(addr_count));
+  for (std::size_t a = 0; a < addr_count; ++a) {
+    const std::string& addr = p.addresses[a];
+    const auto addr_len = static_cast<std::uint16_t>(
+        addr.size() > kMaxAddressLen ? kMaxAddressLen : addr.size());
+    put_u16(out, addr_len);
+    out.insert(out.end(), addr.begin(), addr.begin() + addr_len);
+  }
+  const auto ver_len = static_cast<std::uint8_t>(
+      p.version.size() > kMaxVersionLen ? kMaxVersionLen : p.version.size());
+  out.push_back(ver_len);
+  out.insert(out.end(), p.version.begin(), p.version.begin() + ver_len);
+}
+
+// Append one peer's full wire record: id, public key, signature, then the
+// owner-asserted fields with the liveness byte spliced in after the id/key/sig.
+void append_peer(std::vector<std::uint8_t>& out, const PeerInfo& p) {
+  out.insert(out.end(), p.id.begin(), p.id.end());
+  out.insert(out.end(), p.public_key.begin(), p.public_key.end());
+  const auto sig_len = static_cast<std::uint8_t>(
+      p.signature.size() > kMaxSignatureLen ? kMaxSignatureLen
+                                            : p.signature.size());
+  out.push_back(sig_len);
+  out.insert(out.end(), p.signature.begin(), p.signature.begin() + sig_len);
+  out.push_back(static_cast<std::uint8_t>(p.roles));
+  put_u64(out, p.incarnation);
+  out.push_back(static_cast<std::uint8_t>(p.liveness));
+  const std::size_t addr_count = wire_addr_count(p);
+  out.push_back(static_cast<std::uint8_t>(addr_count));
+  for (std::size_t a = 0; a < addr_count; ++a) {
+    const std::string& addr = p.addresses[a];
+    const auto addr_len = static_cast<std::uint16_t>(
+        addr.size() > kMaxAddressLen ? kMaxAddressLen : addr.size());
+    put_u16(out, addr_len);
+    out.insert(out.end(), addr.begin(), addr.begin() + addr_len);
+  }
+  const auto ver_len = static_cast<std::uint8_t>(
+      p.version.size() > kMaxVersionLen ? kMaxVersionLen : p.version.size());
+  out.push_back(ver_len);
+  out.insert(out.end(), p.version.begin(), p.version.begin() + ver_len);
+}
+
+// Exact number of wire bytes append_peer would emit for this peer.
+std::size_t peer_wire_size(const PeerInfo& p) noexcept {
+  const std::size_t sig_len =
+      p.signature.size() > kMaxSignatureLen ? kMaxSignatureLen
+                                            : p.signature.size();
+  std::size_t n = p.id.size() + p.public_key.size() + 1 /*sig_len*/ + sig_len +
+                  1 /*role*/ + 8 /*incarnation*/ + 1 /*liveness*/ +
+                  1 /*addr_count*/;
+  const std::size_t addr_count = wire_addr_count(p);
+  for (std::size_t a = 0; a < addr_count; ++a) {
+    n += 2 + (p.addresses[a].size() > kMaxAddressLen ? kMaxAddressLen
+                                                     : p.addresses[a].size());
+  }
+  n += 1 /*ver_len*/ +
+       (p.version.size() > kMaxVersionLen ? kMaxVersionLen : p.version.size());
+  return n;
+}
+
+// The 5-byte fixed header of a membership message: type(1) + count(4).
+inline constexpr std::size_t kMembershipHeaderBytes = 5;
+
 }  // namespace
 
 std::vector<std::uint8_t> encode_membership_message(
@@ -105,26 +184,49 @@ std::vector<std::uint8_t> encode_membership_message(
   out.push_back(static_cast<std::uint8_t>(ControlType::membership));
   put_u32(out, static_cast<std::uint32_t>(peers.size()));
   for (const PeerInfo& p : peers) {
-    out.insert(out.end(), p.id.begin(), p.id.end());
-    out.push_back(static_cast<std::uint8_t>(p.roles));
-    put_u64(out, p.incarnation);
-    out.push_back(static_cast<std::uint8_t>(p.liveness));
-    const std::size_t addr_count =
-        p.addresses.size() > kMaxAddressesPerPeer ? kMaxAddressesPerPeer
-                                                  : p.addresses.size();
-    out.push_back(static_cast<std::uint8_t>(addr_count));
-    for (std::size_t a = 0; a < addr_count; ++a) {
-      const std::string& addr = p.addresses[a];
-      const auto addr_len = static_cast<std::uint16_t>(
-          addr.size() > kMaxAddressLen ? kMaxAddressLen : addr.size());
-      put_u16(out, addr_len);
-      out.insert(out.end(), addr.begin(), addr.begin() + addr_len);
-    }
-    const auto ver_len = static_cast<std::uint8_t>(
-        p.version.size() > kMaxVersionLen ? kMaxVersionLen : p.version.size());
-    out.push_back(ver_len);
-    out.insert(out.end(), p.version.begin(), p.version.begin() + ver_len);
+    append_peer(out, p);
   }
+  return out;
+}
+
+std::vector<std::vector<std::uint8_t>> encode_membership_messages(
+    const std::vector<PeerInfo>& peers, std::size_t max_bytes) {
+  std::vector<std::vector<std::uint8_t>> messages;
+  std::vector<PeerInfo> batch;
+  std::size_t batch_bytes = kMembershipHeaderBytes;
+  for (const PeerInfo& p : peers) {
+    const std::size_t sz = peer_wire_size(p);
+    // Flush the current batch before it would exceed the budget, but never emit
+    // an empty message: a single peer larger than the budget (should not happen,
+    // a peer is far smaller than a frame) still goes out on its own.
+    if (!batch.empty() && batch_bytes + sz > max_bytes) {
+      messages.push_back(encode_membership_message(batch));
+      batch.clear();
+      batch_bytes = kMembershipHeaderBytes;
+    }
+    batch.push_back(p);
+    batch_bytes += sz;
+  }
+  if (!batch.empty() || peers.empty()) {
+    messages.push_back(encode_membership_message(batch));
+  }
+  return messages;
+}
+
+std::vector<std::uint8_t> membership_signing_payload(std::string_view network,
+                                                     const PeerInfo& peer) {
+  // Domain-separation tag: binds the signature to this exact purpose so it can
+  // never be mistaken for a signature over anything else. Versioned for a future
+  // format change.
+  static constexpr std::string_view kTag = "tier-membership-v1";
+  std::vector<std::uint8_t> out;
+  out.insert(out.end(), kTag.begin(), kTag.end());
+  out.push_back(0x00);  // separator between the tag and the network name
+  put_u16(out, static_cast<std::uint16_t>(network.size() > 0xFFFFU
+                                              ? 0xFFFFU
+                                              : network.size()));
+  out.insert(out.end(), network.begin(), network.end());
+  append_owner_fields(out, peer);
   return out;
 }
 
@@ -152,6 +254,22 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
       return std::nullopt;
     }
     std::copy(id_bytes.begin(), id_bytes.end(), p.id.begin());
+
+    std::span<const std::uint8_t> pubkey_bytes;
+    if (!r.bytes(p.public_key.size(), pubkey_bytes)) {
+      return std::nullopt;
+    }
+    std::copy(pubkey_bytes.begin(), pubkey_bytes.end(), p.public_key.begin());
+
+    std::uint8_t sig_len = 0;
+    if (!r.u8(sig_len) || sig_len > kMaxSignatureLen) {
+      return std::nullopt;
+    }
+    std::span<const std::uint8_t> sig_bytes;
+    if (!r.bytes(sig_len, sig_bytes)) {
+      return std::nullopt;
+    }
+    p.signature.assign(sig_bytes.begin(), sig_bytes.end());
 
     std::uint8_t roles = 0;
     // Reject any bit outside the defined role set (roles | kAllRoles would then

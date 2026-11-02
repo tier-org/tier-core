@@ -69,6 +69,15 @@ class FailureDetector {
   bool handle(Clock::time_point now, const PeerId& from,
               std::span<const std::uint8_t> msg);
 
+  // Install a hook that re-stamps our own record when refutation raises our
+  // incarnation. Owner-signed membership binds incarnation into the signature,
+  // so a bumped self record must be re-signed before it is stored and gossiped;
+  // the detector lives in core and cannot sign, so the owner supplies this. With
+  // no sealer installed the record is stored as built (used by unit tests that
+  // do not exercise signatures).
+  using SelfSealer = std::function<PeerInfo(const PeerInfo&)>;
+  void set_self_sealer(SelfSealer sealer) { self_sealer_ = std::move(sealer); }
+
  private:
   void refute_if_accused();
   void scan_membership(Clock::time_point now);
@@ -86,6 +95,7 @@ class FailureDetector {
   Membership& m_;
   SwimConfig cfg_;
   SendFn send_;
+  SelfSealer self_sealer_;  // re-signs our record on refutation; may be empty
 
   std::uint64_t next_seq_ = 1;
 

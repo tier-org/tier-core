@@ -43,6 +43,13 @@ bool Membership::apply(const PeerInfo& update) {
   if (merged.version.empty()) {
     merged.version = it->second.version;
   }
+  // Keep the owner's public key and signature when an update omits them, so a
+  // record stays verifiable after a liveness-only merge. A real signed update
+  // always carries its own, so this only fills in for an unsigned report.
+  if (merged.signature.empty()) {
+    merged.public_key = it->second.public_key;
+    merged.signature = it->second.signature;
+  }
   it->second = std::move(merged);
   return true;
 }

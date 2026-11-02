@@ -49,6 +49,14 @@ int main() {
   in[1].version = "0.2.4";
   in[2].version = "1.0.0-rc.1+build.7";
 
+  // Public key and signature must round-trip too: empty (unsigned), a short
+  // signature, and a full 64-byte Ed25519-sized one.
+  in[0].public_key.fill(0x11);
+  in[1].public_key.fill(0x22);
+  in[1].signature = {0xDE, 0xAD, 0xBE, 0xEF};
+  in[2].public_key.fill(0x33);
+  in[2].signature.assign(64, 0x5A);
+
   const auto encoded = tier::core::encode_membership_message(in);
   check(tier::core::peek_control_type(encoded) ==
             tier::core::ControlType::membership,
@@ -62,6 +70,8 @@ int main() {
       const auto& a = in[i];
       const auto& b = (*decoded)[i];
       check(a.id == b.id, "id round-trips");
+      check(a.public_key == b.public_key, "public key round-trips");
+      check(a.signature == b.signature, "signature round-trips");
       check(a.incarnation == b.incarnation, "incarnation round-trips");
       check(a.liveness == b.liveness, "liveness round-trips");
       check(a.roles == b.roles, "role set round-trips");
@@ -93,8 +103,10 @@ int main() {
   }
 
   // Hand-built corruptions of a single-peer message. Layout:
-  //   type(1) count(4) id(32) role(1) incarnation(8) liveness(1) addr_count(1)...
-  // so the role byte is at offset 37 and addr_count at offset 47.
+  //   type(1) count(4) id(32) pubkey(32) sig_len(1) [sig] role(1) incarnation(8)
+  //   liveness(1) addr_count(1)...
+  // The peer() helper leaves the signature empty (sig_len = 0), so the role byte
+  // is at offset 5+32+32+1 = 70 and addr_count at 70+1+8+1 = 80.
   const auto one = tier::core::encode_membership_message(
       {peer(0x04, tier::core::role_bit(Role::client), 1, Liveness::alive,
             {"1.2.3.4:5"})});
@@ -102,7 +114,7 @@ int main() {
   // An address count above the per-peer bound is rejected.
   {
     auto bad = one;
-    bad[47] = static_cast<std::uint8_t>(tier::core::kMaxAddressesPerPeer + 1);
+    bad[80] = static_cast<std::uint8_t>(tier::core::kMaxAddressesPerPeer + 1);
     check(!tier::core::decode_membership_message(bad).has_value(),
           "addr_count over the bound is rejected");
   }
@@ -110,9 +122,17 @@ int main() {
   // A role byte with a bit outside the defined role set is rejected.
   {
     auto bad = one;
-    bad[37] = static_cast<std::uint8_t>(tier::core::kAllRoles | 0x10U);
+    bad[70] = static_cast<std::uint8_t>(tier::core::kAllRoles | 0x10U);
     check(!tier::core::decode_membership_message(bad).has_value(),
           "unknown role bit is rejected");
+  }
+
+  // A signature length above the bound is rejected (bounds an attacker's word).
+  {
+    auto bad = one;
+    bad[69] = static_cast<std::uint8_t>(tier::core::kMaxSignatureLen + 1);
+    check(!tier::core::decode_membership_message(bad).has_value(),
+          "sig_len over the bound is rejected");
   }
 
   // A version carrying a control character is rejected (it would be rendered by
@@ -138,6 +158,39 @@ int main() {
     check(round.has_value() && round->size() == 1 &&
               (*round)[0].version.size() == tier::core::kMaxVersionLen,
           "over-long version is clamped to the bound");
+  }
+
+  // A snapshot too large for one frame is split into several self-contained
+  // messages, each within the byte budget, together carrying every peer exactly
+  // once. (A3: an honest table that outgrows a single frame must still converge.)
+  {
+    std::vector<tier::core::PeerInfo> many;
+    for (int i = 0; i < 500; ++i) {
+      auto p = peer(static_cast<std::uint8_t>(i), tier::core::role_bit(Role::client),
+                    1, Liveness::alive, {"10.0.0.1:7777", "[2001:db8::1]:7777"});
+      p.id[1] = static_cast<std::uint8_t>(i >> 8);  // keep ids distinct past 255
+      p.version = "1.2.3";
+      p.signature.assign(64, 0x5A);
+      many.push_back(p);
+    }
+    const std::size_t budget = 4096;
+    const auto msgs = tier::core::encode_membership_messages(many, budget);
+    check(msgs.size() > 1, "a large snapshot splits into several messages");
+    std::size_t total = 0;
+    bool all_ok = true;
+    for (const auto& m : msgs) {
+      if (m.size() > budget) {
+        all_ok = false;
+      }
+      const auto d = tier::core::decode_membership_message(m);
+      if (!d) {
+        all_ok = false;
+        break;
+      }
+      total += d->size();
+    }
+    check(all_ok, "every split message is within budget and decodes on its own");
+    check(total == many.size(), "the split carries every peer exactly once");
   }
 
   if (g_failures == 0) {

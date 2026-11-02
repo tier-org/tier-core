@@ -4,9 +4,14 @@ if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 
 # Each decoder of untrusted input gets a libFuzzer target (see the security
-# process in the spec). fuzz_frame is the placeholder for the wire-frame decoder.
+# process in the spec). fuzz_frame drives the wire-frame length-prefix decoder
+# (tier::net::framing::take_frame), which is header-only, so it needs the net and
+# crypto include paths but not the heavy transport library.
 add_executable(fuzz_frame fuzz_frame.cpp)
 target_link_libraries(fuzz_frame PRIVATE tier::options)
+target_include_directories(fuzz_frame PRIVATE
+  "${CMAKE_SOURCE_DIR}/libs/net/include"
+  "${CMAKE_SOURCE_DIR}/libs/crypto/include")
 target_compile_options(fuzz_frame PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_frame PRIVATE -fsanitize=fuzzer)
 
