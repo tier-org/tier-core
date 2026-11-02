@@ -38,6 +38,7 @@
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/net/framing.hpp"
+#include "tier/net/send_queue.hpp"
 
 namespace tier::net {
 
@@ -53,8 +54,9 @@ constexpr std::size_t kMaxUdpPayload = 1452;
 // window would otherwise let periodic gossip pile up without bound. On overflow
 // we first drop still-unsent chunks (never bytes already handed to ngtcp2, which
 // holds pointers to them until acked), then, if in-flight data alone exceeds the
-// cap, close the too-slow connection. See Impl::send.
-constexpr std::uint64_t kMaxSendQueueBytes = 4ULL * 1024 * 1024;
+// cap, close the too-slow connection. The admission decision itself is the pure
+// sendq::plan_admit (header-only, unit-tested); see Impl::send.
+using sendq::kMaxSendQueueBytes;
 
 // ALPN protocol name in TLS wire form: a single length-prefixed token
 // "tier/<proto-version>/<network>" ("0" is protocol v0). The network segment
@@ -973,17 +975,17 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
   // snapshot is harmless; the next one carries fresh state. Only once the
   // unsent tail is gone and in-flight data alone still exceeds the cap do we
   // give up on a peer that will not drain and close the connection.
-  const auto queued = [&]() -> std::uint64_t {
-    return c->appended - c->total_acked;
-  };
-  while (queued() + framed.size() > kMaxSendQueueBytes && !c->out.empty() &&
-         c->out.back().base >= c->write_cursor) {
+  const auto decision = sendq::plan_admit(
+      c->out.size(), [&](std::size_t i) { return c->out[i].base; }, c->appended,
+      c->write_cursor, c->total_acked, static_cast<std::uint64_t>(framed.size()),
+      kMaxSendQueueBytes);
+  for (std::size_t i = 0; i < decision.drop_from_back; ++i) {
     c->out.pop_back();
     c->appended = c->out.empty()
                       ? c->write_cursor
                       : c->out.back().base + c->out.back().data.size();
   }
-  if (queued() + framed.size() > kMaxSendQueueBytes) {
+  if (!decision.admit) {
     c->closing = true;  // in-flight backlog alone over budget: drop the peer
     return;
   }

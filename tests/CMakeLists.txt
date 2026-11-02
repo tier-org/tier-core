@@ -22,6 +22,12 @@ add_executable(test_control test_control.cpp)
 target_link_libraries(test_control PRIVATE tier::core tier::options)
 add_test(NAME control COMMAND test_control)
 
+add_executable(test_send_queue test_send_queue.cpp)
+target_link_libraries(test_send_queue PRIVATE tier::options)
+target_include_directories(test_send_queue PRIVATE
+  "${CMAKE_SOURCE_DIR}/libs/net/include")
+add_test(NAME send_queue COMMAND test_send_queue)
+
 add_executable(test_net_backend test_net_backend.cpp)
 target_link_libraries(test_net_backend PRIVATE tier::net tier::options)
 add_test(NAME net_backend COMMAND test_net_backend)
