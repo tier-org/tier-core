@@ -57,9 +57,13 @@ int main() {
   // (observed) address through A, they dial each other directly. Success means
   // every node holds a live connection to both others, i.e. transitive
   // discovery became transitive connectivity.
+  //
+  // All three are infrastructure (backbone) nodes, since only infrastructure
+  // peers dial each other - two edge clients never form a direct connection
+  // (docs/topology.md). The edge asymmetry is covered by test_topology.
   tier::net::Node a = make_node(Role::validator);
-  tier::net::Node b = make_node(Role::client);
-  tier::net::Node c = make_node(Role::client);
+  tier::net::Node b = make_node(Role::transmitter);
+  tier::net::Node c = make_node(Role::transmitter);
 
   b.connect("127.0.0.1", a.local_port());
   c.connect("127.0.0.1", a.local_port());

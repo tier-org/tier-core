@@ -12,6 +12,8 @@
 #include <cstring>
 #include <exception>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <span>
 #include <string>
@@ -29,6 +31,8 @@
 #include "tier/net/admin_listener.hpp"
 #include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
+
+#include "config.hpp"
 
 namespace {
 
@@ -73,6 +77,52 @@ std::string format_roles(tier::core::RoleSet roles) {
   return out.empty() ? "-" : out;
 }
 
+// Parse the roles this node holds from TIER_ROLES: role names separated by
+// '|', ',' or whitespace, e.g. "transmitter" or "validator|keeper". An unset or
+// empty value yields the plain client role, so the default node is an edge node
+// (dial-out only) - see docs/topology.md. Returns std::nullopt on an unknown
+// name so the caller can fail closed with a diagnostic.
+std::optional<tier::core::RoleSet> parse_roles(const char* spec) {
+  if (spec == nullptr) {
+    return tier::core::role_bit(tier::core::Role::client);
+  }
+  tier::core::RoleSet roles = 0;
+  std::string token;
+  const auto flush = [&]() -> bool {
+    if (token.empty()) {
+      return true;
+    }
+    bool matched = false;
+    for (const tier::core::Role r :
+         {tier::core::Role::client, tier::core::Role::validator,
+          tier::core::Role::keeper, tier::core::Role::transmitter}) {
+      if (token == role_name(r)) {
+        roles |= tier::core::role_bit(r);
+        matched = true;
+        break;
+      }
+    }
+    token.clear();
+    return matched;
+  };
+  for (const char c : std::string_view(spec)) {
+    if (c == '|' || c == ',' || c == ' ' || c == '\t') {
+      if (!flush()) {
+        return std::nullopt;
+      }
+    } else {
+      token.push_back(c);
+    }
+  }
+  if (!flush()) {
+    return std::nullopt;
+  }
+  if (roles == 0) {
+    roles = tier::core::role_bit(tier::core::Role::client);
+  }
+  return roles;
+}
+
 // Where the node's long-term Ed25519 seed lives. Override with TIER_ID_FILE
 // (e.g. /etc/tier-network/id or /var/lib/tier/id for a system daemon);
 // otherwise a non-root XDG state path is used.
@@ -97,6 +147,49 @@ std::string resolve_admin_path() {
     return env;
   }
   return "/run/tierd/tierd.sock";
+}
+
+// Load the operator config file. TIER_CONFIG overrides the default path
+// (/etc/tier/tierd.toml). A default path that does not exist is not an error -
+// the node then runs on environment variables and baked defaults alone. An
+// explicit TIER_CONFIG that cannot be read, or a file that fails to parse, is a
+// fatal operator error: returns std::nullopt with `error` set. `found` reports
+// whether a file was actually loaded (for logging).
+std::optional<tier::node::Config> load_node_config(std::string& error,
+                                                   bool& found,
+                                                   std::string& path_out) {
+  found = false;
+  bool explicit_path = false;
+  std::string path = "/etc/tier/tierd.toml";
+  if (const char* const env = std::getenv("TIER_CONFIG");
+      env != nullptr && *env != '\0') {
+    path = env;
+    explicit_path = true;
+  }
+  path_out = path;
+
+  std::ifstream in(path, std::ios::binary);
+  if (!in) {
+    if (explicit_path) {
+      error = "cannot open config file " + path;
+      return std::nullopt;
+    }
+    return tier::node::Config{};  // no default file: env/baked only
+  }
+  std::string text((std::istreambuf_iterator<char>(in)),
+                   std::istreambuf_iterator<char>());
+  if (in.bad()) {
+    error = "cannot read config file " + path;
+    return std::nullopt;
+  }
+  std::string parse_error;
+  auto cfg = tier::node::parse_config(text, parse_error);
+  if (!cfg) {
+    error = path + ": " + parse_error;
+    return std::nullopt;
+  }
+  found = true;
+  return cfg;
 }
 
 // fsync the directory that holds `path` so a freshly created file is durable
@@ -359,10 +452,41 @@ int run_networks() {
 // Long-lived participant: gossips membership and logs every peer it learns of.
 int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
              const char* seed_ip, std::uint16_t seed_port, bool has_seed) {
+  // Operator config file (TIER_CONFIG or /etc/tier/tierd.toml). It is the
+  // canonical home for the knobs below; an environment variable, when set,
+  // overrides the file for its knob, and a command-line argument overrides the
+  // environment. A missing default file is fine (env/baked only); a bad file is
+  // a fatal operator error.
+  std::string config_error;
+  bool config_found = false;
+  std::string config_path;
+  const auto config = load_node_config(config_error, config_found, config_path);
+  if (!config) {
+    std::fprintf(stderr, "%s\n", config_error.c_str());
+    return 2;
+  }
+  if (config_found) {
+    std::printf("config: %s\n", config_path.c_str());
+  }
+  const auto join = [](const std::vector<std::string>& v, char sep) {
+    std::string out;
+    for (const auto& s : v) {
+      if (!out.empty()) {
+        out.push_back(sep);
+      }
+      out += s;
+    }
+    return out;
+  };
+
   // Resolve the network (cluster) this node joins. TIER_NETWORK selects it;
-  // unset means mainnet. Networks are isolated at the handshake, so a typo would
-  // silently strand the node on a cluster of one - validate and fail fast.
+  // unset means the config file, then mainnet. Networks are isolated at the
+  // handshake, so a typo would silently strand the node on a cluster of one -
+  // validate and fail fast.
   std::string network(tier::core::kDefaultNetwork);
+  if (config->network) {
+    network = *config->network;
+  }
   if (const char* const env = std::getenv("TIER_NETWORK");
       env != nullptr && *env != '\0') {
     network = env;
@@ -381,14 +505,21 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   // override is an operator error - fail fast rather than join unconstrained.
   tier::core::VersionRange version_range =
       tier::core::network_version_range(network);
+  std::optional<std::string> version_range_spec;
+  if (config->version_range) {
+    version_range_spec = *config->version_range;
+  }
   if (const char* const env = std::getenv("TIER_VERSION_RANGE");
       env != nullptr && *env != '\0') {
-    const auto parsed = tier::core::parse_version_range(env);
+    version_range_spec = env;
+  }
+  if (version_range_spec) {
+    const auto parsed = tier::core::parse_version_range(*version_range_spec);
     if (!parsed) {
       std::fprintf(stderr,
-                   "invalid TIER_VERSION_RANGE '%s' (expected \"min,max\", "
+                   "invalid version_range '%s' (expected \"min,max\", "
                    "min inclusive and max exclusive, e.g. \"1.4.0,1.5.0\")\n",
-                   env);
+                   version_range_spec->c_str());
       return 2;
     }
     version_range = *parsed;
@@ -408,10 +539,36 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
                 tier::core::to_string(version_range).c_str());
   }
 
+  // Roles this node holds (config `roles`, overridable by TIER_ROLES; default
+  // plain client). A client is an edge node - dial-out only; any other role
+  // makes it reachable infrastructure (docs/topology.md). Fail fast on an
+  // unknown name rather than start with a silently wrong role set.
+  std::string roles_spec;
+  bool roles_set = false;
+  if (config->roles) {
+    roles_spec = join(*config->roles, '|');
+    roles_set = true;
+  }
+  if (const char* const env = std::getenv("TIER_ROLES");
+      env != nullptr && *env != '\0') {
+    roles_spec = env;
+    roles_set = true;
+  }
+  const auto roles = parse_roles(roles_set ? roles_spec.c_str() : nullptr);
+  if (!roles) {
+    std::fprintf(stderr,
+                 "invalid roles '%s' (expected names from "
+                 "client|validator|keeper|transmitter, e.g. \"transmitter\" or "
+                 "\"validator|keeper\")\n",
+                 roles_spec.c_str());
+    return 2;
+  }
+  std::printf("roles: %s\n", format_roles(*roles).c_str());
+
   // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
-  tier::net::Node node(identity, tier::core::role_bit(tier::core::Role::client),
-                       "::", port, {}, network, version_range);
+  tier::net::Node node(identity, *roles, "::", port, {}, network,
+                       version_range);
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -436,16 +593,19 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   // is enough; the rest of the membership arrives by anti-entropy. A node that
   // is itself a seed skips its own address.
   //
-  // TIER_SEEDS, when set and non-empty, FULLY replaces the baked list (private
-  // networks, localnet, e2e tests): the node then dials only those addresses and
-  // never the production seeds. An override that parses to nothing is honored as
-  // an isolated node rather than silently falling back, so a test net can never
-  // leak onto the real network.
+  // The config `seeds` list, or TIER_SEEDS when set, FULLY replaces the baked
+  // list (private networks, localnet, e2e tests): the node then dials only those
+  // addresses and never the production seeds. An override that parses to nothing
+  // is honored as an isolated node rather than silently falling back, so a test
+  // net can never leak onto the real network. Env overrides the config file.
   std::vector<std::string> seeds;
   if (const char* const env = std::getenv("TIER_SEEDS");
       env != nullptr && *env != '\0') {
     seeds = tier::core::parse_seed_list(env);
     std::printf("TIER_SEEDS override: %zu seed address(es)\n", seeds.size());
+  } else if (config->seeds) {
+    seeds = tier::core::parse_seed_list(join(*config->seeds, ' '));
+    std::printf("config seeds: %zu seed address(es)\n", seeds.size());
   } else {
     seeds = tier::core::seed_addresses(network);
     std::printf("dialing %zu preconfigured seed address(es) for %s\n",

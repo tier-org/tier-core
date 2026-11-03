@@ -17,6 +17,10 @@ install(FILES "${CMAKE_SOURCE_DIR}/packaging/systemd/tierd.service"
         DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/system")
 install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.env"
         DESTINATION "/etc/tier")
+# Structured node configuration (roles, network, seeds, version policy). Also a
+# conffile, so operator edits survive package upgrades.
+install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.toml"
+        DESTINATION "/etc/tier")
 
 # Package version: PROJECT_VERSION by default, overridden from the git tag in CI
 # via -DTIER_VERSION=<x.y.z>.

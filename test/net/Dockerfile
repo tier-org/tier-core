@@ -14,9 +14,14 @@ COPY bin/tierd bin/tierctl /usr/local/bin/
 # service in docker-compose.yml and fully replaces the baked production seeds.
 # TIER_NETWORK puts the mesh on a private cluster ("localnet"), isolated from
 # mainnet at the handshake even if an address happened to overlap.
+# TIER_ROLES=transmitter marks every localnet node as reachable infrastructure
+# (backbone), so role-aware autodial forms the full mesh the gate asserts; a
+# plain-client (edge) node would only dial out to seeds and never mesh with
+# peers it learned by gossip (docs/topology.md).
 ENV TIER_ADMIN_SOCK=/run/tierd/tierd.sock \
     TIER_ID_FILE=/var/lib/tier/node_key \
-    TIER_NETWORK=localnet
+    TIER_NETWORK=localnet \
+    TIER_ROLES=transmitter
 
 RUN mkdir -p /run/tierd /var/lib/tier
 

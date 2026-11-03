@@ -28,6 +28,14 @@ target_include_directories(test_send_queue PRIVATE
   "${CMAKE_SOURCE_DIR}/libs/net/include")
 add_test(NAME send_queue COMMAND test_send_queue)
 
+# The node config parser is a header in the daemon's source dir (apps/node/src),
+# unit tested here without building the daemon.
+add_executable(test_config test_config.cpp)
+target_link_libraries(test_config PRIVATE tier::options)
+target_include_directories(test_config PRIVATE
+  "${CMAKE_SOURCE_DIR}/apps/node/src")
+add_test(NAME config COMMAND test_config)
+
 add_executable(test_net_backend test_net_backend.cpp)
 target_link_libraries(test_net_backend PRIVATE tier::net tier::options)
 add_test(NAME net_backend COMMAND test_net_backend)
@@ -76,6 +84,11 @@ add_executable(test_mesh test_mesh.cpp)
 target_link_libraries(test_mesh PRIVATE tier::net tier::core tier::crypto tier::options)
 add_test(NAME mesh COMMAND test_mesh)
 set_tests_properties(mesh PROPERTIES TIMEOUT 60)
+
+add_executable(test_topology test_topology.cpp)
+target_link_libraries(test_topology PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME topology COMMAND test_topology)
+set_tests_properties(topology PROPERTIES TIMEOUT 60)
 
 add_executable(test_multiaddr test_multiaddr.cpp)
 target_link_libraries(test_multiaddr PRIVATE tier::net tier::core tier::crypto tier::options)

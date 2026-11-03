@@ -542,9 +542,20 @@ void Node::autodial(std::chrono::steady_clock::time_point now) {
         conn_by_peer_.count(p.id) != 0) {
       continue;
     }
-    // Tie-break: only the lower id dials, so a pair ends up with one connection
-    // rather than two crossing ones.
-    if (!(self_id_ < p.id)) {
+    // Topology by role (docs/topology.md): an edge node (plain client) is never
+    // a dial target. It reaches the network by dialing infrastructure and is
+    // served over the connection it opened, so nobody dials it. Only
+    // infrastructure peers are autodial candidates. Seeds are dialed separately
+    // (retry_seeds), by address, before their role is known.
+    if (!tier::core::is_infrastructure(p.roles)) {
+      continue;
+    }
+    // Exactly one side initiates each connection. Between two infrastructure
+    // nodes the lower id dials, so a pair ends up with one connection rather
+    // than two crossing ones. An edge node is always the initiator toward
+    // infrastructure (the tie-break does not apply), because infrastructure
+    // never dials an edge node back.
+    if (tier::core::is_infrastructure(roles_) && !(self_id_ < p.id)) {
       continue;
     }
     const auto chosen = select_dial_candidate(p.addresses, dialed_, now, kDialRetry);

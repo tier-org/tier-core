@@ -36,6 +36,19 @@ inline constexpr RoleSet kAllRoles = static_cast<RoleSet>(
     role_bit(Role::client) | role_bit(Role::validator) |
     role_bit(Role::keeper) | role_bit(Role::transmitter));
 
+// Roles that make a node reachable infrastructure (the "backbone"): every role
+// except a plain client. A node holding any of these accepts inbound
+// connections, advertises a stable address and is a dial target. A node that
+// holds only the client role is an edge node: it dials out to infrastructure
+// and is reached over the connection it opened, never dialed. This is the
+// topology boundary used by autodial - see docs/topology.md.
+inline constexpr RoleSet kInfrastructureRoles =
+    static_cast<RoleSet>(kAllRoles & ~role_bit(Role::client));
+
+[[nodiscard]] constexpr bool is_infrastructure(RoleSet set) noexcept {
+  return (set & kInfrastructureRoles) != 0;
+}
+
 // SWIM liveness. Order matters for the merge: alive < suspect < dead, so at an
 // equal incarnation a worse report wins.
 enum class Liveness : std::uint8_t { alive = 0, suspect = 1, dead = 2 };

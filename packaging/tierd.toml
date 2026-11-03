@@ -1,0 +1,44 @@
+# Tier node configuration (/etc/tier/tierd.toml).
+#
+# This is the canonical home for the operator knobs below. Each knob may also be
+# set by its environment variable in /etc/tier/tierd.env, which OVERRIDES this
+# file; a command-line argument overrides the environment. So: CLI > env > this
+# file > built-in default.
+#
+# A small TOML subset is supported: '#' comments (including after a value),
+# `key = "value"` scalars, and inline string arrays `["a", "b"]`. Every key is
+# optional; an unset key falls back to its environment variable, then the baked
+# default. Leave this file as-is for a default production client (edge) node.
+
+# Roles this node holds - decides its place in the network topology
+# (see docs/topology.md). Names from client|validator|keeper|transmitter.
+# Unset means a plain client: an EDGE node that dials out to infrastructure and
+# is never dialed. Any other role makes the node reachable INFRASTRUCTURE
+# (backbone) that peers dial and that forms the mesh.
+#
+# IMPORTANT: a seed, or any node meant to be reachable infrastructure, MUST set
+# a non-client role - otherwise role-aware autodial will not mesh it with peers
+# it learns by gossip (an all-client set only dials out to its seeds). A
+# self-declared validator role grants NO payment-protocol authority (that comes
+# from a separately approved validator set); today it only marks topology.
+#roles = ["transmitter"]
+#roles = ["validator", "keeper"]
+
+# Network (cluster) this node joins; unset means mainnet (production). Nodes on
+# different networks cannot even complete a handshake. Name: [a-z0-9-], 1-32
+# chars. Leave unset in production.
+#network = "testnet"
+
+# Seeds to join through. When set, this FULLY REPLACES the seeds baked into the
+# binary (private networks, local testing): the node dials only these and never
+# the production seeds. "ip:port", IPv6 bracketed. An empty list ([]) means an
+# isolated node, never a fallback to the baked seeds. Leave unset in production.
+#seeds = ["[fd00::2]:7777", "10.0.0.2:7777"]
+
+# Software-version policy: the window of versions this node participates with.
+# "min,max" with min INCLUSIVE and max EXCLUSIVE ("1.4.0,1.5.0" accepts every
+# 1.4.x, rejects 1.5.0). Either side may be empty for an open bound. A node
+# outside the window refuses to start; a gossiped peer outside it is not
+# admitted. Cluster governance, not security (versions are self-reported), never
+# sent on the wire. Unset uses the baked per-network default.
+#version_range = "1.4.0,1.5.0"
