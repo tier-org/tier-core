@@ -147,7 +147,11 @@ jobs:
     # analyzer replays carries Clang-compatible flags; the build also generates
     # the configure-time headers (networks_table.hpp) and submodule headers that
     # the translation units include.
-    runs-on: ubuntu-22.04
+    #
+    # ubuntu-24.04 (not -22.04 like the other jobs): it ships clang-tidy 18 and a
+    # run-clang-tidy that accepts -warnings-as-errors. The 22.04 runner's LLVM 14
+    # run-clang-tidy rejects that flag, and its older checks would differ anyway.
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
         with:
