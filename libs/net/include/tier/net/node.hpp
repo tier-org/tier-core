@@ -88,9 +88,35 @@ class Node {
       const std::map<tier::core::PeerId, std::set<std::string>>& observed,
       std::size_t threshold);
 
+  // Which backbone peers this node should hold a connection to, given the sorted
+  // list of live backbone ids (docs/topology.md, Phase 2). Instead of a full
+  // mesh among infrastructure, a backbone node connects to its ring neighbors -
+  // the `k_backbone/2` successors and predecessors by id on the circular id
+  // space - a connected, redundant graph whose degree does not grow with the
+  // backbone size. The relation is symmetric (B is A's neighbor iff A is B's),
+  // so the one-dials-the-other tie-break still yields a single connection. An
+  // edge node instead targets `k_client` backbone nodes (its id-successors), a
+  // small redundant set of entry points. `sorted_backbone` must be sorted,
+  // unique, and include `self` iff `self_is_backbone`.
+  static std::vector<tier::core::PeerId> ring_dial_targets(
+      const std::vector<tier::core::PeerId>& sorted_backbone,
+      const tier::core::PeerId& self, bool self_is_backbone,
+      std::size_t k_backbone, std::size_t k_client);
+
  private:
   void push_membership(ConnId conn);
   void merge_message(std::span<const tier::crypto::Byte> payload);
+  // Records that propagate network-wide: infrastructure (backbone) peers and
+  // our own record. A plain-client (edge) record is held only by the backbone
+  // it attaches to and is never re-gossiped, so the global membership stays the
+  // small, stable backbone set (docs/topology.md, Phase 3a).
+  [[nodiscard]] bool should_propagate(const tier::core::PeerInfo& p) const noexcept;
+  // The snapshot filtered to should_propagate records - what we gossip.
+  [[nodiscard]] std::vector<tier::core::PeerInfo> gossip_records() const;
+  // Queue a changed record for immediate rumor-push to neighbors this poll
+  // (Phase 3b). Only propagated records are queued; the periodic full
+  // anti-entropy is the backstop for anything a rumor missed.
+  void queue_rumor(const tier::core::PeerInfo& p);
   // Reconcile a gossiped record about ourselves. Our roles and version are
   // locally authoritative and our addresses are learned via observed_addr, so a
   // relayed self-record - even one validly signed by a previous run of this key
@@ -135,7 +161,13 @@ class Node {
   Endpoint endpoint_;
   std::string self_address_;
   std::function<void(const tier::core::PeerInfo&)> on_change_;
-  std::chrono::steady_clock::time_point last_gossip_{};
+  // Periodic full anti-entropy clock (Phase 3b backstop). Timely propagation is
+  // driven by rumor-push on change; this full resync is the infrequent safety
+  // net that heals anything a rumor missed.
+  std::chrono::steady_clock::time_point last_full_sync_{};
+  // Records changed this poll, flushed as a single rumor message to neighbors at
+  // the end of poll() and then cleared.
+  std::vector<tier::core::PeerInfo> rumor_queue_;
   // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;

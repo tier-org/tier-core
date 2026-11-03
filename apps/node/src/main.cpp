@@ -13,9 +13,9 @@
 #include <exception>
 #include <filesystem>
 #include <fstream>
-#include <iterator>
 #include <optional>
 #include <span>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -176,12 +176,13 @@ std::optional<tier::node::Config> load_node_config(std::string& error,
     }
     return tier::node::Config{};  // no default file: env/baked only
   }
-  std::string text((std::istreambuf_iterator<char>(in)),
-                   std::istreambuf_iterator<char>());
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
   if (in.bad()) {
     error = "cannot read config file " + path;
     return std::nullopt;
   }
+  const std::string text = buffer.str();
   std::string parse_error;
   auto cfg = tier::node::parse_config(text, parse_error);
   if (!cfg) {

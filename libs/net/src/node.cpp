@@ -32,6 +32,16 @@ constexpr std::size_t kAddressConfirmations = 1;
 // Minimum gap between dial attempts to the same address.
 constexpr auto kDialRetry = std::chrono::seconds(2);
 
+// Bounded backbone degree (docs/topology.md, Phase 2). A backbone node holds a
+// connection to its ring neighbors - this many in total (half successors, half
+// predecessors by id), even rather than odd so the neighbor relation is
+// symmetric. When the backbone is this small or smaller the window covers
+// everyone and the graph is a full mesh, matching the pre-Phase-2 behavior.
+constexpr std::size_t kBackboneDegree = 8;
+
+// How many backbone entry points an edge (client) node dials for redundancy.
+constexpr std::size_t kClientFanout = 3;
+
 // Split a dialable "ip:port" (IPv6 bracketed as "[::1]:443") into host and
 // port. Returns std::nullopt on anything malformed - these strings arrive over
 // gossip and are untrusted.
@@ -257,24 +267,62 @@ void Node::poll(int timeout_ms) {
   autodial(now);
   fd_.tick(now, neighbors);
 
-  // Periodic anti-entropy: push the current snapshot to all peers so the view
-  // (including liveness changes the detector made) stays fresh and propagates
-  // transitively through a seed. A snapshot too large for one transport frame
-  // is split into several self-contained messages.
-  constexpr auto kGossipInterval = std::chrono::milliseconds(100);
-  if (now - last_gossip_ >= kGossipInterval) {
+  // Dissemination (docs/topology.md, Phase 3b). Timely propagation is driven by
+  // rumor-push: records changed during this poll (new peers, incarnation bumps,
+  // liveness and address changes the detector or merge produced) are flushed now
+  // as one small message to every neighbor. Each node forwards a given version
+  // once (apply() reports only genuinely newer records), so a change floods the
+  // backbone in O(log N) rounds without resending the whole table every tick.
+  if (!rumor_queue_.empty()) {
     for (const auto& msg :
-         tier::core::encode_membership_messages(membership_.snapshot())) {
+         tier::core::encode_membership_messages(rumor_queue_)) {
       endpoint_.broadcast(msg);
     }
-    last_gossip_ = now;
+    rumor_queue_.clear();
+  }
+
+  // Periodic full anti-entropy: the infrequent backstop that heals anything a
+  // rumor missed (a dropped frame, a peer that joined mid-flood). Only the
+  // propagated (backbone + self) records are sent; edge-client records stay
+  // local to the backbone they attach to. A snapshot too large for one frame is
+  // split into several self-contained messages.
+  constexpr auto kFullSyncInterval = std::chrono::seconds(1);
+  if (now - last_full_sync_ >= kFullSyncInterval) {
+    for (const auto& msg :
+         tier::core::encode_membership_messages(gossip_records())) {
+      endpoint_.broadcast(msg);
+    }
+    last_full_sync_ = now;
   }
 }
 
 void Node::push_membership(ConnId conn) {
+  // Initial sync to a freshly connected peer: the propagated (backbone + self)
+  // records, so a joiner converges immediately without waiting for the periodic
+  // anti-entropy.
   for (const auto& msg :
-       tier::core::encode_membership_messages(membership_.snapshot())) {
+       tier::core::encode_membership_messages(gossip_records())) {
     endpoint_.send(conn, msg);
+  }
+}
+
+bool Node::should_propagate(const tier::core::PeerInfo& p) const noexcept {
+  return tier::core::is_infrastructure(p.roles) || p.id == self_id_;
+}
+
+std::vector<tier::core::PeerInfo> Node::gossip_records() const {
+  std::vector<tier::core::PeerInfo> out;
+  for (const auto& p : membership_.snapshot()) {
+    if (should_propagate(p)) {
+      out.push_back(p);
+    }
+  }
+  return out;
+}
+
+void Node::queue_rumor(const tier::core::PeerInfo& p) {
+  if (should_propagate(p)) {
+    rumor_queue_.push_back(p);
   }
 }
 
@@ -308,8 +356,11 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     if (!tier::core::version_admitted(version_range_, peer.version)) {
       continue;
     }
-    if (membership_.apply(peer) && on_change_) {
-      on_change_(peer);
+    if (membership_.apply(peer)) {
+      queue_rumor(peer);  // novel/newer: forward it once to our neighbors
+      if (on_change_) {
+        on_change_(peer);
+      }
     }
   }
 }
@@ -346,8 +397,11 @@ void Node::reconcile_self(const tier::core::PeerInfo& relayed) {
   me.incarnation =
       relayed.incarnation == UINT64_MAX ? UINT64_MAX : relayed.incarnation + 1;
   seal_self(me);
-  if (membership_.apply(me) && on_change_) {
-    on_change_(me);
+  if (membership_.apply(me)) {
+    queue_rumor(me);
+    if (on_change_) {
+      on_change_(me);
+    }
   }
 }
 
@@ -388,6 +442,58 @@ std::vector<std::string> Node::confirmed_addresses(
     }
   }
   return confirmed;
+}
+
+std::vector<tier::core::PeerId> Node::ring_dial_targets(
+    const std::vector<tier::core::PeerId>& sorted_backbone,
+    const tier::core::PeerId& self, bool self_is_backbone,
+    std::size_t k_backbone, std::size_t k_client) {
+  std::vector<tier::core::PeerId> out;
+  const std::size_t n = sorted_backbone.size();
+  if (n == 0) {
+    return out;
+  }
+  // Insertion index of self on the sorted ring (also self's own index when it is
+  // a backbone member).
+  const std::size_t p = static_cast<std::size_t>(
+      std::lower_bound(sorted_backbone.begin(), sorted_backbone.end(), self) -
+      sorted_backbone.begin());
+
+  if (self_is_backbone) {
+    // self must be present; if not, nothing to anchor on.
+    if (p >= n || !(sorted_backbone[p] == self)) {
+      return out;
+    }
+    // The half-successors and half-predecessors by circular index. With n-1
+    // others and a window of up to k_backbone, this covers everyone (full mesh)
+    // once the backbone is small.
+    const std::size_t half = k_backbone / 2;
+    std::vector<std::size_t> idx;
+    for (std::size_t j = 1; j <= half && idx.size() < n - 1; ++j) {
+      idx.push_back((p + j) % n);          // successor
+      if (idx.size() < n - 1) {
+        idx.push_back((p + n - j) % n);    // predecessor
+      }
+    }
+    std::set<std::size_t> uniq(idx.begin(), idx.end());
+    uniq.erase(p);
+    for (const std::size_t i : uniq) {
+      out.push_back(sorted_backbone[i]);
+    }
+  } else {
+    // Edge node: self is not a backbone member. Take the k_client id-successors
+    // (wrapping) as a small, stable, redundant set of entry points. The edge
+    // always initiates toward backbone, so no symmetry is required.
+    const std::size_t take = std::min(k_client, n);
+    std::set<std::size_t> uniq;
+    for (std::size_t j = 0; j < take; ++j) {
+      uniq.insert((p + j) % n);
+    }
+    for (const std::size_t i : uniq) {
+      out.push_back(sorted_backbone[i]);
+    }
+  }
+  return out;
 }
 
 void Node::handle_observed(const tier::core::PeerId& from,
@@ -433,9 +539,11 @@ void Node::handle_observed(const tier::core::PeerId& from,
   me.roles = roles_;  // roles and version are locally authoritative, never
   me.version = std::string(tier::core::version());  // taken from a merged record
   seal_self(me);  // addresses and incarnation changed: re-sign
-  membership_.apply(me);
-  if (on_change_) {
-    on_change_(me);
+  if (membership_.apply(me)) {
+    queue_rumor(me);
+    if (on_change_) {
+      on_change_(me);
+    }
   }
 }
 
@@ -537,6 +645,26 @@ void Node::retry_seeds(std::chrono::steady_clock::time_point now) {
 
 void Node::autodial(std::chrono::steady_clock::time_point now) {
   retry_seeds(now);
+
+  // Bounded degree (docs/topology.md, Phase 2): compute which backbone peers we
+  // should connect to - our ring neighbors if we are backbone, or a small set of
+  // entry points if we are an edge node - rather than dialing every backbone we
+  // know. The id list drives both: build it once from the live backbone, sorted.
+  const bool self_backbone = tier::core::is_infrastructure(roles_);
+  std::vector<tier::core::PeerId> live_backbone;
+  for (const tier::core::PeerInfo& p : membership_.snapshot()) {
+    if (tier::core::is_infrastructure(p.roles) &&
+        p.liveness != tier::core::Liveness::dead) {
+      live_backbone.push_back(p.id);  // includes self iff self is backbone
+    }
+  }
+  std::sort(live_backbone.begin(), live_backbone.end());
+  const auto target_vec = ring_dial_targets(live_backbone, self_id_,
+                                            self_backbone, kBackboneDegree,
+                                            kClientFanout);
+  const std::set<tier::core::PeerId> targets(target_vec.begin(),
+                                             target_vec.end());
+
   for (const tier::core::PeerInfo& p : membership_.snapshot()) {
     if (p.id == self_id_ || p.liveness == tier::core::Liveness::dead ||
         conn_by_peer_.count(p.id) != 0) {
@@ -550,12 +678,18 @@ void Node::autodial(std::chrono::steady_clock::time_point now) {
     if (!tier::core::is_infrastructure(p.roles)) {
       continue;
     }
+    // Bounded degree: only dial backbone peers in our ring-neighbor / entry-point
+    // target set, so the connection count does not grow with the backbone size.
+    if (targets.count(p.id) == 0) {
+      continue;
+    }
     // Exactly one side initiates each connection. Between two infrastructure
     // nodes the lower id dials, so a pair ends up with one connection rather
-    // than two crossing ones. An edge node is always the initiator toward
-    // infrastructure (the tie-break does not apply), because infrastructure
-    // never dials an edge node back.
-    if (tier::core::is_infrastructure(roles_) && !(self_id_ < p.id)) {
+    // than two crossing ones (the target relation is symmetric for backbone, so
+    // both agree the edge should exist). An edge node is always the initiator
+    // toward infrastructure (the tie-break does not apply), because
+    // infrastructure never dials an edge node back.
+    if (self_backbone && !(self_id_ < p.id)) {
       continue;
     }
     const auto chosen = select_dial_candidate(p.addresses, dialed_, now, kDialRetry);

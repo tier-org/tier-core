@@ -26,11 +26,17 @@ int main() {
   using tier::core::Role;
 
   // Star topology: B and C both dial the seed A. Neither B nor C ever connects
-  // to the other, so each can only learn about the other through A's periodic
-  // anti-entropy push. Convergence to all-know-all exercises that gossip.
+  // to the other, so each can only learn about the other through A's gossip
+  // (rumor-push on discovery, plus the periodic anti-entropy backstop).
+  // Convergence to all-know-all exercises that dissemination.
+  //
+  // All three are infrastructure (backbone): only backbone records propagate
+  // network-wide, so a transitive learn-through-the-seed is a backbone property
+  // (an edge client would learn only backbone, not another client - see
+  // test_topology). docs/topology.md.
   tier::net::Node a = make_node(Role::validator);
-  tier::net::Node b = make_node(Role::client);
-  tier::net::Node c = make_node(Role::client);
+  tier::net::Node b = make_node(Role::transmitter);
+  tier::net::Node c = make_node(Role::transmitter);
 
   b.connect("127.0.0.1", a.local_port());
   c.connect("127.0.0.1", a.local_port());
