@@ -137,3 +137,40 @@ jobs:
             echo "== $t =="
             ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1
           done
+
+  tidy:
+    # clang-tidy static-analysis gate over the project's own sources (libs/
+    # and apps/; the check set and header filter live in .clang-tidy). A finding
+    # fails the job: -warnings-as-errors promotes every enabled check to an
+    # error even though .clang-tidy leaves WarningsAsErrors empty for advisory
+    # local runs. Built with Clang (sanitizers off) so the compile database the
+    # analyzer replays carries Clang-compatible flags; the build also generates
+    # the configure-time headers (networks_table.hpp) and submodule headers that
+    # the translation units include.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          submodules: recursive
+
+      - name: Install build tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ninja-build clang clang-tidy
+
+      - name: Configure
+        run: |
+          cmake -S . -B build-tidy -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DTIER_SANITIZE=OFF \
+            -DTIER_WERROR=OFF \
+            -DCMAKE_C_COMPILER=clang \
+            -DCMAKE_CXX_COMPILER=clang++
+
+      - name: Build
+        run: cmake --build build-tidy -j
+
+      - name: clang-tidy
+        run: >
+          run-clang-tidy -p build-tidy -quiet -warnings-as-errors='*'
+          '(libs|apps)/.*\.cpp'

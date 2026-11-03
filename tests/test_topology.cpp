@@ -1,11 +1,18 @@
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <set>
+#include <span>
+#include <string>
 #include <vector>
 
+#include "tier/core/control.hpp"
 #include "tier/core/membership.hpp"
+#include "tier/core/version.hpp"
+#include "tier/crypto/hash.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
 
 namespace {
@@ -27,6 +34,181 @@ tier::net::Node make_node(tier::core::Role role) {
 bool connected_to(const tier::net::Node& n, const tier::core::PeerId& id) {
   const auto peers = n.connected_peers();
   return std::find(peers.begin(), peers.end(), id) != peers.end();
+}
+
+// A raw endpoint standing in for an owner that publishes its own record and
+// answers SWIM pings (so it is not reaped mid-test). Its records carry empty
+// addresses, so no node ever dials it directly: it is reachable only over the
+// connection it opened, which keeps the relay the sole path to downstream peers.
+struct Publisher {
+  tier::crypto::NodeIdentity identity;
+  tier::net::Endpoint endpoint;
+  std::string network;
+  tier::net::ConnId conn = 0;
+  bool handshook = false;
+
+  Publisher(std::array<std::uint8_t, 32> seed, std::string net)
+      : identity(tier::crypto::NodeIdentity::from_seed(seed)),
+        endpoint(tier::crypto::NodeIdentity::from_seed(seed), "127.0.0.1", 0,
+                 net),
+        network(std::move(net)) {
+    endpoint.on_handshake(
+        [this](tier::net::ConnId c, bool, const tier::core::PeerId&) {
+          conn = c;
+          handshook = true;
+        });
+    // Answer liveness pings so the detector keeps us alive for the whole test.
+    endpoint.on_message([this](tier::net::ConnId c, const tier::core::PeerId&,
+                               std::span<const std::uint8_t> p) {
+      if (tier::core::peek_control_type(p) == tier::core::ControlType::ping) {
+        if (const auto ping = tier::core::decode_ping(p)) {
+          endpoint.send(c, tier::core::encode_ack(ping->seq));
+        }
+      }
+    });
+  }
+
+  tier::core::PeerId id() const { return tier::crypto::sha256(identity.public_key()); }
+
+  // Our own signed record at `roles`/`incarnation`, no addresses.
+  tier::core::PeerInfo record(tier::core::RoleSet roles,
+                              std::uint64_t incarnation) const {
+    tier::core::PeerInfo p;
+    p.id = id();
+    p.public_key = identity.public_key();
+    p.roles = roles;
+    p.version = std::string(tier::core::version());
+    p.incarnation = incarnation;
+    p.liveness = tier::core::Liveness::alive;
+    p.signature = identity.signer().sign(
+        tier::core::membership_signing_payload(network, p));
+    return p;
+  }
+
+  void publish(const tier::core::PeerInfo& p) {
+    endpoint.send(conn, tier::core::encode_membership_message({p}));
+  }
+};
+
+// What a node currently thinks a peer's roles are, if it knows the peer.
+bool sees_infrastructure(const tier::net::Node& n, const tier::core::PeerId& id) {
+  const auto rec = n.membership().find(id);
+  return rec.has_value() && tier::core::is_infrastructure(rec->roles);
+}
+
+// A6 (docs/topology.md): an owner that drops from an infrastructure role to
+// plain client must have that demotion reach the whole network, not just the
+// neighbor it is connected to. The scoping filter forwards only
+// infrastructure+self records, so without the demotion-propagation window the
+// downstream node keeps the stale transmitter record and still treats the owner
+// as backbone.
+void role_demotion_propagation() {
+  using tier::core::Role;
+  const tier::core::RoleSet kTransmitter = tier::core::role_bit(Role::transmitter);
+  const tier::core::RoleSet kClient = tier::core::role_bit(Role::client);
+
+  // Case 1: immediate rumor path. publisher -> relay -> downstream, with no
+  // direct publisher<->downstream link (publisher advertises no address).
+  {
+    tier::net::Node relay(tier::crypto::NodeIdentity::generate(), kTransmitter,
+                          "127.0.0.1", 0, {}, "review");
+    tier::net::Node downstream(tier::crypto::NodeIdentity::generate(),
+                               kTransmitter, "127.0.0.1", 0, {}, "review");
+    Publisher pub(tier::crypto::NodeIdentity::generate().seed(), "review");
+
+    downstream.connect("127.0.0.1", relay.local_port());
+    pub.endpoint.connect("127.0.0.1", relay.local_port());
+
+    const auto pump = [&] {
+      relay.poll(2);
+      downstream.poll(2);
+      pub.endpoint.poll(2);
+    };
+
+    // Owner announces an infrastructure role; it propagates relay -> downstream
+    // normally (a transmitter record is gossiped by role).
+    for (int i = 0; i < 6000 && !sees_infrastructure(downstream, pub.id());
+         ++i) {
+      pub.publish(pub.record(kTransmitter, 100));
+      pump();
+    }
+    check(sees_infrastructure(downstream, pub.id()),
+          "A6: downstream learns the owner as infrastructure via the relay");
+
+    // Owner signs a newer record demoting itself to client. Downstream must stop
+    // treating it as infrastructure, reached only through the relay.
+    const auto demoted = pub.record(kClient, 101);
+    bool converged = false;
+    for (int i = 0; i < 6000 && !converged; ++i) {
+      pub.publish(demoted);
+      pump();
+      const auto rec = downstream.membership().find(pub.id());
+      converged = rec.has_value() && rec->incarnation == 101 &&
+                  !tier::core::is_infrastructure(rec->roles);
+    }
+    const auto rec = downstream.membership().find(pub.id());
+    check(rec.has_value() && rec->incarnation == 101,
+          "A6: downstream receives the newer demoted record");
+    check(rec.has_value() && !tier::core::is_infrastructure(rec->roles),
+          "A6: downstream no longer treats the demoted owner as infrastructure");
+    check(rec.has_value() && rec->roles == kClient,
+          "A6: downstream sees the owner's client role");
+  }
+
+  // Case 2: anti-entropy path for a node that was not connected when the
+  // demotion rumor was sent. The relay applies the demotion first; a downstream
+  // that joins afterwards must still learn it from the relay's periodic full
+  // sync (the demotion-propagation window keeps it in gossip_records).
+  {
+    tier::net::Node relay(tier::crypto::NodeIdentity::generate(), kTransmitter,
+                          "127.0.0.1", 0, {}, "review");
+    Publisher pub(tier::crypto::NodeIdentity::generate().seed(), "review");
+    pub.endpoint.connect("127.0.0.1", relay.local_port());
+
+    const auto pump_relay = [&] {
+      relay.poll(2);
+      pub.endpoint.poll(2);
+    };
+
+    for (int i = 0; i < 6000 && !sees_infrastructure(relay, pub.id()); ++i) {
+      pub.publish(pub.record(kTransmitter, 100));
+      pump_relay();
+    }
+    check(sees_infrastructure(relay, pub.id()),
+          "A6: relay learns the owner as infrastructure");
+
+    const auto demoted = pub.record(kClient, 101);
+    bool relay_demoted = false;
+    for (int i = 0; i < 6000 && !relay_demoted; ++i) {
+      pub.publish(demoted);
+      pump_relay();
+      const auto rec = relay.membership().find(pub.id());
+      relay_demoted = rec.has_value() && rec->incarnation == 101 &&
+                      !tier::core::is_infrastructure(rec->roles);
+    }
+    check(relay_demoted, "A6: relay applied the demotion");
+
+    // Only now does the downstream join. It never saw the rumor; it must learn
+    // the client role from the relay's gossip, within the demotion window.
+    tier::net::Node downstream(tier::crypto::NodeIdentity::generate(),
+                               kTransmitter, "127.0.0.1", 0, {}, "review");
+    downstream.connect("127.0.0.1", relay.local_port());
+
+    bool learned = false;
+    for (int i = 0; i < 6000 && !learned; ++i) {
+      pub.publish(demoted);
+      relay.poll(2);
+      downstream.poll(2);
+      pub.endpoint.poll(2);
+      const auto rec = downstream.membership().find(pub.id());
+      learned = rec.has_value() && rec->incarnation == 101;
+    }
+    const auto rec = downstream.membership().find(pub.id());
+    check(rec.has_value() && rec->incarnation == 101,
+          "A6: late-joining downstream learns the demoted record via anti-entropy");
+    check(rec.has_value() && !tier::core::is_infrastructure(rec->roles),
+          "A6: late joiner does not treat the demoted owner as infrastructure");
+  }
 }
 
 }  // namespace
@@ -129,6 +311,7 @@ int main() {
   using tier::core::Role;
 
   ring_properties();
+  role_demotion_propagation();
 
   // Role-based topology (docs/topology.md). A and B are infrastructure
   // (backbone); E1 and E2 are edge clients. Everyone bootstraps through the hub

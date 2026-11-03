@@ -42,6 +42,16 @@ constexpr std::size_t kBackboneDegree = 8;
 // How many backbone entry points an edge (client) node dials for redundancy.
 constexpr std::size_t kClientFanout = 3;
 
+// How long a demotion (an infrastructure role dropping to plain client) keeps
+// being gossiped network-wide (docs/topology.md, A6). The scoping filter would
+// otherwise stop forwarding the record the moment it becomes a client, so the
+// revocation would reach only the owner's immediate neighbor. Holding it in
+// anti-entropy for a window comfortably larger than convergence (full sync runs
+// every second) lets the demotion reach every node and heals a dropped rumor.
+// Assumes a node is not partitioned away for longer than this window across a
+// role downgrade; a longer outage falls back to the record going client-local.
+constexpr auto kDemotionGossipWindow = std::chrono::seconds(30);
+
 // Split a dialable "ip:port" (IPv6 bracketed as "[::1]:443") into host and
 // port. Returns std::nullopt on anything malformed - these strings arrive over
 // gossip and are untrusted.
@@ -223,9 +233,15 @@ void Node::bootstrap(const std::vector<std::string>& seeds) {
     if (addr == self_address_) {
       continue;
     }
-    if (self && std::find(self->addresses.begin(), self->addresses.end(),
-                          addr) != self->addresses.end()) {
-      continue;
+    if (self.has_value()) {
+      // Guarded by has_value() above; the checker loses the guard across the
+      // loop's earlier continue branches, so suppress its false positive here.
+      const auto& self_addrs =
+          self->addresses;  // NOLINT(bugprone-unchecked-optional-access)
+      if (std::find(self_addrs.begin(), self_addrs.end(), addr) !=
+          self_addrs.end()) {
+        continue;
+      }
     }
     const auto hp = split_host_port(addr);
     if (!hp) {
@@ -285,6 +301,17 @@ void Node::poll(int timeout_ms) {
   autodial(now);
   fd_.tick(now, neighbors);
 
+  // Expire demotion-propagation windows: once elapsed, a demoted peer's client
+  // record falls back to local scope like any other client (docs/topology.md,
+  // A6). By now the network has converged on the demotion.
+  for (auto it = demoted_until_.begin(); it != demoted_until_.end();) {
+    if (now >= it->second) {
+      it = demoted_until_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+
   // Dissemination (docs/topology.md, Phase 3b). Timely propagation is driven by
   // rumor-push: records changed during this poll (new peers, incarnation bumps,
   // liveness and address changes the detector or merge produced) are flushed now
@@ -330,8 +357,12 @@ bool Node::should_propagate(const tier::core::PeerInfo& p) const noexcept {
 
 std::vector<tier::core::PeerInfo> Node::gossip_records() const {
   std::vector<tier::core::PeerInfo> out;
+  const auto now = std::chrono::steady_clock::now();
   for (const auto& p : membership_.snapshot()) {
-    if (should_propagate(p)) {
+    // Propagate by role (backbone + self), plus any record inside its
+    // demotion-propagation window so a just-revoked infrastructure status
+    // reaches the whole network, not only the owner's neighbor (A6).
+    if (should_propagate(p) || demotion_active(p.id, now)) {
       out.push_back(p);
     }
   }
@@ -342,6 +373,13 @@ void Node::queue_rumor(const tier::core::PeerInfo& p) {
   if (should_propagate(p)) {
     rumor_queue_.push_back(p);
   }
+}
+
+bool Node::demotion_active(
+    const tier::core::PeerId& id,
+    std::chrono::steady_clock::time_point now) const {
+  const auto it = demoted_until_.find(id);
+  return it != demoted_until_.end() && now < it->second;
 }
 
 void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
@@ -374,8 +412,26 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     if (!tier::core::version_admitted(version_range_, peer.version)) {
       continue;
     }
+    // Capture the prior record before applying, so a role transition can be
+    // detected: a peer dropping from an infrastructure role to plain client is
+    // a demotion whose propagation the scoping filter would otherwise suppress.
+    const auto prev = membership_.find(peer.id);
     if (membership_.apply(peer)) {
-      queue_rumor(peer);  // novel/newer: forward it once to our neighbors
+      const bool was_infra =
+          prev.has_value() && tier::core::is_infrastructure(prev->roles);
+      const bool now_infra = tier::core::is_infrastructure(peer.roles);
+      if (was_infra && !now_infra) {
+        // Demotion (A6): the new record is a client and would not be gossiped by
+        // role, but the revocation of the peer's former backbone status must
+        // reach the whole network. Force this one forward and keep it in
+        // anti-entropy for a bounded window (see gossip_records / demotion_active
+        // and kDemotionGossipWindow).
+        demoted_until_[peer.id] =
+            std::chrono::steady_clock::now() + kDemotionGossipWindow;
+        rumor_queue_.push_back(peer);
+      } else {
+        queue_rumor(peer);  // novel/newer: forward it once to our neighbors
+      }
       if (on_change_) {
         on_change_(peer);
       }
@@ -641,7 +697,7 @@ void Node::retry_seeds(std::chrono::steady_clock::time_point now) {
     }
     try {
       endpoint_.connect(hp->first, hp->second);
-    } catch (const std::exception&) {
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
       // Unroutable right now; the backoff below still advances so we do not spin.
     }
     dialed_[addr] = now;
@@ -721,7 +777,7 @@ void Node::autodial(std::chrono::steady_clock::time_point now) {
     }
     try {
       endpoint_.connect(hp->first, hp->second);
-    } catch (const std::exception&) {
+    } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
       // A malformed or unroutable gossiped address must not take us down; the
       // backoff above keeps us from retrying it in a tight loop.
     }

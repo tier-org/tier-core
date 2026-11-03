@@ -218,7 +218,7 @@ bool fsync_parent_dir(const std::string& path) {
 // Outcome of persist_seed. `exists` means another process installed the key
 // between our absence check and our install - a creation race we lost, not an
 // error: the caller loads the winning key instead.
-enum class PersistResult { ok, exists, error };
+enum class PersistResult : std::uint8_t { ok, exists, error };
 
 // Atomically persist the 32-byte seed to `path`: write a private, per-process
 // temp file (created 0600, before any secret byte is written), flush it, then
@@ -387,7 +387,7 @@ std::optional<tier::crypto::NodeIdentity> load_or_create_identity(
     std::filesystem::permissions(file.parent_path(), std::filesystem::perms::owner_all,
                                  std::filesystem::perm_options::replace, ec);
   }
-  const auto identity = tier::crypto::NodeIdentity::generate();
+  auto identity = tier::crypto::NodeIdentity::generate();
   switch (persist_seed(path, identity.seed())) {
     case PersistResult::ok:
       return identity;

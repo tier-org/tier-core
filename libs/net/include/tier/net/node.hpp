@@ -117,6 +117,16 @@ class Node {
   // (Phase 3b). Only propagated records are queued; the periodic full
   // anti-entropy is the backstop for anything a rumor missed.
   void queue_rumor(const tier::core::PeerInfo& p);
+  // Whether an id is within its demotion-propagation window (see demoted_until_
+  // and merge_message): a node that transitioned from an infrastructure role to
+  // plain client. Such a record is not propagated by role (it is now a client),
+  // but the revocation of its former backbone status must still reach the whole
+  // network, so it is gossiped like a propagated record for a bounded window
+  // (docs/topology.md, A6). Without this, downstream peers keep the stale
+  // infrastructure record and may still dial the node as backbone.
+  [[nodiscard]] bool demotion_active(
+      const tier::core::PeerId& id,
+      std::chrono::steady_clock::time_point now) const;
   // Reconcile a gossiped record about ourselves. Our roles and version are
   // locally authoritative and our addresses are learned via observed_addr, so a
   // relayed self-record - even one validly signed by a previous run of this key
@@ -168,6 +178,14 @@ class Node {
   // Records changed this poll, flushed as a single rumor message to neighbors at
   // the end of poll() and then cleared.
   std::vector<tier::core::PeerInfo> rumor_queue_;
+  // Peers that just dropped from an infrastructure role to plain client, mapped
+  // to the time their demotion stops being gossiped network-wide. While present
+  // and unexpired, the peer's (now client) record is included in gossip and
+  // anti-entropy so the demotion reaches every node, not just the immediate
+  // neighbor that received it; expired entries are pruned each poll. See
+  // merge_message and demotion_active (docs/topology.md, A6).
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point>
+      demoted_until_;
   // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;

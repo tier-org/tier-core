@@ -25,7 +25,7 @@ constexpr std::size_t kMaxRequest = 16;
 void set_io_timeout(int fd) noexcept {
   timeval tv{};
   tv.tv_sec = kIoTimeoutMs / 1000;
-  tv.tv_usec = (kIoTimeoutMs % 1000) * 1000;
+  tv.tv_usec = (kIoTimeoutMs % 1000) * 1000L;
   ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }

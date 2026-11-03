@@ -35,6 +35,7 @@
 #include <ngtcp2/ngtcp2_crypto.h>
 #include <ngtcp2/ngtcp2_crypto_ossl.h>
 
+#include "tier/core/control.hpp"
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/net/framing.hpp"
@@ -194,6 +195,10 @@ struct Endpoint::Impl {
     struct OutChunk {
       std::uint64_t base = 0;
       std::vector<Byte> data;
+      // A SWIM control message (ping/ack/probe), not bulk membership gossip.
+      // The send-queue bound never drops these under a gossip backlog, so a
+      // liveness probe is not starved by a flood of membership snapshots.
+      bool control = false;
     };
     std::deque<OutChunk> out;          // queued/in-flight outbound chunks
     std::uint64_t appended = 0;        // absolute offset for the next chunk
@@ -318,10 +323,10 @@ void rand_cb(std::uint8_t* dest, std::size_t destlen, const ngtcp2_rand_ctx*) {
 void set_stream_limits(ngtcp2_transport_params& params) noexcept {
   params.initial_max_streams_bidi = 8;
   params.initial_max_streams_uni = 8;
-  params.initial_max_stream_data_bidi_local = 256 * 1024;
-  params.initial_max_stream_data_bidi_remote = 256 * 1024;
-  params.initial_max_stream_data_uni = 256 * 1024;
-  params.initial_max_data = 1024 * 1024;
+  params.initial_max_stream_data_bidi_local = 256 * 1024ULL;
+  params.initial_max_stream_data_bidi_remote = 256 * 1024ULL;
+  params.initial_max_stream_data_uni = 256 * 1024ULL;
+  params.initial_max_data = 1024 * 1024ULL;
   // Reap a connection with no traffic for this long. The effective timeout is
   // the min of both peers' advertised values. A live peer is never idle (we
   // gossip every ~100ms), so this only fires on a dead/unreachable peer,
@@ -971,21 +976,31 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
   if (payload.size() > framing::kMaxFrameLen) {
     return;
   }
+  // Classify the message so the queue bound can protect SWIM control traffic:
+  // every message leads with its ControlType byte, and only membership gossip
+  // is bulk. Control messages (ping/ack/ping_req, observed_addr) ride in the
+  // reserve and are never dropped to make room for gossip.
+  const bool is_control =
+      payload.empty() || static_cast<tier::core::ControlType>(payload[0]) !=
+                             tier::core::ControlType::membership;
+
   // Frame the payload first so its size is known for the queue budget.
   std::vector<Byte> framed;
   append_frame(framed, payload);
 
   // Bound the send queue. Bytes still queued but unacknowledged are
-  // `appended - total_acked`. If this frame would push the queue over the cap,
-  // first drop chunks from the back that ngtcp2 has not been handed yet (those
-  // whose base is at or past write_cursor) - dropping a stale, unsent gossip
-  // snapshot is harmless; the next one carries fresh state. Only once the
-  // unsent tail is gone and in-flight data alone still exceeds the cap do we
-  // give up on a peer that will not drain and close the connection.
+  // `appended - total_acked`. If this frame would push the queue over its
+  // budget, first drop fully-unsent BULK chunks from the back (those whose base
+  // is at or past write_cursor) - dropping a stale, unsent gossip snapshot is
+  // harmless; the next one carries fresh state. A control chunk is never
+  // dropped. Only once the droppable bulk tail is gone and the remaining
+  // backlog still exceeds the full cap do we give up on a peer that will not
+  // drain and close the connection.
   const auto decision = sendq::plan_admit(
-      c->out.size(), [&](std::size_t i) { return c->out[i].base; }, c->appended,
+      c->out.size(), [&](std::size_t i) { return c->out[i].base; },
+      [&](std::size_t i) { return c->out[i].control; }, c->appended,
       c->write_cursor, c->total_acked, static_cast<std::uint64_t>(framed.size()),
-      kMaxSendQueueBytes);
+      kMaxSendQueueBytes, sendq::kControlReserveBytes, is_control);
   for (std::size_t i = 0; i < decision.drop_from_back; ++i) {
     c->out.pop_back();
     c->appended = c->out.empty()
@@ -993,7 +1008,7 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
                       : c->out.back().base + c->out.back().data.size();
   }
   if (!decision.admit) {
-    c->closing = true;  // in-flight backlog alone over budget: drop the peer
+    c->closing = true;  // backlog still over budget: drop the peer
     return;
   }
 
@@ -1002,6 +1017,7 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
   Connection::OutChunk chunk;
   chunk.base = c->appended;
   chunk.data = std::move(framed);
+  chunk.control = is_control;
   c->appended += chunk.data.size();
   c->out.push_back(std::move(chunk));
 }
