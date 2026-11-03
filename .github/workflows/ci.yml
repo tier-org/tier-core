@@ -101,7 +101,10 @@ jobs:
     # Short smoke run of the libFuzzer targets for the untrusted-input decoders
     # (membership, SWIM control, version, wire frame). libFuzzer needs Clang. The
     # targets link only tier::core / header-only framing - no transport or
-    # OpenSSL - so this builds and runs fast. A crash fails the job.
+    # OpenSSL - so this builds and runs fast. ASan + UBSan are on (TIER_SANITIZE),
+    # and the Tier libraries are coverage-instrumented (TIER_FUZZ), so libFuzzer
+    # guides into the real decoders and a memory or UB error aborts. A crash or
+    # sanitizer abort fails the job.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -118,7 +121,7 @@ jobs:
           cmake -S . -B build-fuzz -G Ninja \
             -DCMAKE_BUILD_TYPE=Debug \
             -DTIER_FUZZ=ON \
-            -DTIER_SANITIZE=OFF \
+            -DTIER_SANITIZE=ON \
             -DTIER_WERROR=OFF \
             -DCMAKE_C_COMPILER=clang \
             -DCMAKE_CXX_COMPILER=clang++

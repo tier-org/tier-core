@@ -139,22 +139,26 @@ int cmd_peers(const std::string& path) {
   if (!query(path, tier::core::AdminOp::peers, reply)) {
     return 1;
   }
-  const auto peers = tier::core::decode_admin_peers(reply);
-  if (!peers) {
+  const auto reply_decoded = tier::core::decode_admin_peers(reply);
+  if (!reply_decoded) {
     std::fprintf(stderr, "malformed response from tierd\n");
     return 1;
   }
+  const auto& peers = reply_decoded->peers;
 
   std::size_t connected = 0;
-  for (const auto& p : *peers) {
+  for (const auto& p : peers) {
     if (p.connected) {
       ++connected;
     }
   }
-  std::printf("known=%zu connected=%zu\n\n", peers->size(), connected);
+  std::printf("network=%s  known=%zu connected=%zu\n\n",
+              reply_decoded->network.empty() ? "-"
+                                             : reply_decoded->network.c_str(),
+              peers.size(), connected);
   std::printf("%-16s  %-4s  %-8s  %-22s  %-10s  %s\n", "PEER", "CONN",
               "LIVENESS", "ROLES", "VERSION", "ADDRESSES");
-  for (const auto& p : *peers) {
+  for (const auto& p : peers) {
     std::printf("%-16s  %-4s  %-8s  %-22s  %-10s  %s\n",
                 short_id(p.info.id).c_str(), p.connected ? "yes" : "no",
                 liveness_string(p.info.liveness),

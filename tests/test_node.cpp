@@ -202,6 +202,72 @@ int main() {
           "forgery: forged high incarnation did not take");
   }
 
+  // Self-record authority across restart (A1 regression). A neighbor relays a
+  // node's own OLD record - validly signed by the node's key, so verify_owner
+  // accepts it - carrying a higher incarnation and a role the node no longer
+  // runs (the post-restart rollback scenario). The node must not adopt it: its
+  // configured role is authoritative and it refutes the stale record by raising
+  // its incarnation above it.
+  {
+    using tier::core::Liveness;
+    using tier::core::Role;
+
+    // Build the node's identity from a seed we keep, so we can re-derive its
+    // signer and forge a correctly-signed stale record for the same key.
+    const auto seed = tier::crypto::NodeIdentity::generate().seed();
+    const auto signer_identity = tier::crypto::NodeIdentity::from_seed(seed);
+
+    tier::net::Node node(tier::crypto::NodeIdentity::from_seed(seed),
+                         tier::core::role_bit(Role::client), "127.0.0.1", 0,
+                         {}, "review");
+    const auto node_id = node.peer_id();
+
+    tier::net::Endpoint relay(tier::crypto::NodeIdentity::generate(),
+                              "127.0.0.1", 0, "review");
+    tier::net::ConnId conn = 0;
+    bool handshook = false;
+    relay.on_handshake([&](tier::net::ConnId c, bool, const tier::net::PeerId&) {
+      conn = c;
+      handshook = true;
+    });
+    relay.connect("127.0.0.1", node.local_port());
+    for (int i = 0; i < 4000 && !handshook; ++i) {
+      relay.poll(2);
+      node.poll(2);
+    }
+    check(handshook, "restart: relay completes the handshake");
+
+    // The stale, validly-signed self-record: an old validator+keeper role at a
+    // high incarnation. Sign over the owner fields exactly as the node would.
+    tier::core::PeerInfo stale;
+    stale.id = node_id;
+    stale.public_key = signer_identity.public_key();
+    stale.roles = tier::core::role_bit(Role::validator) |
+                  tier::core::role_bit(Role::keeper);
+    stale.version = std::string(tier::core::version());
+    stale.incarnation = 100;  // outranks the freshly restarted incarnation
+    stale.liveness = Liveness::alive;
+    stale.addresses = {};  // empty so nothing is dialed
+    stale.signature = signer_identity.signer().sign(
+        tier::core::membership_signing_payload("review", stale));
+
+    const auto msg = tier::core::encode_membership_message({stale});
+    for (int i = 0; i < 400; ++i) {
+      relay.send(conn, msg);
+      relay.poll(2);
+      node.poll(2);
+    }
+
+    const auto self = node.membership().find(node_id);
+    check(self.has_value() &&
+              self->roles == tier::core::role_bit(Role::client),
+          "restart: configured role wins over the stale signed record");
+    check(self.has_value() && self->incarnation > 100,
+          "restart: stale high incarnation is refuted, not adopted");
+    check(self.has_value() && self->liveness == Liveness::alive,
+          "restart: node stays alive");
+  }
+
   if (g_failures == 0) {
     std::puts("ok");
     return 0;

@@ -964,6 +964,13 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
     }
     c->stream_id = stream_id;
   }
+  // A payload past the frame cap would be rejected as oversize by the receiver
+  // (framing::take_frame), closing the connection. The membership path stays
+  // within budget via encode_membership_messages; this guards the send API so
+  // local code can never put an invalid frame on the wire. Drop it here.
+  if (payload.size() > framing::kMaxFrameLen) {
+    return;
+  }
   // Frame the payload first so its size is known for the queue budget.
   std::vector<Byte> framed;
   append_frame(framed, payload);

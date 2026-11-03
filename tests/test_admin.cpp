@@ -68,21 +68,24 @@ int main() {
   connected.push_back(peers[0].id);
   connected.push_back(peers[2].id);
 
-  const auto encoded = tier::core::encode_admin_peers(peers, connected);
+  const auto encoded = tier::core::encode_admin_peers("mainnet", peers, connected);
   const auto decoded = tier::core::decode_admin_peers(encoded);
   check(decoded.has_value(), "peers response decodes");
-  check(decoded && decoded->size() == peers.size(), "peer count round-trips");
-  if (decoded && decoded->size() == peers.size()) {
+  check(decoded && decoded->network == "mainnet", "network round-trips");
+  check(decoded && decoded->peers.size() == peers.size(),
+        "peer count round-trips");
+  if (decoded && decoded->peers.size() == peers.size()) {
+    const auto& dp = decoded->peers;
     for (std::size_t i = 0; i < peers.size(); ++i) {
-      check((*decoded)[i].info.id == peers[i].id, "id round-trips");
-      check((*decoded)[i].info.roles == peers[i].roles, "roles round-trip");
-      check((*decoded)[i].info.liveness == peers[i].liveness, "liveness round-trips");
-      check((*decoded)[i].info.addresses == peers[i].addresses, "addresses round-trip");
-      check((*decoded)[i].info.version == peers[i].version, "version round-trips");
+      check(dp[i].info.id == peers[i].id, "id round-trips");
+      check(dp[i].info.roles == peers[i].roles, "roles round-trip");
+      check(dp[i].info.liveness == peers[i].liveness, "liveness round-trips");
+      check(dp[i].info.addresses == peers[i].addresses, "addresses round-trip");
+      check(dp[i].info.version == peers[i].version, "version round-trips");
     }
-    check((*decoded)[0].connected, "peer 1 reported connected");
-    check(!(*decoded)[1].connected, "peer 2 reported not connected");
-    check((*decoded)[2].connected, "peer 3 reported connected");
+    check(dp[0].connected, "peer 1 reported connected");
+    check(!dp[1].connected, "peer 2 reported not connected");
+    check(dp[2].connected, "peer 3 reported connected");
   }
 
   // A trailing byte is rejected.

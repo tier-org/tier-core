@@ -100,8 +100,10 @@ std::string resolve_admin_path() {
 }
 
 // fsync the directory that holds `path` so a freshly created file is durable
-// across a crash (the rename below is only guaranteed after the directory entry
-// is flushed). Best effort: a failure here is reported by the caller's checks.
+// across a crash (the install below is only guaranteed after the directory
+// entry is flushed). Returns false on failure with errno set to the cause, so
+// the caller can refuse to proceed rather than claim a durable key it does not
+// have.
 bool fsync_parent_dir(const std::string& path) {
   const std::filesystem::path p(path);
   const std::string dir =
@@ -111,30 +113,43 @@ bool fsync_parent_dir(const std::string& path) {
     return false;
   }
   const bool ok = ::fsync(fd) == 0;
+  const int saved = errno;  // close() must not clobber the fsync failure cause
   ::close(fd);
+  if (!ok) {
+    errno = saved;
+  }
   return ok;
 }
 
-// Atomically persist the 32-byte seed to `path`: write a sibling temp file
-// (created 0600, before any secret byte is written), flush it, then rename it
-// into place and flush the directory. Returns false, leaving no new key in
-// place, on any failure. Never truncates an existing key file.
-bool persist_seed(const std::string& path,
-                  std::span<const tier::crypto::Byte> seed) {
-  const std::string tmp = path + ".tmp";
-  ::unlink(tmp.c_str());  // clear a leftover from a previous crash (ignore ENOENT)
+// Outcome of persist_seed. `exists` means another process installed the key
+// between our absence check and our install - a creation race we lost, not an
+// error: the caller loads the winning key instead.
+enum class PersistResult { ok, exists, error };
+
+// Atomically persist the 32-byte seed to `path`: write a private, per-process
+// temp file (created 0600, before any secret byte is written), flush it, then
+// install it with link() - which fails if `path` already exists, so a key that
+// appeared after our absence check is never clobbered - and flush the directory.
+// Leaves no new key in place on error, and never truncates an existing file.
+PersistResult persist_seed(const std::string& path,
+                           std::span<const tier::crypto::Byte> seed) {
+  // Per-process temp name: two concurrent starts never share a temp path, so
+  // neither can unlink or overwrite the other's in-flight file.
+  const std::string tmp =
+      path + ".tmp." + std::to_string(static_cast<long>(::getpid()));
+  ::unlink(tmp.c_str());  // clear our own leftover from a crashed prior run
   const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
   if (fd < 0) {
     std::fprintf(stderr, "cannot create key temp file %s: %s\n", tmp.c_str(),
                  std::strerror(errno));
-    return false;
+    return PersistResult::error;
   }
   // Guarantee 0600 regardless of umask, before writing the secret.
   if (::fchmod(fd, 0600) != 0) {
     std::fprintf(stderr, "cannot set key file mode: %s\n", std::strerror(errno));
     ::close(fd);
     ::unlink(tmp.c_str());
-    return false;
+    return PersistResult::error;
   }
   std::size_t written = 0;
   while (written < seed.size()) {
@@ -147,23 +162,106 @@ bool persist_seed(const std::string& path,
       std::fprintf(stderr, "cannot write key: %s\n", std::strerror(errno));
       ::close(fd);
       ::unlink(tmp.c_str());
-      return false;
+      return PersistResult::error;
     }
     written += static_cast<std::size_t>(n);
   }
   if (::fsync(fd) != 0 || ::close(fd) != 0) {
     std::fprintf(stderr, "cannot flush key file: %s\n", std::strerror(errno));
     ::unlink(tmp.c_str());
-    return false;
+    return PersistResult::error;
   }
-  if (::rename(tmp.c_str(), path.c_str()) != 0) {
-    std::fprintf(stderr, "cannot install key file %s: %s\n", path.c_str(),
-                 std::strerror(errno));
+  // Install without clobbering: link() fails with EEXIST if another process won
+  // the creation race, so we never overwrite a key that appeared after our
+  // absence check. The key then lives at `path`; drop the temp name.
+  if (::link(tmp.c_str(), path.c_str()) != 0) {
+    const int e = errno;
     ::unlink(tmp.c_str());
-    return false;
+    if (e == EEXIST) {
+      return PersistResult::exists;
+    }
+    std::fprintf(stderr, "cannot install key file %s: %s\n", path.c_str(),
+                 std::strerror(e));
+    return PersistResult::error;
   }
-  fsync_parent_dir(path);  // make the rename durable; non-fatal if unsupported
-  return true;
+  ::unlink(tmp.c_str());
+  if (!fsync_parent_dir(path)) {
+    // The key is linked at `path` but its directory entry may not survive a
+    // crash. Refuse rather than report a durability we cannot vouch for; a
+    // restart will find the key already present and load it.
+    std::fprintf(stderr, "cannot flush key directory for %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    return PersistResult::error;
+  }
+  return PersistResult::ok;
+}
+
+// Read the identity from an existing key file. Returns the identity on success;
+// std::nullopt otherwise, with `absent` set true only when the file is confirmed
+// not to exist (ENOENT) - the one case in which the caller may mint a new key.
+// Every present-but-bad case (wrong type or size, unreadable, stat error) is
+// diagnosed here, leaves the file untouched, and reports absent == false.
+std::optional<tier::crypto::NodeIdentity> read_existing_identity(
+    const std::string& path, bool& absent) {
+  absent = false;
+  struct stat st {};
+  if (::stat(path.c_str(), &st) != 0) {
+    if (errno == ENOENT) {
+      absent = true;
+      return std::nullopt;
+    }
+    // Present but unstattable (e.g. a permission or I/O error): do not mask it
+    // by minting a new identity on top of a file we simply cannot see.
+    std::fprintf(stderr, "cannot access key file %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    return std::nullopt;
+  }
+  // The file exists: it must be a regular file of exactly the seed size and
+  // fully readable, or we stop. We never regenerate over an existing file.
+  if (!S_ISREG(st.st_mode)) {
+    std::fprintf(stderr, "key file %s is not a regular file\n", path.c_str());
+    return std::nullopt;
+  }
+  if (static_cast<std::uintmax_t>(st.st_size) != tier::crypto::kEd25519SeedSize) {
+    std::fprintf(stderr,
+                 "key file %s has wrong size (%lld bytes, expected %zu); "
+                 "refusing to overwrite - move it aside to mint a new key\n",
+                 path.c_str(), static_cast<long long>(st.st_size),
+                 static_cast<std::size_t>(tier::crypto::kEd25519SeedSize));
+    return std::nullopt;
+  }
+  const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    std::fprintf(stderr, "cannot open key file %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    return std::nullopt;
+  }
+  std::array<tier::crypto::Byte, tier::crypto::kEd25519SeedSize> seed{};
+  std::size_t got = 0;
+  bool read_ok = true;
+  while (got < seed.size()) {
+    const ssize_t n = ::read(fd, seed.data() + got, seed.size() - got);
+    if (n < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      std::fprintf(stderr, "cannot read key file %s: %s\n", path.c_str(),
+                   std::strerror(errno));
+      read_ok = false;
+      break;
+    }
+    if (n == 0) {
+      break;  // short file despite the size check (raced); treated as an error
+    }
+    got += static_cast<std::size_t>(n);
+  }
+  ::close(fd);
+  if (!read_ok || got != seed.size()) {
+    std::fprintf(stderr, "key file %s could not be fully read; not starting\n",
+                 path.c_str());
+    return std::nullopt;
+  }
+  return tier::crypto::NodeIdentity::from_seed(seed);
 }
 
 // Load the node identity from a 32-byte seed file, creating (and persisting) a
@@ -174,61 +272,12 @@ bool persist_seed(const std::string& path,
 // was durably written. Returns std::nullopt on any such error.
 std::optional<tier::crypto::NodeIdentity> load_or_create_identity(
     const std::string& path) {
-  struct stat st {};
-  if (::stat(path.c_str(), &st) == 0) {
-    // The file exists: it must be a regular file of exactly the seed size and
-    // fully readable, or we stop. We never regenerate over an existing file.
-    if (!S_ISREG(st.st_mode)) {
-      std::fprintf(stderr, "key file %s is not a regular file\n", path.c_str());
-      return std::nullopt;
-    }
-    if (static_cast<std::uintmax_t>(st.st_size) != tier::crypto::kEd25519SeedSize) {
-      std::fprintf(stderr,
-                   "key file %s has wrong size (%lld bytes, expected %zu); "
-                   "refusing to overwrite - move it aside to mint a new key\n",
-                   path.c_str(), static_cast<long long>(st.st_size),
-                   static_cast<std::size_t>(tier::crypto::kEd25519SeedSize));
-      return std::nullopt;
-    }
-    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
-      std::fprintf(stderr, "cannot open key file %s: %s\n", path.c_str(),
-                   std::strerror(errno));
-      return std::nullopt;
-    }
-    std::array<tier::crypto::Byte, tier::crypto::kEd25519SeedSize> seed{};
-    std::size_t got = 0;
-    bool read_ok = true;
-    while (got < seed.size()) {
-      const ssize_t n = ::read(fd, seed.data() + got, seed.size() - got);
-      if (n < 0) {
-        if (errno == EINTR) {
-          continue;
-        }
-        std::fprintf(stderr, "cannot read key file %s: %s\n", path.c_str(),
-                     std::strerror(errno));
-        read_ok = false;
-        break;
-      }
-      if (n == 0) {
-        break;  // short file despite the size check (raced); treated as an error
-      }
-      got += static_cast<std::size_t>(n);
-    }
-    ::close(fd);
-    if (!read_ok || got != seed.size()) {
-      std::fprintf(stderr, "key file %s could not be fully read; not starting\n",
-                   path.c_str());
-      return std::nullopt;
-    }
-    return tier::crypto::NodeIdentity::from_seed(seed);
+  bool absent = false;
+  if (auto existing = read_existing_identity(path, absent)) {
+    return existing;
   }
-  if (errno != ENOENT) {
-    // Present but unstattable (e.g. a permission or I/O error): do not mask it
-    // by minting a new identity on top of a file we simply cannot see.
-    std::fprintf(stderr, "cannot access key file %s: %s\n", path.c_str(),
-                 std::strerror(errno));
-    return std::nullopt;
+  if (!absent) {
+    return std::nullopt;  // present but bad; already diagnosed, left untouched
   }
 
   // Confirmed absent: create the parent directory (0700) and a fresh identity.
@@ -245,10 +294,26 @@ std::optional<tier::crypto::NodeIdentity> load_or_create_identity(
                                  std::filesystem::perm_options::replace, ec);
   }
   const auto identity = tier::crypto::NodeIdentity::generate();
-  if (!persist_seed(path, identity.seed())) {
-    return std::nullopt;  // do not run with an unsaved identity
+  switch (persist_seed(path, identity.seed())) {
+    case PersistResult::ok:
+      return identity;
+    case PersistResult::exists: {
+      // Lost a creation race: another process installed the key first. Load the
+      // winner so both processes converge on one identity.
+      bool raced_absent = false;
+      if (auto winner = read_existing_identity(path, raced_absent)) {
+        return winner;
+      }
+      std::fprintf(stderr,
+                   "key file %s appeared during creation but could not be read; "
+                   "not starting\n",
+                   path.c_str());
+      return std::nullopt;
+    }
+    case PersistResult::error:
+      return std::nullopt;  // do not run with an unsaved identity
   }
-  return identity;
+  return std::nullopt;  // unreachable; keeps the compiler happy
 }
 
 void print_hex(const char* label, std::span<const tier::crypto::Byte> bytes) {
@@ -410,7 +475,8 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   const auto admin_handler =
       [&node](tier::core::AdminOp op) -> std::vector<std::uint8_t> {
     if (op == tier::core::AdminOp::peers) {
-      return tier::core::encode_admin_peers(node.membership().snapshot(),
+      return tier::core::encode_admin_peers(node.network(),
+                                            node.membership().snapshot(),
                                             node.connected_peers());
     }
     return {};

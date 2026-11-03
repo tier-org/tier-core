@@ -257,10 +257,13 @@ The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
 
     sudo tierctl peers        # the node's view of the mesh: known vs connected
 
-Each row is a peer: short id, whether a live connection is held, liveness, roles,
-the peer's advertised software version (gossiped mesh-wide, so skew is visible at
-a glance; `-` for a peer too old to advertise one) and advertised addresses. The
-socket is local only (service user and root) and is never exposed on the network.
+The header reports the node's own network (the cluster it joined) and the known
+versus connected counts. Each row is a peer: short id, whether a live connection
+is held, liveness, roles, the peer's advertised software version (gossiped
+mesh-wide, so skew is visible at a glance; `-` for a peer too old to advertise
+one) and advertised addresses. The network is a header, not a column: membership
+only ever holds peers on this same network, so every row shares it. The socket is
+local only (service user and root) and is never exposed on the network.
 The wire is the project's compact binary codec, one request and one response per
 connection.
 

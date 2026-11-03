@@ -44,6 +44,10 @@ class Node {
   // This node's membership id: SHA-256 of its public key.
   [[nodiscard]] const tier::core::PeerId& peer_id() const noexcept;
 
+  // The network (cluster) this node joined. Node-wide, not carried per peer:
+  // membership only ever holds peers on this same network.
+  [[nodiscard]] const std::string& network() const noexcept;
+
   void connect(const std::string& ip, std::uint16_t port);
 
   // Dial a set of bootstrap addresses ("ip:port", IPv6 bracketed) once at
@@ -87,6 +91,15 @@ class Node {
  private:
   void push_membership(ConnId conn);
   void merge_message(std::span<const tier::crypto::Byte> payload);
+  // Reconcile a gossiped record about ourselves. Our roles and version are
+  // locally authoritative and our addresses are learned via observed_addr, so a
+  // relayed self-record - even one validly signed by a previous run of this key
+  // - is never merged over them. If it could supersede our current record
+  // (incarnation at least ours) and differs from what we assert, we refute it
+  // the SWIM way: raise our incarnation above it and re-broadcast our
+  // authoritative record. This also recovers after a restart that reset our
+  // incarnation or changed our configured role.
+  void reconcile_self(const tier::core::PeerInfo& relayed);
   // Seal our own record: stamp our public key and sign the owner-asserted fields
   // for this network, so peers can verify the record we gossip is ours. Called
   // whenever our own id/roles/version/addresses/incarnation change.
@@ -111,6 +124,10 @@ class Node {
 
   tier::crypto::NodeIdentity identity_;
   tier::core::PeerId self_id_;
+  // Our configured roles: locally authoritative, never redefined by a gossiped
+  // record (see reconcile_self). Version is likewise authoritative and always
+  // tier::core::version().
+  tier::core::RoleSet roles_;
   // The cluster this node joins; bound into each record's signature so a record
   // signed for one network cannot be replayed into another.
   std::string network_;

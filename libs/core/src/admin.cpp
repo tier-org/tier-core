@@ -95,10 +95,17 @@ std::optional<AdminOp> decode_admin_request(std::span<const std::uint8_t> in) {
 }
 
 std::vector<std::uint8_t> encode_admin_peers(
-    const std::vector<PeerInfo>& peers, const std::vector<PeerId>& connected) {
+    std::string_view network, const std::vector<PeerInfo>& peers,
+    const std::vector<PeerId>& connected) {
   std::vector<std::uint8_t> out;
   out.push_back(kAdminVersion);
   out.push_back(static_cast<std::uint8_t>(AdminOp::peers));
+
+  // The daemon's own network. A valid network name is at most 32 bytes, so a
+  // single length byte is ample; truncate defensively rather than overflow it.
+  const std::size_t net_len = network.size() > 0xFFU ? 0xFFU : network.size();
+  out.push_back(static_cast<std::uint8_t>(net_len));
+  out.insert(out.end(), network.begin(), network.begin() + net_len);
 
   const auto membership = encode_membership_message(peers);
   put_u32(out, static_cast<std::uint32_t>(membership.size()));
@@ -112,7 +119,7 @@ std::vector<std::uint8_t> encode_admin_peers(
   return out;
 }
 
-std::optional<std::vector<AdminPeer>> decode_admin_peers(
+std::optional<AdminPeersReply> decode_admin_peers(
     std::span<const std::uint8_t> in) {
   Reader r(in);
   std::uint8_t ver = 0;
@@ -121,6 +128,13 @@ std::optional<std::vector<AdminPeer>> decode_admin_peers(
       op != static_cast<std::uint8_t>(AdminOp::peers)) {
     return std::nullopt;
   }
+
+  std::uint8_t net_len = 0;
+  std::span<const std::uint8_t> net_bytes;
+  if (!r.u8(net_len) || !r.bytes(net_len, net_bytes)) {
+    return std::nullopt;
+  }
+  std::string network(net_bytes.begin(), net_bytes.end());
 
   std::uint32_t mlen = 0;
   std::span<const std::uint8_t> mbytes;
@@ -150,8 +164,9 @@ std::optional<std::vector<AdminPeer>> decode_admin_peers(
     return std::nullopt;  // trailing bytes
   }
 
-  std::vector<AdminPeer> out;
-  out.reserve(peers->size());
+  AdminPeersReply reply;
+  reply.network = std::move(network);
+  reply.peers.reserve(peers->size());
   for (const PeerInfo& p : *peers) {
     bool is_connected = false;
     for (const PeerId& c : connected) {
@@ -160,9 +175,9 @@ std::optional<std::vector<AdminPeer>> decode_admin_peers(
         break;
       }
     }
-    out.push_back(AdminPeer{p, is_connected});
+    reply.peers.push_back(AdminPeer{p, is_connected});
   }
-  return out;
+  return reply;
 }
 
 }  // namespace tier::core

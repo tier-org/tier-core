@@ -60,7 +60,7 @@ int main() {
   const auto handler =
       [&](tier::core::AdminOp op) -> std::vector<std::uint8_t> {
     if (op == tier::core::AdminOp::peers) {
-      return tier::core::encode_admin_peers(peers, connected);
+      return tier::core::encode_admin_peers("testnet", peers, connected);
     }
     return {};
   };
@@ -92,10 +92,11 @@ int main() {
 
   const auto decoded = tier::core::decode_admin_peers(reply);
   check(decoded.has_value(), "client decodes the reply");
-  check(decoded && decoded->size() == 1, "one peer in the reply");
-  if (decoded && decoded->size() == 1) {
-    check((*decoded)[0].info.id == p.id, "peer id round-trips over the socket");
-    check((*decoded)[0].connected, "peer reported connected");
+  check(decoded && decoded->network == "testnet", "network round-trips over the socket");
+  check(decoded && decoded->peers.size() == 1, "one peer in the reply");
+  if (decoded && decoded->peers.size() == 1) {
+    check(decoded->peers[0].info.id == p.id, "peer id round-trips over the socket");
+    check(decoded->peers[0].connected, "peer reported connected");
   }
 
   // A second request on a fresh connection still works (listener is reusable).

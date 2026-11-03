@@ -89,6 +89,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
            tier::core::VersionRange version_range)
     : identity_(std::move(identity)),
       self_id_(tier::crypto::sha256(identity_.public_key())),
+      roles_(roles),
       network_(std::move(network)),
       endpoint_(identity_, ip, port, network_),
       rng_(std::random_device{}()),
@@ -123,6 +124,10 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
   // record. Hand it a sealer rather than teach core about crypto.
   fd_.set_self_sealer([this](const tier::core::PeerInfo& p) {
     tier::core::PeerInfo sealed = p;
+    // Roles and version are locally authoritative: re-stamp them so a refutation
+    // can never re-sign a role a stale gossiped record briefly put on us.
+    sealed.roles = roles_;
+    sealed.version = std::string(tier::core::version());
     seal_self(sealed);
     return sealed;
   });
@@ -153,6 +158,8 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
 std::uint16_t Node::local_port() const noexcept { return endpoint_.local_port(); }
 
 const tier::core::PeerId& Node::peer_id() const noexcept { return self_id_; }
+
+const std::string& Node::network() const noexcept { return network_; }
 
 const tier::core::Membership& Node::membership() const noexcept {
   return membership_;
@@ -286,6 +293,14 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     if (!verify_owner(peer)) {
       continue;
     }
+    // Our own record is never merged from gossip: a relayed copy (necessarily
+    // signed by this key, since verify_owner dropped any forgery) may be stale -
+    // an old role or incarnation from before a restart. Reconcile it against our
+    // authoritative local state instead.
+    if (peer.id == self_id_) {
+      reconcile_self(peer);
+      continue;
+    }
     // Network version policy: do not admit a peer whose advertised version is
     // outside this network's window (an unconstrained range admits all; an
     // unknown/old version is admitted leniently). This gates membership only;
@@ -296,6 +311,43 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
     if (membership_.apply(peer) && on_change_) {
       on_change_(peer);
     }
+  }
+}
+
+void Node::reconcile_self(const tier::core::PeerInfo& relayed) {
+  const auto self = membership_.find(self_id_);
+  if (!self) {
+    return;  // self is seeded at construction and never removed
+  }
+  // Can the relayed record win over ours anywhere it is gossiped? Only if its
+  // incarnation is at least ours. And does it actually disagree with what we
+  // authoritatively assert? A plain echo of our current record (same fields,
+  // same incarnation, alive) must not trigger a refutation, or every gossip
+  // round would ratchet our incarnation upward forever.
+  const bool could_supersede = relayed.incarnation >= self->incarnation;
+  const bool differs = relayed.roles != roles_ ||
+                       relayed.version != tier::core::version() ||
+                       relayed.addresses != self->addresses ||
+                       relayed.incarnation != self->incarnation ||
+                       relayed.liveness != tier::core::Liveness::alive;
+  if (!could_supersede || !differs) {
+    return;
+  }
+  // Refute: re-assert our authoritative record at an incarnation above the stale
+  // one. Roles and version come from local config, addresses from what we have
+  // learned so far (observed_addr re-confirms them); the relayed record dictates
+  // none of it.
+  tier::core::PeerInfo me = *self;
+  me.roles = roles_;
+  me.version = std::string(tier::core::version());
+  me.liveness = tier::core::Liveness::alive;
+  // Saturate at the ceiling rather than wrap to zero (which would lose to the
+  // stale record); unreachable in practice, defined at the edge.
+  me.incarnation =
+      relayed.incarnation == UINT64_MAX ? UINT64_MAX : relayed.incarnation + 1;
+  seal_self(me);
+  if (membership_.apply(me) && on_change_) {
+    on_change_(me);
   }
 }
 
@@ -378,6 +430,8 @@ void Node::handle_observed(const tier::core::PeerId& from,
   me.addresses = std::move(confirmed);
   me.incarnation += 1;
   me.liveness = tier::core::Liveness::alive;
+  me.roles = roles_;  // roles and version are locally authoritative, never
+  me.version = std::string(tier::core::version());  // taken from a merged record
   seal_self(me);  // addresses and incarnation changed: re-sign
   membership_.apply(me);
   if (on_change_) {
