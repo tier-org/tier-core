@@ -37,7 +37,7 @@ peers_counts() {
   local out
   out="$(compose exec -T "$1" tierctl peers 2>/dev/null || true)"
   local known connected
-  known="$(printf '%s\n' "$out" | sed -n 's/^known=\([0-9]*\).*/\1/p')"
+  known="$(printf '%s\n' "$out" | sed -n 's/.*known=\([0-9]*\).*/\1/p')"
   connected="$(printf '%s\n' "$out" | sed -n 's/.*connected=\([0-9]*\).*/\1/p')"
   printf '%s %s\n' "${known:-0}" "${connected:-0}"
 }
