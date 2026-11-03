@@ -198,8 +198,8 @@ int main() {
           "forgery: victim's own roles unchanged by the forged record");
     check(self.has_value() && self->liveness == Liveness::alive,
           "forgery: victim not marked dead by the forged record");
-    check(self.has_value() && self->incarnation < 1000,
-          "forgery: forged high incarnation did not take");
+    check(self.has_value() && self->incarnation != 1000,
+          "forgery: forged incarnation value did not become ours");
   }
 
   // Self-record authority across restart (A1 regression). A neighbor relays a
@@ -266,6 +266,74 @@ int main() {
           "restart: stale high incarnation is refuted, not adopted");
     check(self.has_value() && self->liveness == Liveness::alive,
           "restart: node stays alive");
+  }
+
+  // Restart incarnation recovery (regression for the mixed-deploy stale record).
+  // A node re-enters the mesh with a wall-clock-seeded incarnation, not 1, so a
+  // validly-signed record from a PREVIOUS run - necessarily a lower incarnation,
+  // possibly in an old role the network still remembers - cannot override its
+  // fresh record. This is what lets a node that was a client and is now backbone
+  // reclaim its role after a staggered restart: the stale client record is
+  // scoped out of gossip and could never be refuted the normal way, so losing on
+  // incarnation is the mechanism that saves it.
+  {
+    using tier::core::Liveness;
+    using tier::core::Role;
+    const auto seed = tier::crypto::NodeIdentity::generate().seed();
+    const auto signer = tier::crypto::NodeIdentity::from_seed(seed);
+
+    tier::net::Node node(tier::crypto::NodeIdentity::from_seed(seed),
+                         tier::core::role_bit(Role::transmitter), "127.0.0.1", 0,
+                         {}, "review");
+    const auto node_id = node.peer_id();
+    const auto before = node.membership().find(node_id);
+    const std::uint64_t fresh_inc = before ? before->incarnation : 0;
+    check(fresh_inc > 1,
+          "restart-inc: incarnation is seeded from the clock, not 1");
+
+    tier::net::Endpoint relay(tier::crypto::NodeIdentity::generate(),
+                              "127.0.0.1", 0, "review");
+    tier::net::ConnId conn = 0;
+    bool handshook = false;
+    relay.on_handshake([&](tier::net::ConnId c, bool, const tier::net::PeerId&) {
+      conn = c;
+      handshook = true;
+    });
+    relay.connect("127.0.0.1", node.local_port());
+    for (int i = 0; i < 4000 && !handshook; ++i) {
+      relay.poll(2);
+      node.poll(2);
+    }
+    check(handshook, "restart-inc: relay completes the handshake");
+
+    // A correctly-signed record from an older run: a lower incarnation and the
+    // old client role. verify_owner accepts it (same key), so only the
+    // incarnation ordering keeps it from winning.
+    tier::core::PeerInfo stale;
+    stale.id = node_id;
+    stale.public_key = signer.public_key();
+    stale.roles = tier::core::role_bit(Role::client);
+    stale.version = std::string(tier::core::version());
+    stale.incarnation = fresh_inc - 1000;  // an earlier run, lower incarnation
+    stale.liveness = Liveness::alive;
+    stale.addresses = {};
+    stale.signature = signer.signer().sign(
+        tier::core::membership_signing_payload("review", stale));
+
+    const auto msg = tier::core::encode_membership_message({stale});
+    for (int i = 0; i < 400; ++i) {
+      relay.send(conn, msg);
+      relay.poll(2);
+      node.poll(2);
+    }
+
+    const auto after = node.membership().find(node_id);
+    check(after && tier::core::has_role(after->roles, Role::transmitter),
+          "restart-inc: node keeps its backbone role against the older record");
+    check(after && !tier::core::has_role(after->roles, Role::client),
+          "restart-inc: stale client role from the old run does not take");
+    check(after && after->incarnation >= fresh_inc,
+          "restart-inc: incarnation not dragged down to the old run's value");
   }
 
   if (g_failures == 0) {

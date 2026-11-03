@@ -91,6 +91,24 @@ bool is_ipv6(const std::string& addr) {
   return !addr.empty() && addr.front() == '[';
 }
 
+// Seed a node's own incarnation from the wall clock (microseconds since the
+// epoch) rather than a fixed 1, so a restarted node always re-enters the mesh
+// with an incarnation above any record a peer still remembers from a previous
+// run. Its fresh record (new role, version, addresses) then supersedes the
+// stale one by the normal merge rule - crucial when the stale record is a
+// scoped-out edge (client) record that would never be gossiped back for the
+// owner to refute (docs/topology.md). Assumes the clock does not move backward
+// across a restart (NTP-synced hosts); microsecond resolution makes a
+// same-tick restart effectively impossible, and reconcile_self remains the
+// fallback if a stale record ever still outranks us.
+std::uint64_t startup_incarnation() {
+  const auto since_epoch =
+      std::chrono::system_clock::now().time_since_epoch();
+  const auto micros =
+      std::chrono::duration_cast<std::chrono::microseconds>(since_epoch).count();
+  return micros > 0 ? static_cast<std::uint64_t>(micros) : 1;
+}
+
 }  // namespace
 
 Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
@@ -124,7 +142,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
   }
   me.roles = roles;
   me.version = std::string(tier::core::version());
-  me.incarnation = 1;
+  me.incarnation = startup_incarnation();
   me.liveness = tier::core::Liveness::alive;
   seal_self(me);
   membership_.apply(me);
