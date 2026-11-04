@@ -376,6 +376,11 @@ class Node {
     tier::msg::Suite suite;
     std::vector<tier::crypto::Byte> plaintext;
     std::chrono::steady_clock::time_point deadline;
+    // Devices this message has already been fanned out to. The user's device
+    // set is resolved repeatedly (devices enroll asynchronously and a lookup
+    // can land before a device has registered), so we deliver to each newly
+    // seen device exactly once and keep the send alive until its deadline.
+    std::set<tier::core::PeerId> delivered;
   };
   std::map<tier::core::PeerId, std::vector<PendingUserSend>> pending_user_sends_;
   // Target user id -> when we last sent a user lookup, to rate-limit lookups.

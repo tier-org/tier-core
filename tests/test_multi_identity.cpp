@@ -139,6 +139,43 @@ int main() {
   check(all_true(got1), "device 1 received all three user messages");
   check(all_true(got2), "device 2 received all three user messages");
 
+  // Late-enrollment race (regression for the frozen fan-out bug that the docker
+  // multi-identity gate caught). A device that enrolls under the user AFTER a
+  // user send has already been resolved to the other devices must still receive
+  // it: the sender resolves the user's device set repeatedly within the send
+  // window, delivering to each newly seen device once, rather than freezing the
+  // set at the first result. Here device3 is not even connected when the send is
+  // issued and the first result (device1, device2) is answered; it must still be
+  // reached once it joins.
+  tier::net::Node device3 = make_node(Role::client);
+  device3.set_user_identity(from_same_seed(user));
+  const auto late_pt = bytes("to-user late-enroll");
+  {
+    const auto res = sender.send_to_user(
+        user_id, Suite::classical,
+        std::span<const Byte>(late_pt.data(), late_pt.size()));
+    check(res == tier::net::Node::SendResult::queued,
+          "late-enroll send_to_user is queued");
+  }
+  // Resolve + fan out to the devices known so far (device3 is absent): this is
+  // the point at which the old code erased the pending send.
+  pump(all, 80);
+  // device3 now joins and enrolls under the user.
+  device3.connect("127.0.0.1", comm.local_port());
+  std::vector<tier::net::Node*> all3{&comm, &device1, &device2, &sender, &device3};
+  bool got3 = false;
+  for (int i = 0; i < 20000 && !got3; ++i) {
+    pump(all3, 1);
+    for (const auto& m : device3.take_inbox()) {
+      if (m.plaintext == late_pt) {
+        got3 = true;
+        check(m.sender_user && *m.sender_user == sender_user_id,
+              "late device: authenticated as the sender's user id");
+      }
+    }
+  }
+  check(got3, "a device enrolling after the send still receives it");
+
   // A node with no user identity cannot send to a user.
   tier::net::Node plain = make_node(Role::client);
   const auto probe = bytes("x");

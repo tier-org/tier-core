@@ -1128,12 +1128,23 @@ void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
   if (it == pending_user_sends_.end()) {
     return;
   }
-  // Fan each queued message out to every returned device as a device-level send
-  // carrying our user envelope. send_message resolves/connects on demand.
-  for (const auto& m : it->second) {
+  // Fan each queued message out to every returned device not yet delivered to,
+  // as a device-level send carrying our user envelope (send_message resolves /
+  // connects on demand). The device set is resolved repeatedly rather than once:
+  // the two devices of a user enroll asynchronously, and a lookup can be answered
+  // (even from a replica) before a device has registered, so a single result may
+  // list only some devices. We therefore do NOT erase the pending send here -
+  // each new device seen on a later result is delivered to once (deduplicated by
+  // m.delivered), and service_user_sends drops the message when its deadline
+  // passes. This matches the online, direct-delivery model: reach every device
+  // that comes online within the send window.
+  for (auto& m : it->second) {
     for (const auto& device : devices) {
       if (device == self_id_) {
         continue;  // do not echo to our own device
+      }
+      if (!m.delivered.insert(device).second) {
+        continue;  // already fanned out to this device
       }
       const std::vector<tier::crypto::Byte> envelope = tier::msg::make_user_envelope(
           user_identity_->public_key(),
@@ -1144,8 +1155,6 @@ void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
           tier::crypto::ByteSpan(envelope.data(), envelope.size()));
     }
   }
-  pending_user_sends_.erase(it);
-  user_lookup_sent_.erase(user);
 }
 
 void Node::register_user(std::chrono::steady_clock::time_point now,
