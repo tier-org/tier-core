@@ -40,3 +40,18 @@ add_executable(fuzz_sealed fuzz_sealed.cpp)
 target_link_libraries(fuzz_sealed PRIVATE tier::msg tier::crypto tier::core tier::options)
 target_compile_options(fuzz_sealed PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_sealed PRIVATE -fsanitize=fuzzer)
+
+add_executable(fuzz_presence fuzz_presence.cpp)
+target_link_libraries(fuzz_presence PRIVATE tier::msg tier::crypto tier::core tier::options)
+target_compile_options(fuzz_presence PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_presence PRIVATE -fsanitize=fuzzer)
+
+add_executable(fuzz_user fuzz_user.cpp)
+target_link_libraries(fuzz_user PRIVATE tier::msg tier::crypto tier::core tier::options)
+target_compile_options(fuzz_user PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_user PRIVATE -fsanitize=fuzzer)
+
+add_executable(fuzz_holepunch fuzz_holepunch.cpp)
+target_link_libraries(fuzz_holepunch PRIVATE tier::msg tier::crypto tier::core tier::options)
+target_compile_options(fuzz_holepunch PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_holepunch PRIVATE -fsanitize=fuzzer)

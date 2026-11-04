@@ -15,8 +15,14 @@
 #include "tier/core/swim.hpp"
 #include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/msg/holepunch.hpp"
+#include "tier/msg/presence.hpp"
 #include "tier/msg/sealed.hpp"
+#include "tier/msg/user.hpp"
 #include "tier/net/endpoint.hpp"
+#include "tier/net/presence_registry.hpp"
+#include "tier/net/rendezvous.hpp"
+#include "tier/net/user_directory.hpp"
 
 namespace tier::net {
 
@@ -71,24 +77,60 @@ class Node {
   // plane. `sender` is the authenticated peer id (it hashes to the identity
   // key the message was signed with).
   struct ReceivedMessage {
-    tier::core::PeerId sender{};
+    tier::core::PeerId sender{};  // authenticated sender device id
     tier::msg::Suite suite{};
     std::vector<tier::crypto::Byte> plaintext;
+    // Set when the message carried a user envelope whose credential verified:
+    // the authenticated sender user id (see docs/multi-identity.md).
+    std::optional<tier::core::PeerId> sender_user;
   };
 
-  // Send an encrypted message to a peer under `suite`. The peer must be
-  // connected and must have announced its encryption keys (which happens on
-  // handshake). Returns false if it is not connected or its keys are not yet
-  // known; throws only on an unexpected crypto backend failure. v1 delivers
-  // only to a directly connected peer - relayed/offline delivery is future
-  // work (see docs/overnight-2026-11-03.md).
-  [[nodiscard]] bool send_message(const tier::core::PeerId& to,
-                                  tier::msg::Suite suite,
-                                  std::span<const tier::crypto::Byte> plaintext);
+  // Outcome of a send_message call.
+  enum class SendResult : std::uint8_t {
+    sent,    // sealed and handed to the transport on an existing connection
+    queued,  // held pending discovery/connection; delivered or dropped later
+    failed,  // could not be accepted (e.g. no way to reach the peer at all)
+  };
+
+  // Send an encrypted message to a peer under `suite`. If the peer is already
+  // connected and its encryption keys are known, the message is sealed and sent
+  // immediately (`sent`). Otherwise it is queued and the node resolves the peer
+  // via a communicator (presence lookup), connects directly, and flushes the
+  // message when ready (`queued`); it is dropped if that does not complete
+  // before a timeout. `failed` means the send could not even be queued. Throws
+  // only on an unexpected crypto backend failure. See docs/communicator.md.
+  [[nodiscard]] SendResult send_message(
+      const tier::core::PeerId& to, tier::msg::Suite suite,
+      std::span<const tier::crypto::Byte> plaintext);
 
   // Whether this node currently holds the encryption keys for a peer (i.e. the
   // peer is reachable for send_message).
   [[nodiscard]] bool has_encryption_keys(const tier::core::PeerId& peer) const;
+
+  // --- multi-identity (see docs/multi-identity.md) -----------------------
+  // Attach a user identity to this device. The node self-issues its own device
+  // credential (this device, signed by the user key) and begins publishing a
+  // user-directory enrollment so the user is addressable. A node without a user
+  // identity still sends and receives device-level messages as before.
+  void set_user_identity(tier::crypto::NodeIdentity user);
+
+  // This node's user id, if a user identity is attached.
+  [[nodiscard]] std::optional<tier::core::PeerId> user_id() const;
+
+  // Test-only: simulate a restricted NAT in front of this node (see
+  // Endpoint::set_simulated_restricted_nat). Lets NAT traversal be tested
+  // without a real NAT. Never call on a live node.
+  void set_simulated_restricted_nat(bool on);
+
+  // Send an encrypted message to a user (all of whose currently-online devices
+  // receive it). Resolves the user's devices through a communicator and fans the
+  // message out as device-level sends, each carrying a user envelope that proves
+  // our user identity. Requires a user identity attached here. With no storage,
+  // offline devices simply miss it. Same sent/queued/failed contract as
+  // send_message (queued while the user is being resolved).
+  [[nodiscard]] SendResult send_to_user(
+      const tier::core::PeerId& to_user, tier::msg::Suite suite,
+      std::span<const tier::crypto::Byte> plaintext);
 
   // Remove and return every message received since the last call.
   [[nodiscard]] std::vector<ReceivedMessage> take_inbox();
@@ -192,6 +234,71 @@ class Node {
   // addressed to us; a message that fails any check is dropped.
   void handle_sealed(const PeerId& sender_key,
                      std::span<const tier::crypto::Byte> payload);
+  // --- client-to-client discovery (see docs/communicator.md) ---------------
+  // Communicator side: verify and store a client's signed presence record.
+  void handle_presence_register(std::span<const tier::crypto::Byte> payload,
+                                std::uint64_t now_unix);
+  // Communicator side: answer a lookup on `conn` with the stored record (or a
+  // not-found marker).
+  void handle_presence_lookup(ConnId conn,
+                              std::span<const tier::crypto::Byte> payload,
+                              std::uint64_t now_unix);
+  // Resolver side: verify a returned record, cache the peer's keys/addresses,
+  // and dial it so a queued message can flush.
+  void handle_presence_result(std::span<const tier::crypto::Byte> payload,
+                              std::chrono::steady_clock::time_point now);
+  // Live communicator ids from the current membership (alive, communicator
+  // role), used to compute rendezvous responsibility.
+  [[nodiscard]] std::vector<tier::core::PeerId> live_communicators() const;
+  // If this node is an edge client, (re)publish its presence record to the
+  // communicators responsible for its id, dialing one if not yet connected.
+  void register_presence(std::chrono::steady_clock::time_point now,
+                         std::uint64_t now_unix);
+  // Drive queued sends: flush any whose peer is now connected with known keys,
+  // (re)issue a lookup or direct dial for the rest, and drop timed-out ones.
+  void service_pending_sends(std::chrono::steady_clock::time_point now);
+  // Seal and transmit one message to an already-connected peer whose keys are
+  // known. Returns false if the peer is not currently reachable this way.
+  bool deliver_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
+                      std::span<const tier::crypto::Byte> plaintext);
+  // Dial the first dialable of `addresses` (rate-limited via dialed_), if not
+  // already connected to `id`.
+  void dial_addresses(const std::vector<std::string>& addresses,
+                      std::chrono::steady_clock::time_point now);
+  // --- multi-identity directory (see docs/multi-identity.md) ---------------
+  // Communicator side: verify a device enrollment (its credential must bind the
+  // connection's device id to the carried user key) and store it.
+  void handle_user_register(const tier::core::PeerId& from_device,
+                            std::span<const tier::crypto::Byte> payload,
+                            std::uint64_t now_unix);
+  // Communicator side: answer a user lookup on `conn` with the enrolled devices.
+  void handle_user_lookup(ConnId conn,
+                          std::span<const tier::crypto::Byte> payload,
+                          std::uint64_t now_unix);
+  // Sender side: on a user result, fan the queued message(s) for that user out
+  // to each returned device.
+  void handle_user_result(std::span<const tier::crypto::Byte> payload,
+                          std::chrono::steady_clock::time_point now);
+  // If a user identity is attached, (re)publish this device's enrollment to the
+  // communicators responsible for the user id.
+  void register_user(std::chrono::steady_clock::time_point now,
+                     std::uint64_t now_unix);
+  // Drive queued user-level sends: (re)issue a user lookup, drop timed-out ones.
+  void service_user_sends(std::chrono::steady_clock::time_point now);
+  // --- NAT hole punching (see docs/communicator.md, M-NAT) -----------------
+  // Communicator side: relay a punch request to its target as a signal.
+  void handle_hole_punch_request(ConnId conn, const tier::core::PeerId& from,
+                                 std::span<const tier::crypto::Byte> payload);
+  // Target side: dial the origin's candidates and, on an initiate, reply so the
+  // origin dials ours too (coordinated simultaneous open).
+  void handle_hole_punch_signal(ConnId conn,
+                                std::span<const tier::crypto::Byte> payload,
+                                std::chrono::steady_clock::time_point now);
+  // Our own candidate addresses (what we advertise), for a punch.
+  [[nodiscard]] std::vector<std::string> self_candidates() const;
+  // Ask the communicator responsible for `target` to coordinate a punch to it.
+  void initiate_hole_punch(const tier::core::PeerId& target,
+                           std::chrono::steady_clock::time_point now);
   // Dial known peers we have learned of but are not yet connected to, forming a
   // mesh out of transitive discovery.
   void autodial(std::chrono::steady_clock::time_point now);
@@ -232,8 +339,56 @@ class Node {
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;
   // Per peer id, the encryption keys it announced (enc_keys). Populated on
-  // handshake; required to seal a message to that peer.
+  // handshake; required to seal a message to that peer. Also filled from a
+  // resolved presence record when reaching a peer we are not yet connected to.
   std::map<tier::core::PeerId, tier::msg::PeerEncKeys> peer_enc_keys_;
+  // --- client-to-client discovery state (see docs/communicator.md) ---------
+  // Communicator role only: the bounded store of client presence records.
+  PresenceRegistry presence_registry_;
+  // A message waiting for its peer to be reachable.
+  struct PendingSend {
+    tier::msg::Suite suite;
+    std::vector<tier::crypto::Byte> plaintext;
+    std::chrono::steady_clock::time_point deadline;
+  };
+  // Target peer id -> messages queued for it while discovery/connection is in
+  // flight (send_message to an unconnected peer).
+  std::map<tier::core::PeerId, std::vector<PendingSend>> pending_sends_;
+  // Target peer id -> addresses learned from its resolved presence record, used
+  // to dial it directly.
+  std::map<tier::core::PeerId, std::vector<std::string>> resolved_addrs_;
+  // Target peer id -> when we last sent a presence lookup for it, to rate-limit
+  // repeated lookups while a resolution is pending.
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point>
+      lookup_sent_;
+  // When this (edge client) node may next publish its presence record.
+  std::chrono::steady_clock::time_point next_presence_register_{};
+  // --- multi-identity state (see docs/multi-identity.md) -------------------
+  // The attached user identity, if any, and this device's self-issued
+  // credential under it (signed once at attach time).
+  std::optional<tier::crypto::NodeIdentity> user_identity_;
+  tier::core::PeerId user_id_{};
+  std::vector<tier::crypto::Byte> device_credential_;
+  // Communicator role only: user id -> enrolled device ids.
+  UserDirectory user_directory_;
+  // A user-level message waiting for the user's devices to be resolved.
+  struct PendingUserSend {
+    tier::msg::Suite suite;
+    std::vector<tier::crypto::Byte> plaintext;
+    std::chrono::steady_clock::time_point deadline;
+  };
+  std::map<tier::core::PeerId, std::vector<PendingUserSend>> pending_user_sends_;
+  // Target user id -> when we last sent a user lookup, to rate-limit lookups.
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point>
+      user_lookup_sent_;
+  // When this node may next publish its user-directory enrollment.
+  std::chrono::steady_clock::time_point next_user_register_{};
+  // --- hole-punch state (see docs/communicator.md, M-NAT) ------------------
+  // Target id -> earliest time to escalate a stuck direct dial to a hole punch
+  // (set when we first resolve the peer's addresses), and -> when we last sent a
+  // punch request for it (rate-limit).
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> punch_grace_;
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> punch_sent_;
   // Decrypted messages received and not yet drained by take_inbox().
   std::vector<ReceivedMessage> inbox_;
   std::function<void(const ReceivedMessage&)> on_message_received_;

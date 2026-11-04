@@ -46,9 +46,11 @@ void send_and_check(tier::net::Node& from, tier::net::Node& to,
                     tier::msg::Suite suite, const std::string& text,
                     const char* name) {
   const auto pt = bytes(text);
-  const bool sent = from.send_message(to.peer_id(), suite,
-                                      std::span<const Byte>(pt.data(), pt.size()));
-  check(sent, name);
+  const auto result = from.send_message(to.peer_id(), suite,
+                                        std::span<const Byte>(pt.data(), pt.size()));
+  // These peers are directly connected with keys exchanged, so the send is
+  // immediate, not queued.
+  check(result == tier::net::Node::SendResult::sent, name);
   pump(from, to, 200);
   auto inbox = to.take_inbox();
   bool found = false;
@@ -99,13 +101,20 @@ int main() {
   // A larger payload round-trips too.
   send_and_check(client, backbone, Suite::hybrid, std::string(20000, 'x'), "send large");
 
-  // Sending to a peer we are not connected to fails cleanly.
+  // Sending to a peer we are not connected to and cannot resolve (no
+  // communicator in this two-node test) is queued, not delivered: it never
+  // reaches an inbox and ages out on its own.
   tier::core::PeerId stranger{};
   stranger[0] = 0xAB;
   const std::vector<Byte> p = bytes("nobody");
-  check(!client.send_message(stranger, Suite::classical,
-                             std::span<const Byte>(p.data(), p.size())),
-        "send to unknown peer returns false");
+  const auto res = client.send_message(stranger, Suite::classical,
+                                       std::span<const Byte>(p.data(), p.size()));
+  check(res == tier::net::Node::SendResult::queued,
+        "send to an unresolvable peer is queued, not sent");
+  pump(client, backbone, 50);
+  for (const auto& m : backbone.take_inbox()) {
+    check(m.sender != stranger, "stranger message never delivered");
+  }
 
   if (g_failures == 0) {
     std::puts("messaging e2e: all checks passed");

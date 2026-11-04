@@ -1,0 +1,83 @@
+# A role-mixed INTERNAL dual-stack mesh for the multi-identity gate (see
+# docs/multi-identity.md). Two communicators form the backbone; two client
+# "devices" share one user identity (the same user seed is mounted into both),
+# and a separate "sender" client has its own user identity. The point: the
+# sender addresses the shared user id and both devices receive, with no prior
+# connection between any of them.
+#
+# USER_SEED and SENDER_SEED are absolute host paths to 32-byte seed files the
+# harness creates before `up`. Same isolation as the other compose files:
+# internal network, private TIER_NETWORK.
+
+name: tier-localnet-multi
+
+networks:
+  tiernet:
+    driver: bridge
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.79.0.0/24
+        - subnet: fd00:7179::/64
+
+services:
+  comm1:
+    image: tier-localnet:latest
+    container_name: tier-multi-comm1
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "[fd00:7179::21]:7777 10.79.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.11
+        ipv6_address: fd00:7179::11
+  comm2:
+    image: tier-localnet:latest
+    container_name: tier-multi-comm2
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "[fd00:7179::11]:7777 10.79.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.21
+        ipv6_address: fd00:7179::21
+  devicea:
+    image: tier-localnet:latest
+    container_name: tier-multi-devicea
+    environment:
+      TIER_ROLES: client
+      TIER_USER_ID_FILE: /etc/tier/user.id
+      TIER_SEEDS: "[fd00:7179::11]:7777 10.79.0.11:7777 [fd00:7179::21]:7777 10.79.0.21:7777"
+    volumes:
+      - "${USER_SEED}:/etc/tier/user.id:ro"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.31
+        ipv6_address: fd00:7179::31
+  deviceb:
+    image: tier-localnet:latest
+    container_name: tier-multi-deviceb
+    environment:
+      TIER_ROLES: client
+      TIER_USER_ID_FILE: /etc/tier/user.id
+      TIER_SEEDS: "[fd00:7179::11]:7777 10.79.0.11:7777 [fd00:7179::21]:7777 10.79.0.21:7777"
+    volumes:
+      - "${USER_SEED}:/etc/tier/user.id:ro"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.41
+        ipv6_address: fd00:7179::41
+  sender:
+    image: tier-localnet:latest
+    container_name: tier-multi-sender
+    environment:
+      TIER_ROLES: client
+      TIER_USER_ID_FILE: /etc/tier/user.id
+      TIER_SEEDS: "[fd00:7179::11]:7777 10.79.0.11:7777 [fd00:7179::21]:7777 10.79.0.21:7777"
+    volumes:
+      - "${SENDER_SEED}:/etc/tier/user.id:ro"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.51
+        ipv6_address: fd00:7179::51

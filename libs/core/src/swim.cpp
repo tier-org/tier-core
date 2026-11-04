@@ -268,6 +268,14 @@ bool FailureDetector::handle(Clock::time_point now, const PeerId& from,
     case ControlType::observed_addr:
     case ControlType::enc_keys:
     case ControlType::app_sealed:
+    case ControlType::presence_register:
+    case ControlType::presence_lookup:
+    case ControlType::presence_result:
+    case ControlType::user_register:
+    case ControlType::user_lookup:
+    case ControlType::user_result:
+    case ControlType::hole_punch_request:
+    case ControlType::hole_punch_signal:
       return false;  // not ours; the caller handles these
   }
   return false;

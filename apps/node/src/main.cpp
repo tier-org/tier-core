@@ -58,6 +58,8 @@ const char* role_name(tier::core::Role role) {
       return "keeper";
     case tier::core::Role::transmitter:
       return "transmitter";
+    case tier::core::Role::communicator:
+      return "communicator";
   }
   return "?";
 }
@@ -67,7 +69,8 @@ std::string format_roles(tier::core::RoleSet roles) {
   std::string out;
   for (const tier::core::Role r :
        {tier::core::Role::client, tier::core::Role::validator,
-        tier::core::Role::keeper, tier::core::Role::transmitter}) {
+        tier::core::Role::keeper, tier::core::Role::transmitter,
+        tier::core::Role::communicator}) {
     if (tier::core::has_role(roles, r)) {
       if (!out.empty()) {
         out += '|';
@@ -96,7 +99,8 @@ std::optional<tier::core::RoleSet> parse_roles(const char* spec) {
     bool matched = false;
     for (const tier::core::Role r :
          {tier::core::Role::client, tier::core::Role::validator,
-          tier::core::Role::keeper, tier::core::Role::transmitter}) {
+          tier::core::Role::keeper, tier::core::Role::transmitter,
+          tier::core::Role::communicator}) {
       if (token == role_name(r)) {
         roles |= tier::core::role_bit(r);
         matched = true;
@@ -560,8 +564,8 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   if (!roles) {
     std::fprintf(stderr,
                  "invalid roles '%s' (expected names from "
-                 "client|validator|keeper|transmitter, e.g. \"transmitter\" or "
-                 "\"validator|keeper\")\n",
+                 "client|validator|keeper|transmitter|communicator, e.g. "
+                 "\"transmitter\" or \"validator|keeper\")\n",
                  roles_spec.c_str());
     return 2;
   }
@@ -571,6 +575,24 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
   tier::net::Node node(identity, *roles, "::", port, {}, network,
                        version_range);
+
+  // Optional user identity (multi-identity, see docs/multi-identity.md). If
+  // TIER_USER_ID_FILE names a seed, attach it: this device then enrolls under
+  // that user and can be addressed by, and send as, the user. The seed file is
+  // created if absent, exactly like the device key.
+  if (const char* const user_path = std::getenv("TIER_USER_ID_FILE");
+      user_path != nullptr && user_path[0] != '\0') {
+    auto user_identity = load_or_create_identity(user_path);
+    if (!user_identity) {
+      std::fprintf(stderr, "cannot load user identity from %s\n", user_path);
+      return 1;
+    }
+    node.set_user_identity(std::move(*user_identity));
+    if (const auto uid = node.user_id()) {
+      print_hex("user id:  ", *uid);
+    }
+  }
+
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -637,6 +659,12 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   const auto admin_handler =
       [&node](const tier::core::AdminRequest& req) -> std::vector<std::uint8_t> {
     switch (req.op) {
+      case tier::core::AdminOp::id: {
+        tier::core::AdminId id;
+        id.device_id = node.peer_id();
+        id.user_id = node.user_id();
+        return tier::core::encode_admin_id_reply(id);
+      }
       case tier::core::AdminOp::peers:
         return tier::core::encode_admin_peers(node.network(),
                                               node.membership().snapshot(),
@@ -645,17 +673,33 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
         if (!tier::msg::is_known_suite(req.suite)) {
           return tier::core::encode_admin_send_reply(false);
         }
-        const bool ok = node.send_message(
+        const auto result = node.send_message(
             req.recipient, static_cast<tier::msg::Suite>(req.suite),
             std::span<const tier::crypto::Byte>(req.plaintext.data(),
                                                 req.plaintext.size()));
-        return tier::core::encode_admin_send_reply(ok);
+        // Accepted for delivery whether sent now or queued pending discovery;
+        // only an outright failure (e.g. unknown suite, self-send) is false.
+        const bool accepted =
+            result != tier::net::Node::SendResult::failed;
+        return tier::core::encode_admin_send_reply(accepted);
+      }
+      case tier::core::AdminOp::send_user: {
+        if (!tier::msg::is_known_suite(req.suite)) {
+          return tier::core::encode_admin_send_user_reply(false);
+        }
+        const auto result = node.send_to_user(
+            req.recipient, static_cast<tier::msg::Suite>(req.suite),
+            std::span<const tier::crypto::Byte>(req.plaintext.data(),
+                                                req.plaintext.size()));
+        const bool accepted = result != tier::net::Node::SendResult::failed;
+        return tier::core::encode_admin_send_user_reply(accepted);
       }
       case tier::core::AdminOp::inbox: {
         std::vector<tier::core::AdminInboxMessage> out;
         for (auto& m : node.take_inbox()) {
           tier::core::AdminInboxMessage im;
           im.sender = m.sender;
+          im.sender_user = m.sender_user;
           im.suite = static_cast<std::uint8_t>(m.suite);
           im.plaintext = std::move(m.plaintext);
           out.push_back(std::move(im));

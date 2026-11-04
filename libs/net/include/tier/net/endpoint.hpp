@@ -89,6 +89,14 @@ class Endpoint {
   // Queue a frame on every connection whose handshake has completed.
   void broadcast(std::span<const tier::crypto::Byte> payload);
 
+  // Test-only: simulate an address-restricted-cone NAT in front of this
+  // endpoint. When on, an inbound datagram from a source this endpoint has not
+  // yet sent a packet to is dropped (as a real NAT would, having no mapping for
+  // it). This makes a plain one-sided dial to a NAT'd peer fail and a
+  // coordinated hole punch succeed, so NAT traversal can be tested without a
+  // real NAT. Off in production; never set on a live node.
+  void set_simulated_restricted_nat(bool on);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

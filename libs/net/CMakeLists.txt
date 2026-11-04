@@ -2,7 +2,10 @@ add_library(tier_net STATIC
   src/endpoint.cpp
   src/backend.cpp
   src/node.cpp
-  src/admin_listener.cpp)
+  src/admin_listener.cpp
+  src/rendezvous.cpp
+  src/presence_registry.cpp
+  src/user_directory.cpp)
 add_library(tier::net ALIAS tier_net)
 
 target_include_directories(tier_net PUBLIC include)

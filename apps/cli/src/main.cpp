@@ -97,13 +97,24 @@ std::string short_id(const tier::core::PeerId& id) {
   return out;
 }
 
+std::string full_id(const tier::core::PeerId& id) {
+  static const char* const hex = "0123456789abcdef";
+  std::string out;
+  for (const auto b : id) {
+    out += hex[b >> 4];
+    out += hex[b & 0x0F];
+  }
+  return out;
+}
+
 std::string roles_string(tier::core::RoleSet roles) {
   using tier::core::Role;
   struct Named { Role r; const char* name; };
   static const Named kAll[] = {{Role::client, "client"},
                                {Role::validator, "validator"},
                                {Role::keeper, "keeper"},
-                               {Role::transmitter, "transmitter"}};
+                               {Role::transmitter, "transmitter"},
+                               {Role::communicator, "communicator"}};
   std::string out;
   for (const Named& n : kAll) {
     if (tier::core::has_role(roles, n.r)) {
@@ -137,6 +148,28 @@ std::string join_addresses(const std::vector<std::string>& addrs) {
     out += a;
   }
   return out.empty() ? "-" : out;
+}
+
+int cmd_id(const std::string& path) {
+  std::vector<std::uint8_t> reply;
+  if (!query(path, tier::core::AdminOp::id, reply)) {
+    return 1;
+  }
+  const auto id = tier::core::decode_admin_id_reply(reply);
+  if (!id) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  // The full 64-hex device id (what `tierctl send <peer-id>` expects) and, if a
+  // user identity is attached, the user id (what `tierctl send-user` expects).
+  // Share whichever one out of band with who wants to message this node/user.
+  std::printf("device %s\n", full_id(id->device_id).c_str());
+  if (id->user_id) {
+    std::printf("user   %s\n", full_id(*id->user_id).c_str());
+  } else {
+    std::printf("user   -\n");
+  }
+  return 0;
 }
 
 int cmd_peers(const std::string& path) {
@@ -244,10 +277,52 @@ int cmd_send(const std::string& path, std::string_view peer_hex,
   }
   if (!*ok) {
     std::fprintf(stderr,
-                 "not sent: peer not connected or its encryption keys unknown\n");
+                 "not accepted: unknown suite, or no way to reach the peer\n");
     return 1;
   }
-  std::printf("sent (%s) to %s\n", suite_name(*suite), short_id(*id).c_str());
+  // Accepted for delivery: sent now if already connected, otherwise queued while
+  // the node resolves the peer through a communicator and connects to it.
+  std::printf("accepted (%s) for %s\n", suite_name(*suite), short_id(*id).c_str());
+  return 0;
+}
+
+int cmd_send_user(const std::string& path, std::string_view user_hex,
+                  std::string_view suite_name_arg, std::string_view message) {
+  const auto id = parse_peer_id(user_hex);
+  if (!id) {
+    std::fprintf(stderr, "invalid user id (expected 64 hex chars)\n");
+    return 2;
+  }
+  const auto suite = parse_suite(suite_name_arg);
+  if (!suite) {
+    std::fprintf(stderr, "invalid suite (expected classical|hybrid|pq)\n");
+    return 2;
+  }
+  const std::vector<std::uint8_t> pt(message.begin(), message.end());
+  if (pt.size() > tier::core::kMaxAdminMessageBytes) {
+    std::fprintf(stderr, "message too large (max %zu bytes)\n",
+                 tier::core::kMaxAdminMessageBytes);
+    return 2;
+  }
+  const auto req = tier::core::encode_admin_send_user(
+      *id, *suite, std::span<const std::uint8_t>(pt.data(), pt.size()));
+  std::vector<std::uint8_t> reply;
+  if (!query_bytes(path, req, reply)) {
+    return 1;
+  }
+  const auto ok = tier::core::decode_admin_send_user_reply(reply);
+  if (!ok) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  if (!*ok) {
+    std::fprintf(stderr,
+                 "not accepted: unknown suite, or this node has no user identity\n");
+    return 1;
+  }
+  // Fans out to the user's online devices once resolved through a communicator.
+  std::printf("accepted (%s) for user %s\n", suite_name(*suite),
+              short_id(*id).c_str());
   return 0;
 }
 
@@ -264,8 +339,11 @@ int cmd_inbox(const std::string& path) {
   std::printf("%zu message(s)\n", messages->size());
   for (const auto& m : *messages) {
     std::string text(m.plaintext.begin(), m.plaintext.end());
-    std::printf("from %s  suite=%s  %zu bytes: %s\n", short_id(m.sender).c_str(),
-                suite_name(m.suite), m.plaintext.size(), text.c_str());
+    const std::string user =
+        m.sender_user ? ("user " + short_id(*m.sender_user)) : std::string("-");
+    std::printf("from %s (%s)  suite=%s  %zu bytes: %s\n",
+                short_id(m.sender).c_str(), user.c_str(), suite_name(m.suite),
+                m.plaintext.size(), text.c_str());
   }
   return 0;
 }
@@ -273,11 +351,15 @@ int cmd_inbox(const std::string& path) {
 int usage() {
   std::fputs(
       "usage: tierctl [--sock <path>] <command>\n"
+      "  id                         print this node's own peer id (64 hex)\n"
       "  peers                      list the node's view of the mesh\n"
       "  send <peer-id> [suite] <message>\n"
-      "                             send an encrypted message to a peer\n"
+      "                             send an encrypted message to a peer (device)\n"
       "                             (peer-id: 64 hex chars; suite: "
       "classical|hybrid|pq, default hybrid)\n"
+      "  send-user <user-id> [suite] <message>\n"
+      "                             send to a user (fans out to its online "
+      "devices)\n"
       "  inbox                      print and drain received messages\n"
       "\n"
       "The socket defaults to " "/run/tierd/tierd.sock"
@@ -309,6 +391,9 @@ int main(int argc, char** argv) {
   const std::string path = resolve_socket(sock_override);
   const std::string_view command = positional.empty() ? "peers" : positional[0];
 
+  if (command == "id") {
+    return cmd_id(path);
+  }
   if (command == "peers") {
     return cmd_peers(path);
   }
@@ -323,6 +408,15 @@ int main(int argc, char** argv) {
     }
     if (positional.size() == 4) {
       return cmd_send(path, positional[1], positional[2], positional[3]);
+    }
+    return usage();
+  }
+  if (command == "send-user") {
+    if (positional.size() == 3) {
+      return cmd_send_user(path, positional[1], "hybrid", positional[2]);
+    }
+    if (positional.size() == 4) {
+      return cmd_send_user(path, positional[1], positional[2], positional[3]);
     }
     return usage();
   }

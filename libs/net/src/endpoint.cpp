@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -297,6 +298,12 @@ struct Endpoint::Impl {
   int timer_fd = -1;
   sockaddr_storage local_addr{};
   socklen_t local_addrlen = 0;
+
+  // Test-only NAT simulation (see Endpoint::set_simulated_restricted_nat). When
+  // restricted_nat is set, inbound datagrams from a source not in sent_to are
+  // dropped; sent_to accumulates every destination we transmit to.
+  bool restricted_nat = false;
+  std::set<std::string> sent_to;
 
   SSL_CTX* server_ctx = nullptr;
   SSL_CTX* client_ctx = nullptr;
@@ -818,6 +825,9 @@ void Endpoint::Impl::drain_reads() {
     if (nread < 0) {
       break;  // EAGAIN / EWOULDBLOCK: socket drained
     }
+    if (restricted_nat && sent_to.count(format_remote(ra)) == 0) {
+      continue;  // simulated NAT: no mapping for a source we have not contacted
+    }
     route_packet(buf.data(), static_cast<std::size_t>(nread), ra, ral);
   }
 }
@@ -874,6 +884,9 @@ void Endpoint::Impl::flush_writes() {
         break;
       }
       ngtcp2_conn_update_pkt_tx_time(c->conn, timestamp());
+      if (restricted_nat) {
+        sent_to.insert(format_remote(c->remote));  // NAT mapping opens on egress
+      }
       ::sendto(udp_fd, buf.data(), static_cast<std::size_t>(nwrite), 0,
                reinterpret_cast<sockaddr*>(&c->remote), c->remotelen);
     }
@@ -1145,6 +1158,10 @@ void Endpoint::send(ConnId conn, std::span<const tier::crypto::Byte> payload) {
 
 void Endpoint::broadcast(std::span<const tier::crypto::Byte> payload) {
   impl_->broadcast(payload);
+}
+
+void Endpoint::set_simulated_restricted_nat(bool on) {
+  impl_->restricted_nat = on;
 }
 
 }  // namespace tier::net

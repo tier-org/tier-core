@@ -56,6 +56,62 @@ int main() {
     const auto inbox_op = tier::core::decode_admin_request(inbox_req);
     check(inbox_op.has_value() && inbox_op->op == AdminOp::inbox,
           "inbox request round-trips");
+
+    // id request (no params) round-trips.
+    const auto id_req = tier::core::encode_admin_request(AdminOp::id);
+    const auto id_op = tier::core::decode_admin_request(id_req);
+    check(id_op.has_value() && id_op->op == AdminOp::id,
+          "id request round-trips");
+
+    // send_user request round-trips like send.
+    tier::core::PeerId user{};
+    user.fill(0x5A);
+    const std::vector<std::uint8_t> up = {1, 2, 3};
+    const auto su_req = tier::core::encode_admin_send_user(
+        user, 2, std::span<const std::uint8_t>(up.data(), up.size()));
+    const auto su_op = tier::core::decode_admin_request(su_req);
+    check(su_op.has_value() && su_op->op == AdminOp::send_user &&
+              su_op->recipient == user && su_op->suite == 2 &&
+              su_op->plaintext == up,
+          "send_user request round-trips");
+  }
+
+  // id response round-trip: device id only, and device + user id.
+  {
+    tier::core::PeerId dev{};
+    for (std::size_t i = 0; i < dev.size(); ++i) {
+      dev[i] = static_cast<std::uint8_t>(i * 7 + 1);
+    }
+    // No user id.
+    {
+      tier::core::AdminId id;
+      id.device_id = dev;
+      const auto reply = tier::core::encode_admin_id_reply(id);
+      const auto got = tier::core::decode_admin_id_reply(reply);
+      check(got.has_value() && got->device_id == dev && !got->user_id,
+            "id reply (device only) round-trips");
+      auto trailing_id = reply;
+      trailing_id.push_back(0x00);
+      check(!tier::core::decode_admin_id_reply(trailing_id).has_value(),
+            "id reply with trailing byte rejected");
+    }
+    // With a user id.
+    {
+      tier::core::PeerId usr{};
+      usr.fill(0xC3);
+      tier::core::AdminId id;
+      id.device_id = dev;
+      id.user_id = usr;
+      const auto reply = tier::core::encode_admin_id_reply(id);
+      const auto got = tier::core::decode_admin_id_reply(reply);
+      check(got.has_value() && got->device_id == dev && got->user_id &&
+                *got->user_id == usr,
+            "id reply (device + user) round-trips");
+      auto truncated = reply;
+      truncated.pop_back();
+      check(!tier::core::decode_admin_id_reply(truncated).has_value(),
+            "truncated id reply rejected");
+    }
   }
 
   // send request round-trip and bounds.
@@ -113,6 +169,9 @@ int main() {
     m1.plaintext = {'a', 'b', 'c'};
     tier::core::AdminInboxMessage m2;
     m2.sender.fill(0x22);
+    tier::core::PeerId u2{};
+    u2.fill(0x77);
+    m2.sender_user = u2;  // this one carries an authenticated user sender
     m2.suite = 3;
     m2.plaintext = {};
     msgs.push_back(m1);
@@ -121,12 +180,13 @@ int main() {
     const auto dec = tier::core::decode_admin_inbox(enc);
     check(dec.has_value() && dec->size() == 2, "inbox reply count round-trips");
     if (dec && dec->size() == 2) {
-      check((*dec)[0].sender == m1.sender && (*dec)[0].suite == 1 &&
-                (*dec)[0].plaintext == m1.plaintext,
-            "inbox message 1 round-trips");
-      check((*dec)[1].sender == m2.sender && (*dec)[1].suite == 3 &&
+      check((*dec)[0].sender == m1.sender && !(*dec)[0].sender_user &&
+                (*dec)[0].suite == 1 && (*dec)[0].plaintext == m1.plaintext,
+            "inbox message 1 (no user) round-trips");
+      check((*dec)[1].sender == m2.sender && (*dec)[1].sender_user &&
+                *(*dec)[1].sender_user == u2 && (*dec)[1].suite == 3 &&
                 (*dec)[1].plaintext.empty(),
-            "inbox message 2 (empty) round-trips");
+            "inbox message 2 (with user) round-trips");
     }
     auto trailing = enc;
     trailing.push_back(0x00);

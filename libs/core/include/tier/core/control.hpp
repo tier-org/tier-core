@@ -31,6 +31,34 @@ enum class ControlType : std::uint8_t {
   // app_sealed    - an end-to-end encrypted application message (see tier::msg).
   enc_keys = 6,
   app_sealed = 7,
+  // Client-to-client discovery via a communicator (see docs/communicator.md).
+  // Like enc_keys/app_sealed, the payload codec and crypto live in tier::msg;
+  // only the type tags are here.
+  //   presence_register - a client registers its owner-signed presence record
+  //                       (addresses + enc_keys) with a communicator.
+  //   presence_lookup   - a node asks a communicator to resolve a target id.
+  //   presence_result   - a communicator returns the stored record (or a
+  //                       not-found marker).
+  presence_register = 8,
+  presence_lookup = 9,
+  presence_result = 10,
+  // User directory for multi-identity (see docs/multi-identity.md). Same
+  // pattern: payload codec and crypto in tier::msg, only the tags here.
+  //   user_register - a device enrolls under a user id (carries the user key and
+  //                   the device credential); the communicator aggregates.
+  //   user_lookup   - resolve a user id to its enrolled device ids.
+  //   user_result   - the set of currently-enrolled device ids for a user.
+  user_register = 11,
+  user_lookup = 12,
+  user_result = 13,
+  // NAT hole punching (see docs/communicator.md, M-NAT). Payload codec in
+  // tier::msg, tags here.
+  //   hole_punch_request - client -> communicator: coordinate a punch to a
+  //                        target, carrying my candidate addresses.
+  //   hole_punch_signal  - communicator -> client: a relayed punch request from
+  //                        an origin, carrying the origin's candidate addresses.
+  hole_punch_request = 14,
+  hole_punch_signal = 15,
 };
 
 // Peek the control type of a received message without decoding it. Returns

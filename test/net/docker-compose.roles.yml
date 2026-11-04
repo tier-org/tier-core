@@ -1,0 +1,63 @@
+# A role-mixed INTERNAL dual-stack mesh for the client-to-client discovery gate
+# (see docs/communicator.md). Two communicators form the backbone and seed each
+# other; two plain clients dial the communicators and are never dialed or
+# gossiped. The point of this topology is that the two clients share no direct
+# connection and do not know of each other - they must find each other through a
+# communicator's presence registry.
+#
+# Same isolation as docker-compose.yml: internal network (no route off the
+# bridge), private TIER_NETWORK, so no prod contamination.
+
+name: tier-localnet-roles
+
+networks:
+  tiernet:
+    driver: bridge
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.78.0.0/24
+        - subnet: fd00:7178::/64
+
+services:
+  comm1:
+    image: tier-localnet:latest
+    container_name: tier-roles-comm1
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "[fd00:7178::21]:7777 10.78.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.78.0.11
+        ipv6_address: fd00:7178::11
+  comm2:
+    image: tier-localnet:latest
+    container_name: tier-roles-comm2
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "[fd00:7178::11]:7777 10.78.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.78.0.21
+        ipv6_address: fd00:7178::21
+  clienta:
+    image: tier-localnet:latest
+    container_name: tier-roles-clienta
+    environment:
+      TIER_ROLES: client
+      TIER_SEEDS: "[fd00:7178::11]:7777 10.78.0.11:7777 [fd00:7178::21]:7777 10.78.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.78.0.31
+        ipv6_address: fd00:7178::31
+  clientb:
+    image: tier-localnet:latest
+    container_name: tier-roles-clientb
+    environment:
+      TIER_ROLES: client
+      TIER_SEEDS: "[fd00:7178::11]:7777 10.78.0.11:7777 [fd00:7178::21]:7777 10.78.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.78.0.41
+        ipv6_address: fd00:7178::41

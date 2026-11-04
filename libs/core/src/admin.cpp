@@ -94,6 +94,19 @@ std::vector<std::uint8_t> encode_admin_send(const PeerId& recipient,
   return out;
 }
 
+std::vector<std::uint8_t> encode_admin_send_user(const PeerId& user,
+                                                 std::uint8_t suite,
+                                                 std::span<const std::uint8_t> plaintext) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminOp::send_user));
+  out.insert(out.end(), user.begin(), user.end());
+  out.push_back(suite);
+  put_u32(out, static_cast<std::uint32_t>(plaintext.size()));
+  out.insert(out.end(), plaintext.begin(), plaintext.end());
+  return out;
+}
+
 std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> in) {
   Reader r(in);
   std::uint8_t ver = 0;
@@ -105,12 +118,16 @@ std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> i
   switch (static_cast<AdminOp>(op)) {
     case AdminOp::peers:
     case AdminOp::inbox:
+    case AdminOp::id:
       if (!r.at_end()) {
         return std::nullopt;
       }
       req.op = static_cast<AdminOp>(op);
       return req;
-    case AdminOp::send: {
+    case AdminOp::send:
+    case AdminOp::send_user: {
+      // Same wire for both: a 32-byte id (device id for send, user id for
+      // send_user), a suite byte, and a length-prefixed plaintext.
       std::span<const std::uint8_t> id;
       std::uint8_t suite = 0;
       std::uint32_t len = 0;
@@ -124,7 +141,7 @@ std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> i
       if (!r.bytes(len, body) || !r.at_end()) {
         return std::nullopt;
       }
-      req.op = AdminOp::send;
+      req.op = static_cast<AdminOp>(op);
       std::copy(id.begin(), id.end(), req.recipient.begin());
       req.suite = suite;
       req.plaintext.assign(body.begin(), body.end());
@@ -152,6 +169,66 @@ std::optional<bool> decode_admin_send_reply(std::span<const std::uint8_t> in) {
   return status == 0;
 }
 
+std::vector<std::uint8_t> encode_admin_send_user_reply(bool ok) {
+  return {kAdminVersion, static_cast<std::uint8_t>(AdminOp::send_user),
+          static_cast<std::uint8_t>(ok ? 0 : 1)};
+}
+
+std::optional<bool> decode_admin_send_user_reply(std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t ver = 0;
+  std::uint8_t op = 0;
+  std::uint8_t status = 0;
+  if (!r.u8(ver) || ver != kAdminVersion || !r.u8(op) ||
+      op != static_cast<std::uint8_t>(AdminOp::send_user) || !r.u8(status) ||
+      !r.at_end()) {
+    return std::nullopt;
+  }
+  return status == 0;
+}
+
+std::vector<std::uint8_t> encode_admin_id_reply(const AdminId& id) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminOp::id));
+  out.insert(out.end(), id.device_id.begin(), id.device_id.end());
+  out.push_back(id.user_id ? 1 : 0);
+  if (id.user_id) {
+    out.insert(out.end(), id.user_id->begin(), id.user_id->end());
+  }
+  return out;
+}
+
+std::optional<AdminId> decode_admin_id_reply(std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t ver = 0;
+  std::uint8_t op = 0;
+  std::span<const std::uint8_t> dev;
+  std::uint8_t has_user = 0;
+  if (!r.u8(ver) || ver != kAdminVersion || !r.u8(op) ||
+      op != static_cast<std::uint8_t>(AdminOp::id) || !r.bytes(kIdLen, dev) ||
+      !r.u8(has_user)) {
+    return std::nullopt;
+  }
+  AdminId out;
+  std::copy(dev.begin(), dev.end(), out.device_id.begin());
+  if (has_user == 1) {
+    std::span<const std::uint8_t> uid;
+    if (!r.bytes(kIdLen, uid)) {
+      return std::nullopt;
+    }
+    PeerId u{};
+    std::copy(uid.begin(), uid.end(), u.begin());
+    out.user_id = u;
+  } else if (has_user != 0) {
+    return std::nullopt;
+  }
+  if (!r.at_end()) {
+    return std::nullopt;
+  }
+  return out;
+}
+
 std::vector<std::uint8_t> encode_admin_inbox(
     const std::vector<AdminInboxMessage>& messages) {
   std::vector<std::uint8_t> out;
@@ -162,6 +239,10 @@ std::vector<std::uint8_t> encode_admin_inbox(
   for (std::size_t i = 0; i < count; ++i) {
     const AdminInboxMessage& m = messages[i];
     out.insert(out.end(), m.sender.begin(), m.sender.end());
+    out.push_back(m.sender_user ? 1 : 0);
+    if (m.sender_user) {
+      out.insert(out.end(), m.sender_user->begin(), m.sender_user->end());
+    }
     out.push_back(m.suite);
     put_u32(out, static_cast<std::uint32_t>(m.plaintext.size()));
     out.insert(out.end(), m.plaintext.begin(), m.plaintext.end());
@@ -182,17 +263,32 @@ std::optional<std::vector<AdminInboxMessage>> decode_admin_inbox(
   std::vector<AdminInboxMessage> out;
   for (std::uint16_t i = 0; i < count; ++i) {
     std::span<const std::uint8_t> sender;
+    std::uint8_t has_user = 0;
+    if (!r.bytes(kIdLen, sender) || !r.u8(has_user)) {
+      return std::nullopt;
+    }
+    AdminInboxMessage m;
+    std::copy(sender.begin(), sender.end(), m.sender.begin());
+    if (has_user == 1) {
+      std::span<const std::uint8_t> uid;
+      if (!r.bytes(kIdLen, uid)) {
+        return std::nullopt;
+      }
+      PeerId u{};
+      std::copy(uid.begin(), uid.end(), u.begin());
+      m.sender_user = u;
+    } else if (has_user != 0) {
+      return std::nullopt;
+    }
     std::uint8_t suite = 0;
     std::uint32_t len = 0;
-    if (!r.bytes(kIdLen, sender) || !r.u8(suite) || !r.u32(len)) {
+    if (!r.u8(suite) || !r.u32(len)) {
       return std::nullopt;
     }
     std::span<const std::uint8_t> body;
     if (!r.bytes(len, body)) {
       return std::nullopt;
     }
-    AdminInboxMessage m;
-    std::copy(sender.begin(), sender.end(), m.sender.begin());
     m.suite = suite;
     m.plaintext.assign(body.begin(), body.end());
     out.push_back(std::move(m));

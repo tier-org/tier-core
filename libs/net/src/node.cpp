@@ -20,6 +20,8 @@
 #include "tier/core/version.hpp"
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/hash.hpp"
+#include "tier/msg/presence.hpp"
+#include "tier/net/rendezvous.hpp"
 
 namespace tier::net {
 namespace {
@@ -28,6 +30,38 @@ namespace {
 // it. One is enough to bootstrap from a single seed; raising it hardens against
 // a lying peer, and belongs with signed membership (not yet in place).
 constexpr std::size_t kAddressConfirmations = 1;
+
+// Wall-clock unix seconds. Presence records carry an issue stamp and an expiry
+// in wall-clock time (they are relayed and cached across nodes), unlike the
+// steady_clock used for local timers.
+std::uint64_t unix_now() {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count());
+}
+
+// Presence record lifetime and how often an edge client republishes it (well
+// before expiry, so a refresh always lands first). Also the per-target budget
+// for resolving and the lookup re-issue interval.
+constexpr std::uint64_t kPresenceTtlSeconds = 300;
+constexpr auto kPresenceRegisterInterval = std::chrono::seconds(120);
+constexpr auto kPendingSendTimeout = std::chrono::seconds(20);
+constexpr auto kLookupRetryInterval = std::chrono::seconds(2);
+
+// User-directory enrollment lifetime and republish cadence, and how long a
+// self-issued device credential is valid. The credential is long-lived (the
+// device holds the user key in the single-process case and re-issues on
+// restart); the directory enrollment is short like presence so it ages out.
+constexpr std::uint64_t kUserEnrollTtlSeconds = 300;
+constexpr auto kUserRegisterInterval = std::chrono::seconds(120);
+constexpr std::uint64_t kDeviceCredentialTtlSeconds = 365ULL * 24 * 3600;
+
+// Hole punch: how long to let a direct dial try before escalating to a
+// coordinated punch, and how often to re-issue a punch request while a target
+// stays unconnected (see docs/communicator.md, M-NAT).
+constexpr auto kPunchGrace = std::chrono::seconds(3);
+constexpr auto kPunchRetryInterval = std::chrono::seconds(3);
 
 // Minimum gap between dial attempts to the same address.
 constexpr auto kDialRetry = std::chrono::seconds(2);
@@ -183,7 +217,7 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
     // Announce our encryption keys so the peer can send us sealed messages.
     endpoint_.send(conn, tier::msg::make_enc_keys_announce(identity_, network_));
   });
-  endpoint_.on_message([this](ConnId, const PeerId& key,
+  endpoint_.on_message([this](ConnId conn, const PeerId& key,
                               std::span<const tier::crypto::Byte> payload) {
     const tier::core::PeerId from = tier::crypto::sha256(key);
     const auto ctype = tier::core::peek_control_type(payload);
@@ -197,6 +231,38 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
     }
     if (ctype == tier::core::ControlType::app_sealed) {
       handle_sealed(key, payload);
+      return;
+    }
+    if (ctype == tier::core::ControlType::presence_register) {
+      handle_presence_register(payload, unix_now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::presence_lookup) {
+      handle_presence_lookup(conn, payload, unix_now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::presence_result) {
+      handle_presence_result(payload, std::chrono::steady_clock::now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::user_register) {
+      handle_user_register(from, payload, unix_now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::user_lookup) {
+      handle_user_lookup(conn, payload, unix_now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::user_result) {
+      handle_user_result(payload, std::chrono::steady_clock::now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::hole_punch_request) {
+      handle_hole_punch_request(conn, from, payload);
+      return;
+    }
+    if (ctype == tier::core::ControlType::hole_punch_signal) {
+      handle_hole_punch_signal(conn, payload, std::chrono::steady_clock::now());
       return;
     }
     if (fd_.handle(std::chrono::steady_clock::now(), from, payload)) {
@@ -313,6 +379,20 @@ void Node::poll(int timeout_ms) {
   const auto now = std::chrono::steady_clock::now();
   autodial(now);
   fd_.tick(now, neighbors);
+
+  // Client-to-client discovery (docs/communicator.md): publish our presence (if
+  // an edge client), drive queued sends toward resolution/flush, and age out
+  // expired registry entries (a no-op unless we are a communicator).
+  const std::uint64_t unow = unix_now();
+  register_presence(now, unow);
+  service_pending_sends(now);
+  presence_registry_.prune(unow);
+  // Multi-identity (docs/multi-identity.md): publish our user enrollment, drive
+  // queued user-level sends, and age out the user directory (a no-op unless we
+  // are a communicator).
+  register_user(now, unow);
+  service_user_sends(now);
+  user_directory_.prune(unow);
 
   // Expire demotion-propagation windows: once elapsed, a demoted peer's client
   // record falls back to local scope like any other client (docs/topology.md,
@@ -681,21 +761,486 @@ void Node::handle_sealed(const PeerId& sender_key,
   rx.sender = opened->sender_id;
   rx.suite = opened->suite;
   rx.plaintext = std::move(opened->plaintext);
+  // If the plaintext is a user envelope whose credential authenticates the
+  // sending device for a user, surface the user id and unwrap the inner payload.
+  // A plain device-level message does not verify as an envelope and is left as
+  // is (see docs/multi-identity.md).
+  if (auto u = tier::msg::open_user_envelope(
+          network_, rx.sender, unix_now(),
+          tier::crypto::ByteSpan(rx.plaintext.data(), rx.plaintext.size()))) {
+    rx.sender_user = u->sender_user_id;
+    rx.plaintext = std::move(u->plaintext);
+  }
   if (on_message_received_) {
     on_message_received_(rx);
   }
   inbox_.push_back(std::move(rx));
 }
 
-bool Node::send_message(const tier::core::PeerId& to, tier::msg::Suite suite,
-                        std::span<const tier::crypto::Byte> plaintext) {
+std::vector<tier::core::PeerId> Node::live_communicators() const {
+  std::vector<tier::core::PeerId> out;
+  for (const tier::core::PeerInfo& p : membership_.snapshot()) {
+    if (tier::core::has_role(p.roles, tier::core::Role::communicator) &&
+        p.liveness != tier::core::Liveness::dead) {
+      out.push_back(p.id);
+    }
+  }
+  return out;
+}
+
+void Node::dial_addresses(const std::vector<std::string>& addresses,
+                          std::chrono::steady_clock::time_point now) {
+  const auto chosen = select_dial_candidate(addresses, dialed_, now, kDialRetry);
+  if (!chosen) {
+    return;
+  }
+  const auto hp = split_host_port(*chosen);
+  if (!hp) {
+    return;
+  }
+  dialed_[*chosen] = now;
+  try {
+    endpoint_.connect(hp->first, hp->second);
+  } catch (const std::exception&) {  // NOLINT(bugprone-empty-catch)
+    // A malformed or unroutable address must not take us down; the dialed_
+    // rate-limit keeps us from retrying it in a tight loop.
+  }
+}
+
+void Node::handle_presence_register(std::span<const tier::crypto::Byte> payload,
+                                    std::uint64_t now_unix) {
+  // Only a communicator keeps a registry; others ignore registrations.
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto rec = tier::msg::open_presence_register(network_, payload);
+  if (!rec) {
+    return;  // malformed or signature did not verify
+  }
+  presence_registry_.store(rec->id, rec->record_bytes, rec->issued_unix,
+                           rec->expiry_unix, now_unix);
+}
+
+void Node::handle_presence_lookup(ConnId conn,
+                                  std::span<const tier::crypto::Byte> payload,
+                                  std::uint64_t now_unix) {
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto target = tier::msg::open_presence_lookup(payload);
+  if (!target) {
+    return;
+  }
+  const auto found = presence_registry_.lookup(*target, now_unix);
+  const tier::crypto::ByteSpan bytes =
+      found ? tier::crypto::ByteSpan(found->data(), found->size())
+            : tier::crypto::ByteSpan();
+  endpoint_.send(conn, tier::msg::make_presence_result(*target, bytes));
+}
+
+void Node::handle_presence_result(std::span<const tier::crypto::Byte> payload,
+                                  std::chrono::steady_clock::time_point now) {
+  // We only trust a result for a target we actually have pending work for, and
+  // we re-verify the record ourselves (never on the communicator's word).
+  tier::core::PeerId target{};
+  bool matched = false;
+  for (const auto& [id, queue] : pending_sends_) {
+    const auto out = tier::msg::open_presence_result(network_, id, payload);
+    if (out.has_value()) {
+      target = id;
+      matched = true;
+      if (out->has_value()) {
+        peer_enc_keys_[id] = (*out)->enc_keys;
+        resolved_addrs_[id] = (*out)->addresses;
+      }
+      break;
+    }
+  }
+  if (!matched) {
+    return;  // not a result for anything we are resolving
+  }
+  // Dial the resolved peer directly so the queued message can flush once the
+  // handshake completes.
+  const auto addrs = resolved_addrs_.find(target);
+  if (addrs != resolved_addrs_.end() && conn_by_peer_.count(target) == 0) {
+    dial_addresses(addrs->second, now);
+    // Start the clock on escalating to a hole punch if the direct dial does not
+    // connect (the peer may be behind a NAT that drops our unsolicited dial).
+    punch_grace_.try_emplace(target, now + kPunchGrace);
+  }
+}
+
+void Node::register_presence(std::chrono::steady_clock::time_point now,
+                             std::uint64_t now_unix) {
+  // Only edge clients publish presence; infrastructure is already reachable and
+  // gossiped.
+  if (tier::core::is_infrastructure(roles_)) {
+    return;
+  }
+  if (now < next_presence_register_) {
+    return;
+  }
+
+  const auto comms = live_communicators();
+  if (comms.empty()) {
+    return;  // no communicator known yet; try again next tick
+  }
+  const auto self = membership_.find(self_id_);
+  if (!self || self->addresses.empty()) {
+    return;  // no reachable address to advertise yet
+  }
+
+  const std::vector<tier::crypto::Byte> frame = tier::msg::make_presence_register(
+      identity_, network_, roles_, self->addresses, now_unix,
+      now_unix + kPresenceTtlSeconds);
+
+  const auto responsible =
+      responsible_communicators(self_id_, comms, kPresenceReplicas);
+  for (const auto& c : responsible) {
+    const auto conn = conn_by_peer_.find(c);
+    if (conn != conn_by_peer_.end()) {
+      endpoint_.send(conn->second, frame);
+    } else if (const auto info = membership_.find(c); info) {
+      dial_addresses(info->addresses, now);  // connect so we can register next tick
+    }
+  }
+  next_presence_register_ = now + kPresenceRegisterInterval;
+}
+
+void Node::service_pending_sends(std::chrono::steady_clock::time_point now) {
+  for (auto it = pending_sends_.begin(); it != pending_sends_.end();) {
+    const tier::core::PeerId& to = it->first;
+    auto& queue = it->second;
+
+    // Flush anything deliverable now (connected + keys known).
+    if (conn_by_peer_.count(to) != 0 && peer_enc_keys_.count(to) != 0) {
+      for (const auto& m : queue) {
+        deliver_sealed(to, m.suite, tier::crypto::ByteSpan(m.plaintext.data(),
+                                                           m.plaintext.size()));
+      }
+      queue.clear();
+    }
+
+    // Drop timed-out messages.
+    queue.erase(std::remove_if(queue.begin(), queue.end(),
+                               [&](const PendingSend& m) {
+                                 return now >= m.deadline;
+                               }),
+                queue.end());
+
+    if (queue.empty()) {
+      lookup_sent_.erase(to);
+      resolved_addrs_.erase(to);
+      punch_grace_.erase(to);
+      punch_sent_.erase(to);
+      it = pending_sends_.erase(it);
+      continue;
+    }
+
+    // Still pending: drive resolution. If we already resolved addresses, keep
+    // dialing the peer directly; otherwise ask a responsible communicator.
+    if (const auto addrs = resolved_addrs_.find(to);
+        addrs != resolved_addrs_.end() && conn_by_peer_.count(to) == 0) {
+      dial_addresses(addrs->second, now);
+      // If the direct dial has not connected within the grace window, the peer
+      // may be behind a NAT; escalate to a coordinated hole punch (rate-limited).
+      const auto grace = punch_grace_.find(to);
+      if (grace != punch_grace_.end() && now >= grace->second) {
+        const auto last = punch_sent_.find(to);
+        if (last == punch_sent_.end() || now - last->second >= kPunchRetryInterval) {
+          initiate_hole_punch(to, now);
+        }
+      }
+    } else if (peer_enc_keys_.count(to) == 0) {
+      const auto last = lookup_sent_.find(to);
+      if (last == lookup_sent_.end() || now - last->second >= kLookupRetryInterval) {
+        const auto comms = live_communicators();
+        const auto responsible =
+            responsible_communicators(to, comms, kPresenceReplicas);
+        bool asked = false;
+        for (const auto& c : responsible) {
+          const auto conn = conn_by_peer_.find(c);
+          if (conn != conn_by_peer_.end()) {
+            endpoint_.send(conn->second, tier::msg::make_presence_lookup(to));
+            asked = true;
+          } else if (const auto info = membership_.find(c); info) {
+            dial_addresses(info->addresses, now);  // connect to ask next tick
+          }
+        }
+        if (asked) {
+          lookup_sent_[to] = now;
+        }
+      }
+    }
+    ++it;
+  }
+}
+
+void Node::set_user_identity(tier::crypto::NodeIdentity user) {
+  user_identity_ = std::move(user);
+  user_id_ = tier::msg::user_id_of(user_identity_->public_key());
+  // Self-issue this device's credential under the user (single-process case:
+  // the user key is held here). Every user envelope we send carries it.
+  device_credential_ = tier::msg::make_device_credential(
+      *user_identity_, network_, self_id_, unix_now() + kDeviceCredentialTtlSeconds);
+  next_user_register_ = {};  // publish on the next poll
+}
+
+std::optional<tier::core::PeerId> Node::user_id() const {
+  if (!user_identity_) {
+    return std::nullopt;
+  }
+  return user_id_;
+}
+
+void Node::set_simulated_restricted_nat(bool on) {
+  endpoint_.set_simulated_restricted_nat(on);
+}
+
+std::vector<std::string> Node::self_candidates() const {
+  if (const auto self = membership_.find(self_id_); self) {
+    return self->addresses;
+  }
+  return {};
+}
+
+void Node::handle_hole_punch_request(ConnId conn, const tier::core::PeerId& from,
+                                     std::span<const tier::crypto::Byte> payload) {
+  // Only a communicator relays punches.
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto req = tier::msg::open_hole_punch_request(payload);
+  if (!req) {
+    return;
+  }
+  // Relay to the target as a signal naming the originator (read from the
+  // connection, so it cannot be spoofed). If the target is not connected here,
+  // the punch simply cannot be coordinated and is dropped.
+  const auto target_conn = conn_by_peer_.find(req->target);
+  if (target_conn == conn_by_peer_.end()) {
+    return;
+  }
+  (void)conn;  // the originator's connection; the origin id is `from`
+  endpoint_.send(target_conn->second,
+                 tier::msg::make_hole_punch_signal(from, req->phase, req->addresses));
+}
+
+void Node::handle_hole_punch_signal(ConnId conn,
+                                    std::span<const tier::crypto::Byte> payload,
+                                    std::chrono::steady_clock::time_point now) {
+  const auto sig = tier::msg::open_hole_punch_signal(payload);
+  if (!sig) {
+    return;
+  }
+  // Dial the origin's candidates now: our outbound opens our NAT for it, and it
+  // is doing the same toward us, so the handshake gets through.
+  dial_addresses(sig->addresses, now);
+  // On an initiate, reply through the same communicator so the origin dials our
+  // candidates too. A respond is terminal (no reply), so there is no ping-pong.
+  if (sig->phase == tier::msg::PunchPhase::initiate) {
+    endpoint_.send(conn, tier::msg::make_hole_punch_request(
+                             sig->origin, tier::msg::PunchPhase::respond,
+                             self_candidates()));
+  }
+}
+
+void Node::initiate_hole_punch(const tier::core::PeerId& target,
+                               std::chrono::steady_clock::time_point now) {
+  const auto candidates = self_candidates();
+  if (candidates.empty()) {
+    return;  // we have no reachable address to offer yet
+  }
+  const auto comms = live_communicators();
+  const auto responsible = responsible_communicators(target, comms, kPresenceReplicas);
+  for (const auto& c : responsible) {
+    const auto conn = conn_by_peer_.find(c);
+    if (conn != conn_by_peer_.end()) {
+      endpoint_.send(conn->second,
+                     tier::msg::make_hole_punch_request(
+                         target, tier::msg::PunchPhase::initiate, candidates));
+    }
+  }
+  punch_sent_[target] = now;
+}
+
+void Node::handle_user_register(const tier::core::PeerId& from_device,
+                                std::span<const tier::crypto::Byte> payload,
+                                std::uint64_t now_unix) {
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto reg = tier::msg::open_user_register(payload);
+  if (!reg) {
+    return;
+  }
+  // The credential must authorize exactly the device on the other end of this
+  // connection, so an enrollment cannot claim a device it does not control.
+  if (!tier::msg::verify_device_credential(
+          network_, reg->user_pub, from_device, now_unix,
+          tier::crypto::ByteSpan(reg->credential.data(), reg->credential.size()))) {
+    return;
+  }
+  // Cap the directory TTL so a device cannot pin an entry indefinitely.
+  const std::uint64_t expiry =
+      std::min(reg->expiry_unix, now_unix + kUserEnrollTtlSeconds);
+  user_directory_.enroll(tier::msg::user_id_of(reg->user_pub), from_device,
+                         reg->issued_unix, expiry, now_unix);
+}
+
+void Node::handle_user_lookup(ConnId conn,
+                              std::span<const tier::crypto::Byte> payload,
+                              std::uint64_t now_unix) {
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto user = tier::msg::open_user_lookup(payload);
+  if (!user) {
+    return;
+  }
+  const auto devices = user_directory_.lookup(*user, now_unix);
+  endpoint_.send(conn, tier::msg::make_user_result(*user, devices));
+}
+
+void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
+                              std::chrono::steady_clock::time_point /*now*/) {
+  if (!user_identity_) {
+    return;  // nothing to send on behalf of
+  }
+  // Match the result to a user we are resolving.
+  tier::core::PeerId user{};
+  std::vector<tier::core::PeerId> devices;
+  bool matched = false;
+  for (const auto& [u, queue] : pending_user_sends_) {
+    const auto res = tier::msg::open_user_result(u, payload);
+    if (res) {
+      user = u;
+      devices = res->device_ids;
+      matched = true;
+      break;
+    }
+  }
+  if (!matched || devices.empty()) {
+    return;  // keep the queued message pending (retry/time out) if no devices yet
+  }
+
+  const auto it = pending_user_sends_.find(user);
+  if (it == pending_user_sends_.end()) {
+    return;
+  }
+  // Fan each queued message out to every returned device as a device-level send
+  // carrying our user envelope. send_message resolves/connects on demand.
+  for (const auto& m : it->second) {
+    for (const auto& device : devices) {
+      if (device == self_id_) {
+        continue;  // do not echo to our own device
+      }
+      const std::vector<tier::crypto::Byte> envelope = tier::msg::make_user_envelope(
+          user_identity_->public_key(),
+          tier::crypto::ByteSpan(device_credential_.data(), device_credential_.size()),
+          tier::crypto::ByteSpan(m.plaintext.data(), m.plaintext.size()));
+      (void)send_message(
+          device, m.suite,
+          tier::crypto::ByteSpan(envelope.data(), envelope.size()));
+    }
+  }
+  pending_user_sends_.erase(it);
+  user_lookup_sent_.erase(user);
+}
+
+void Node::register_user(std::chrono::steady_clock::time_point now,
+                         std::uint64_t now_unix) {
+  if (!user_identity_ || device_credential_.empty()) {
+    return;
+  }
+  if (now < next_user_register_) {
+    return;
+  }
+  const auto comms = live_communicators();
+  if (comms.empty()) {
+    return;
+  }
+  const std::vector<tier::crypto::Byte> frame = tier::msg::make_user_register(
+      user_identity_->public_key(),
+      tier::crypto::ByteSpan(device_credential_.data(), device_credential_.size()),
+      now_unix, now_unix + kUserEnrollTtlSeconds);
+  const auto responsible =
+      responsible_communicators(user_id_, comms, kPresenceReplicas);
+  for (const auto& c : responsible) {
+    const auto conn = conn_by_peer_.find(c);
+    if (conn != conn_by_peer_.end()) {
+      endpoint_.send(conn->second, frame);
+    } else if (const auto info = membership_.find(c); info) {
+      dial_addresses(info->addresses, now);
+    }
+  }
+  next_user_register_ = now + kUserRegisterInterval;
+}
+
+void Node::service_user_sends(std::chrono::steady_clock::time_point now) {
+  for (auto it = pending_user_sends_.begin(); it != pending_user_sends_.end();) {
+    const tier::core::PeerId user = it->first;
+    auto& queue = it->second;
+
+    queue.erase(std::remove_if(queue.begin(), queue.end(),
+                               [&](const PendingUserSend& m) {
+                                 return now >= m.deadline;
+                               }),
+                queue.end());
+    if (queue.empty()) {
+      user_lookup_sent_.erase(user);
+      it = pending_user_sends_.erase(it);
+      continue;
+    }
+
+    const auto last = user_lookup_sent_.find(user);
+    if (last == user_lookup_sent_.end() ||
+        now - last->second >= kLookupRetryInterval) {
+      const auto comms = live_communicators();
+      const auto responsible =
+          responsible_communicators(user, comms, kPresenceReplicas);
+      bool asked = false;
+      for (const auto& c : responsible) {
+        const auto conn = conn_by_peer_.find(c);
+        if (conn != conn_by_peer_.end()) {
+          endpoint_.send(conn->second, tier::msg::make_user_lookup(user));
+          asked = true;
+        } else if (const auto info = membership_.find(c); info) {
+          dial_addresses(info->addresses, now);
+        }
+      }
+      if (asked) {
+        user_lookup_sent_[user] = now;
+      }
+    }
+    ++it;
+  }
+}
+
+Node::SendResult Node::send_to_user(const tier::core::PeerId& to_user,
+                                    tier::msg::Suite suite,
+                                    std::span<const tier::crypto::Byte> plaintext) {
+  if (!user_identity_ || device_credential_.empty()) {
+    return SendResult::failed;  // no user identity to sign the envelope with
+  }
+  PendingUserSend pending;
+  pending.suite = suite;
+  pending.plaintext.assign(plaintext.begin(), plaintext.end());
+  pending.deadline = std::chrono::steady_clock::now() + kPendingSendTimeout;
+  pending_user_sends_[to_user].push_back(std::move(pending));
+  service_user_sends(std::chrono::steady_clock::now());
+  return SendResult::queued;
+}
+
+bool Node::deliver_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
+                          std::span<const tier::crypto::Byte> plaintext) {
   const auto conn = conn_by_peer_.find(to);
   if (conn == conn_by_peer_.end()) {
     return false;  // not connected
   }
   const auto keys = peer_enc_keys_.find(to);
   if (keys == peer_enc_keys_.end()) {
-    return false;  // encryption keys not yet announced
+    return false;  // encryption keys not known
   }
   tier::msg::Recipient recipient;
   recipient.id = to;
@@ -704,6 +1249,30 @@ bool Node::send_message(const tier::core::PeerId& to, tier::msg::Suite suite,
       tier::msg::seal(identity_, network_, suite, recipient, plaintext);
   endpoint_.send(conn->second, sealed);
   return true;
+}
+
+Node::SendResult Node::send_message(
+    const tier::core::PeerId& to, tier::msg::Suite suite,
+    std::span<const tier::crypto::Byte> plaintext) {
+  // Fast path: already connected with known keys.
+  if (deliver_sealed(to, suite, plaintext)) {
+    return SendResult::sent;
+  }
+  // Cannot reach a plain client without a communicator to resolve it through,
+  // and never route to ourselves.
+  if (to == self_id_) {
+    return SendResult::failed;
+  }
+  // Queue it; the poll loop resolves the peer (presence lookup), connects, and
+  // flushes. seal() copies the plaintext at delivery, so keep our own copy now.
+  PendingSend pending;
+  pending.suite = suite;
+  pending.plaintext.assign(plaintext.begin(), plaintext.end());
+  pending.deadline = std::chrono::steady_clock::now() + kPendingSendTimeout;
+  pending_sends_[to].push_back(std::move(pending));
+  // Kick resolution immediately so a reachable peer flushes on the next poll.
+  service_pending_sends(std::chrono::steady_clock::now());
+  return SendResult::queued;
 }
 
 bool Node::has_encryption_keys(const tier::core::PeerId& peer) const {

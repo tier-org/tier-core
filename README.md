@@ -73,10 +73,35 @@ owner-signed message the peer verifies against the identity it authenticated
 with in the QUIC handshake - the large ML-KEM key therefore never travels in the
 gossiped membership table.
 
-v1 delivers only to a **directly connected** peer. Relayed/offline delivery,
-forward-secret sessions (a ratchet) and group messaging are future work; the
-sealing itself is independent of how a message is carried. Per-message ephemeral
-X25519 already gives forward secrecy for the classical key-agreement part.
+Reaching a peer you are not already connected to uses the **communicator** role
+(see docs/communicator.md). Two plain clients never dial or gossip each other,
+so to be reachable a client publishes an owner-signed **presence record** - its
+addresses and encryption keys - to the communicator(s) responsible for its id
+(rendezvous hashing). Another node resolves it by asking the same communicator,
+then connects directly and the sealed message flows. `send_message` returns
+`sent` when the peer was already connected, or `queued` when it is being
+resolved and connected on demand (delivered, or dropped after a timeout). This
+is direct, relay-free delivery between clients; data never passes through the
+communicator, only the small presence lookup does.
+
+### User identity over device identity
+
+A user identity (its own Ed25519 keypair) sits above the device identity, so one
+user can span several devices and a recipient learns which *user* sent a
+message, not merely which device (see docs/multi-identity.md). The user key signs
+a device credential authorizing each device; that credential travels in a user
+envelope inside the normal sealed message. Attach a user identity with
+`TIER_USER_ID_FILE` (a seed file, created if absent); the device then enrolls
+under the user at a communicator and can be addressed with `tierctl send-user
+<user-id>`. With no message storage in this version, a user send reaches
+whichever of the user's devices are online; both sender and recipient must be
+online.
+
+Still future work: NAT hole punching (coordinated simultaneous open) for clients
+behind NAT, offline store-and-forward (keeper-backed, so an offline device can
+catch up), forward-secret sessions (a ratchet) and group messaging. The sealing
+itself is independent of how a message is carried. Per-message ephemeral X25519
+already gives forward secrecy for the classical key-agreement part.
 
 ## Dependencies
 
@@ -283,13 +308,18 @@ Docker with IPv6 enabled on the daemon - see `test/net/README.md`.
 The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
 `$TIER_ADMIN_SOCK`). `tierctl` talks to it over that socket:
 
+    sudo tierctl id           # this node's device id and user id (64 hex each)
     sudo tierctl peers        # the node's view of the mesh: known vs connected
     sudo tierctl inbox        # print and drain encrypted messages received
     sudo tierctl send <peer-id> [classical|hybrid|pq] <message>
+    sudo tierctl send-user <user-id> [classical|hybrid|pq] <message>
 
-`send` encrypts a message end-to-end to a connected peer (see "Encrypted
-messaging" below); `<peer-id>` is the 64-hex id from `peers`, and the suite
-defaults to `hybrid`. `inbox` prints each received message with its
+`send` encrypts a message end-to-end (see "Encrypted messaging" below);
+`<peer-id>` is the recipient's full 64-hex id - get it from `tierctl id` on that
+node and share it out of band (the `peers` table shows only a shortened id). The
+suite defaults to `hybrid`. If the peer is not already connected, the node
+resolves it through a communicator and connects on demand, so `send` reports the
+message accepted (sent or queued). `inbox` prints each received message with its
 authenticated sender and suite, then clears the queue.
 
 The header reports the node's own network (the cluster it joined) and the known
@@ -368,6 +398,9 @@ Where these come from:
 
 The keeper (paid encrypted storage) and transmitter (relay) roles will get their
 own profiles - storage-heavy and bandwidth-heavy respectively - when they land.
+The **communicator** role is reachable backbone that additionally serves the
+client-to-client presence registry (and, later, hole-punch signaling); set it
+with `TIER_ROLES=communicator`. See docs/communicator.md.
 
 ## License
 

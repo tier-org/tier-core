@@ -15,7 +15,16 @@ namespace tier::core {
 // keys later).
 using PeerId = std::array<std::uint8_t, 32>;
 
-enum class Role : std::uint8_t { client, validator, keeper, transmitter };
+enum class Role : std::uint8_t {
+  client,
+  validator,
+  keeper,
+  transmitter,
+  // Reachable infrastructure that serves the presence registry and (M2)
+  // hole-punch signaling for client-to-client messaging. See
+  // docs/communicator.md.
+  communicator
+};
 
 // A node may hold several roles at once (e.g. a validator that is also a
 // keeper), so roles travel as a bitmask: bit (1 << Role) per role held. This
@@ -30,11 +39,14 @@ using RoleSet = std::uint8_t;
   return (set & role_bit(r)) != 0;
 }
 
-// Every defined role bit OR'd together; used to reject unknown bits off the
-// wire. Update when a role is added to the enum.
+// Every role bit this version defines a meaning for. Used to interpret the
+// known bits of a roles byte; unknown bits (from a newer peer) are preserved
+// verbatim and ignored, not rejected - see decode_membership. Update when a
+// role is added to the enum.
 inline constexpr RoleSet kAllRoles = static_cast<RoleSet>(
     role_bit(Role::client) | role_bit(Role::validator) |
-    role_bit(Role::keeper) | role_bit(Role::transmitter));
+    role_bit(Role::keeper) | role_bit(Role::transmitter) |
+    role_bit(Role::communicator));
 
 // Roles that make a node reachable infrastructure (the "backbone"): every role
 // except a plain client. A node holding any of these accepts inbound

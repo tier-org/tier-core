@@ -119,12 +119,23 @@ int main() {
           "addr_count over the bound is rejected");
   }
 
-  // A role byte with a bit outside the defined role set is rejected.
+  // A role byte with a bit this version does not define is accepted and kept
+  // verbatim (forward compatibility: a newer role must propagate through older
+  // nodes untouched, and the byte is covered by the owner signature so it may
+  // not be altered). is_infrastructure / has_role still read only known bits.
   {
-    auto bad = one;
-    bad[70] = static_cast<std::uint8_t>(tier::core::kAllRoles | 0x10U);
-    check(!tier::core::decode_membership_message(bad).has_value(),
-          "unknown role bit is rejected");
+    auto fwd = one;
+    const auto unknown_bit = static_cast<std::uint8_t>(0x80U);  // outside kAllRoles
+    fwd[70] = static_cast<std::uint8_t>(tier::core::role_bit(Role::client) |
+                                        unknown_bit);
+    const auto decoded_fwd = tier::core::decode_membership_message(fwd);
+    check(decoded_fwd.has_value(), "unknown role bit does not break decode");
+    check(decoded_fwd && decoded_fwd->size() == 1 &&
+              (*decoded_fwd)[0].roles == fwd[70],
+          "unknown role bit is preserved verbatim");
+    check(decoded_fwd && decoded_fwd->size() == 1 &&
+              !tier::core::is_infrastructure((*decoded_fwd)[0].roles),
+          "a client with an unknown bit is still not infrastructure");
   }
 
   // A signature length above the bound is rejected (bounds an attacker's word).

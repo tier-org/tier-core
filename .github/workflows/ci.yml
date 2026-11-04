@@ -97,6 +97,18 @@ jobs:
           TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
         run: ./test/net/e2e.sh
 
+      - name: E2E client-to-client discovery gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+        run: ./test/net/e2e-roles.sh
+
+      - name: E2E multi-identity gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+        run: ./test/net/e2e-multi.sh
+
   fuzz:
     # libFuzzer targets for the untrusted-input decoders: membership, SWIM
     # control + admin, version, wire frame, and the sealed-message / enc_keys
@@ -131,7 +143,7 @@ jobs:
       - name: Build fuzz targets
         run: |
           cmake --build build-fuzz -j \
-            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed
+            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch
 
       - name: Restore fuzz corpus
         uses: actions/cache@v4
@@ -145,7 +157,7 @@ jobs:
 
       - name: Run each fuzzer briefly
         run: |
-          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed; do
+          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch; do
             echo "== $t =="
             mkdir -p "fuzz-corpus/$t"
             ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1 \

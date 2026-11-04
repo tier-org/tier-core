@@ -18,9 +18,44 @@ add_executable(test_messaging test_messaging.cpp)
 target_link_libraries(test_messaging PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
 add_test(NAME messaging COMMAND test_messaging)
 
+add_executable(test_discovery test_discovery.cpp)
+target_link_libraries(test_discovery PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME discovery COMMAND test_discovery)
+set_tests_properties(discovery PROPERTIES TIMEOUT 60)
+
+add_executable(test_multi_identity test_multi_identity.cpp)
+target_link_libraries(test_multi_identity PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME multi_identity COMMAND test_multi_identity)
+set_tests_properties(multi_identity PROPERTIES TIMEOUT 90)
+
+add_executable(test_user_directory test_user_directory.cpp)
+target_link_libraries(test_user_directory PRIVATE tier::net tier::core tier::options)
+add_test(NAME user_directory COMMAND test_user_directory)
+
+add_executable(test_holepunch test_holepunch.cpp)
+target_link_libraries(test_holepunch PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME holepunch COMMAND test_holepunch)
+set_tests_properties(holepunch PROPERTIES TIMEOUT 120)
+
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)
+
+add_executable(test_presence test_presence.cpp)
+target_link_libraries(test_presence PRIVATE tier::msg tier::crypto tier::core tier::options)
+add_test(NAME presence COMMAND test_presence)
+
+add_executable(test_user test_user.cpp)
+target_link_libraries(test_user PRIVATE tier::msg tier::crypto tier::core tier::options)
+add_test(NAME user COMMAND test_user)
+
+add_executable(test_rendezvous test_rendezvous.cpp)
+target_link_libraries(test_rendezvous PRIVATE tier::net tier::core tier::crypto tier::options)
+add_test(NAME rendezvous COMMAND test_rendezvous)
+
+add_executable(test_presence_registry test_presence_registry.cpp)
+target_link_libraries(test_presence_registry PRIVATE tier::net tier::core tier::options)
+add_test(NAME presence_registry COMMAND test_presence_registry)
 
 add_executable(test_semver test_semver.cpp)
 target_link_libraries(test_semver PRIVATE tier::core tier::options)

@@ -272,10 +272,13 @@ std::optional<std::vector<PeerInfo>> decode_membership_message(
     p.signature.assign(sig_bytes.begin(), sig_bytes.end());
 
     std::uint8_t roles = 0;
-    // Reject any bit outside the defined role set (roles | kAllRoles would then
-    // exceed kAllRoles), so unknown roles from a newer/hostile peer are refused.
-    if (!r.u8(roles) ||
-        static_cast<RoleSet>(roles | kAllRoles) != kAllRoles) {
+    // Accept the roles byte verbatim, including bits this version does not
+    // define. Unknown bits are inert here (is_infrastructure / has_role only
+    // test known bits) but must be preserved: the byte is covered by the owner
+    // signature, so stripping it would break verification when the record is
+    // re-gossiped, and keeping it lets a newer role propagate through older
+    // nodes untouched. Forward compatibility - new roles never break the wire.
+    if (!r.u8(roles)) {
       return std::nullopt;
     }
     p.roles = roles;
@@ -353,6 +356,22 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
       return ControlType::enc_keys;
     case static_cast<std::uint8_t>(ControlType::app_sealed):
       return ControlType::app_sealed;
+    case static_cast<std::uint8_t>(ControlType::presence_register):
+      return ControlType::presence_register;
+    case static_cast<std::uint8_t>(ControlType::presence_lookup):
+      return ControlType::presence_lookup;
+    case static_cast<std::uint8_t>(ControlType::presence_result):
+      return ControlType::presence_result;
+    case static_cast<std::uint8_t>(ControlType::user_register):
+      return ControlType::user_register;
+    case static_cast<std::uint8_t>(ControlType::user_lookup):
+      return ControlType::user_lookup;
+    case static_cast<std::uint8_t>(ControlType::user_result):
+      return ControlType::user_result;
+    case static_cast<std::uint8_t>(ControlType::hole_punch_request):
+      return ControlType::hole_punch_request;
+    case static_cast<std::uint8_t>(ControlType::hole_punch_signal):
+      return ControlType::hole_punch_signal;
     default:
       return std::nullopt;
   }
