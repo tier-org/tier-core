@@ -58,8 +58,8 @@ int main() {
   const std::vector<tier::core::PeerId> connected{p.id};
 
   const auto handler =
-      [&](tier::core::AdminOp op) -> std::vector<std::uint8_t> {
-    if (op == tier::core::AdminOp::peers) {
+      [&](const tier::core::AdminRequest& req) -> std::vector<std::uint8_t> {
+    if (req.op == tier::core::AdminOp::peers) {
       return tier::core::encode_admin_peers("testnet", peers, connected);
     }
     return {};

@@ -349,6 +349,10 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
       return ControlType::ping_req;
     case static_cast<std::uint8_t>(ControlType::observed_addr):
       return ControlType::observed_addr;
+    case static_cast<std::uint8_t>(ControlType::enc_keys):
+      return ControlType::enc_keys;
+    case static_cast<std::uint8_t>(ControlType::app_sealed):
+      return ControlType::app_sealed;
     default:
       return std::nullopt;
   }

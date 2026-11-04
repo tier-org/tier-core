@@ -24,6 +24,13 @@ enum class ControlType : std::uint8_t {
   ack = 3,
   ping_req = 4,
   observed_addr = 5,
+  // enc_keys      - an owner-signed announcement of this node's encryption
+  //                 public keys (X25519 + ML-KEM-768), sent on handshake so a
+  //                 peer can send it end-to-end encrypted messages. The codec
+  //                 and crypto live in tier::msg; only the type tag is here.
+  // app_sealed    - an end-to-end encrypted application message (see tier::msg).
+  enc_keys = 6,
+  app_sealed = 7,
 };
 
 // Peek the control type of a received message without decoding it. Returns

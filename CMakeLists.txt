@@ -46,6 +46,7 @@ enable_testing()
 
 add_subdirectory(libs/core)
 add_subdirectory(libs/crypto)
+add_subdirectory(libs/msg)
 add_subdirectory(libs/net)
 add_subdirectory(apps/node)
 add_subdirectory(apps/cli)

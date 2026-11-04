@@ -18,9 +18,10 @@ namespace {
 // serve() from ever blocking the node loop for long.
 constexpr int kIoTimeoutMs = 100;
 
-// A request is tiny ([version:1][op:1]); never read more than this from a
-// client, so a flood cannot grow our buffer.
-constexpr std::size_t kMaxRequest = 16;
+// A request is small: [version:1][op:1] for peers/inbox, or a send carrying up
+// to kMaxAdminMessageBytes of plaintext plus a fixed header. Cap the read at
+// that budget plus margin so a flood cannot grow our buffer without bound.
+constexpr std::size_t kMaxRequest = tier::core::kMaxAdminMessageBytes + 64;
 
 void set_io_timeout(int fd) noexcept {
   timeval tv{};
@@ -92,15 +93,29 @@ void AdminListener::serve(const Handler& handler, int max_conns) {
     }
     set_io_timeout(conn);
 
-    // Read the (tiny) request. The client sends it then half-closes, so a
-    // single bounded read is enough; stop at kMaxRequest regardless.
-    std::array<std::uint8_t, kMaxRequest> buf{};
-    const ssize_t n = ::recv(conn, buf.data(), buf.size(), 0);
-    if (n > 0) {
-      const auto op = tier::core::decode_admin_request(
-          std::span<const std::uint8_t>(buf.data(), static_cast<std::size_t>(n)));
-      if (op) {
-        const std::vector<std::uint8_t> reply = handler(*op);
+    // Read the request. The client sends it then half-closes (SHUT_WR), so we
+    // read until EOF, but never past kMaxRequest, so a flood or a client that
+    // never closes cannot grow our buffer or stall the loop beyond the timeout.
+    std::vector<std::uint8_t> req;
+    req.reserve(256);
+    std::array<std::uint8_t, 4096> buf{};
+    bool overflow = false;
+    for (;;) {
+      const ssize_t n = ::recv(conn, buf.data(), buf.size(), 0);
+      if (n <= 0) {
+        break;  // EOF, timeout, or error: request complete (or abandoned)
+      }
+      if (req.size() + static_cast<std::size_t>(n) > kMaxRequest) {
+        overflow = true;
+        break;
+      }
+      req.insert(req.end(), buf.data(), buf.data() + n);
+    }
+    if (!overflow && !req.empty()) {
+      const auto request = tier::core::decode_admin_request(
+          std::span<const std::uint8_t>(req.data(), req.size()));
+      if (request) {
+        const std::vector<std::uint8_t> reply = handler(*request);
         if (!reply.empty()) {
           write_all(conn, reply);
         }

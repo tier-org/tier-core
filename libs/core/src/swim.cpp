@@ -266,6 +266,8 @@ bool FailureDetector::handle(Clock::time_point now, const PeerId& from,
     }
     case ControlType::membership:
     case ControlType::observed_addr:
+    case ControlType::enc_keys:
+    case ControlType::app_sealed:
       return false;  // not ours; the caller handles these
   }
   return false;

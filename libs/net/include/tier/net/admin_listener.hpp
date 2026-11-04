@@ -17,9 +17,10 @@ namespace tier::net {
 // reachable only by processes the OS permits (service user and root).
 class AdminListener {
  public:
-  // Produce the response payload for a decoded request op. Returning an empty
+  // Produce the response payload for a decoded request. Returning an empty
   // vector sends nothing and closes the connection.
-  using Handler = std::function<std::vector<std::uint8_t>(tier::core::AdminOp)>;
+  using Handler =
+      std::function<std::vector<std::uint8_t>(const tier::core::AdminRequest&)>;
 
   // Bind and listen on `path` (any stale socket file is removed first). Throws
   // std::runtime_error on failure so the daemon can decide to run without admin.

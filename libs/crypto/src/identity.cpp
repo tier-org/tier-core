@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include <openssl/evp.h>
@@ -11,6 +12,7 @@
 
 #include "openssl_backend.hpp"
 #include "tier/crypto/ed25519.hpp"
+#include "tier/crypto/kdf.hpp"
 
 namespace tier::crypto {
 namespace {
@@ -95,6 +97,40 @@ std::vector<Byte> NodeIdentity::self_signed_certificate_der() const {
   std::vector<Byte> out(der, der + len);
   OPENSSL_free(der);
   return out;
+}
+
+namespace {
+
+// Domain-separation context strings for deriving the encryption keys from the
+// identity seed. Changing a string rotates that derived key, so they are fixed.
+constexpr char kX25519Info[] = "tier identity x25519 v1";
+constexpr char kMlKemInfo[] = "tier identity ml-kem-768 v1";
+
+ByteSpan as_span(const char* s) {
+  return ByteSpan(reinterpret_cast<const Byte*>(s),
+                  std::char_traits<char>::length(s));
+}
+
+}  // namespace
+
+X25519KeyPair NodeIdentity::x25519_identity_key() const {
+  const Ed25519Seed& s = seed();
+  std::vector<Byte> material =
+      hkdf_sha256(ByteSpan(s.data(), s.size()), ByteSpan(), as_span(kX25519Info),
+                  kX25519KeySize);
+  X25519SecretKey secret{};
+  std::copy(material.begin(), material.end(), secret.begin());
+  return x25519_from_secret(secret);
+}
+
+MlKem768KeyPair NodeIdentity::mlkem768_identity_key() const {
+  const Ed25519Seed& s = seed();
+  std::vector<Byte> material =
+      hkdf_sha256(ByteSpan(s.data(), s.size()), ByteSpan(), as_span(kMlKemInfo),
+                  kMlKem768SeedSize);
+  MlKem768Seed kem_seed{};
+  std::copy(material.begin(), material.end(), kem_seed.begin());
+  return mlkem768_from_seed(kem_seed);
 }
 
 std::vector<Byte> NodeIdentity::private_key_pkcs8_der() const {

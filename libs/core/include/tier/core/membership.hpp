@@ -81,15 +81,39 @@ struct PeerInfo {
   Liveness liveness = Liveness::alive;
 };
 
+// Default cap on the number of entries the table holds (A3). Signatures make a
+// record authentic but do not bound how many identities a party can mint, so an
+// unbounded table is a memory-exhaustion vector: a flood of validly signed junk
+// identities would grow it without limit. The cap bounds memory; the eviction
+// policy (see apply) keeps the useful records - a node's own, infrastructure
+// over clients, alive over dead - when the table is full. Generous relative to a
+// real network's backbone, so it never bites a healthy mesh; tunable per node.
+inline constexpr std::size_t kDefaultMaxMembershipEntries = 100000;
+
 // The known-peers table with SWIM / anti-entropy merge semantics. Transport
 // agnostic: the network layer feeds it updates and reads snapshots to gossip.
 class Membership {
  public:
+  Membership() = default;
+  explicit Membership(std::size_t max_entries) : max_entries_(max_entries) {}
+
+  // Pin an id that must never be evicted to make room (the node's own id). An
+  // unpinned least-valuable entry is chosen instead.
+  void set_pinned(const PeerId& id) { pinned_ = id; }
+
   // Merge one received update. Returns true if local state changed.
   // A higher incarnation always wins; at an equal incarnation a worse liveness
   // (dead > suspect > alive) wins; a lower incarnation is ignored. An update for
   // a tombstoned id (see bury) is ignored unless its incarnation is strictly
   // greater than the tombstone's, which lifts the tombstone (a genuine rejoin).
+  //
+  // Admitting a new id is subject to the table budget (A3): if the table is full
+  // (max_entries), the new record is admitted only by evicting the single
+  // least-valuable unpinned entry, and only when the new record is strictly more
+  // valuable than it (infrastructure outranks client; alive outranks
+  // suspect/dead). Otherwise the new id is rejected (apply returns false) and the
+  // table stays bounded. Updates to an id already present are never subject to
+  // the budget (they do not grow the table).
   bool apply(const PeerInfo& update);
 
   // Drop an entry (e.g. a dead peer past its cleanup grace). Returns true if an
@@ -116,10 +140,19 @@ class Membership {
   [[nodiscard]] std::vector<PeerInfo> snapshot() const;
 
  private:
+  // Make room for one new id when the table is at capacity: evict the single
+  // least-valuable unpinned entry if the incoming record outranks it. Returns
+  // true if there is now room to insert (either the table was not full, or an
+  // entry was evicted), false if the incoming record should be rejected.
+  [[nodiscard]] bool make_room_for(const PeerInfo& incoming);
+
   std::map<PeerId, PeerInfo> peers_;
   // Buried ids mapped to the incarnation they were buried at. An apply for such
   // an id is suppressed unless it carries a strictly higher incarnation.
   std::map<PeerId, std::uint64_t> tombstones_;
+  std::size_t max_entries_ = kDefaultMaxMembershipEntries;
+  // The node's own id (optional): never evicted to admit another record.
+  std::optional<PeerId> pinned_;
 };
 
 }  // namespace tier::core

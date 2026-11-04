@@ -50,6 +50,18 @@ namespace {
 constexpr std::size_t kCidLen = 16;
 constexpr std::size_t kMaxUdpPayload = 1452;
 
+// Cap on the number of live connections (A5, cross-connection bound). Outbound
+// connections are already bounded by the topology (a node dials only its ring
+// neighbors / a few backbone entry points), but inbound ones are not: without a
+// limit, a peer could open connections without bound and, since each carries a
+// send queue capped at kMaxSendQueueBytes, exhaust memory. A new inbound
+// (server) connection past this cap is refused; existing connections are
+// untouched. The bound also caps total send-queue memory at
+// kMaxConnections * kMaxSendQueueBytes. Generous relative to a node's real
+// neighbor count (ring degree plus attached clients), so it only trips on an
+// abusive fan-in, not a healthy mesh.
+constexpr std::size_t kMaxConnections = 4096;
+
 // Cap on bytes queued but not yet acknowledged on one connection's send stream.
 // A peer that keeps the connection open but stops extending its flow-control
 // window would otherwise let periodic gossip pile up without bound. On overflow
@@ -713,6 +725,12 @@ Endpoint::Impl::Connection* Endpoint::Impl::accept_server(
   if (ngtcp2_accept(&hd, data, len) != 0) {
     return nullptr;  // not an acceptable Initial
   }
+  // Refuse a new inbound connection once at the cap (A5): bound inbound fan-in
+  // and total send-queue memory. Existing connections keep working; the peer may
+  // retry later as others close.
+  if (conns.size() >= kMaxConnections) {
+    return nullptr;
+  }
 
   auto c = std::make_unique<Connection>();
   c->ep = this;
@@ -1007,8 +1025,17 @@ void Endpoint::Impl::send(ConnId id, std::span<const Byte> payload) {
                       ? c->write_cursor
                       : c->out.back().base + c->out.back().data.size();
   }
-  if (!decision.admit) {
-    c->closing = true;  // backlog still over budget: drop the peer
+  if (decision.decision == sendq::Decision::close) {
+    // Only a control message that still overruns the full cap after shedding
+    // droppable bulk reaches here: a genuine, undroppable backlog (in flight or
+    // queued control), so the peer is not draining and is dropped.
+    c->closing = true;
+    return;
+  }
+  if (decision.decision == sendq::Decision::reject) {
+    // Bulk that does not fit its budget (cap - reserve) even after shedding the
+    // droppable tail: drop this snapshot but keep the connection and the control
+    // reserve intact. The next gossip round carries fresh state.
     return;
   }
 

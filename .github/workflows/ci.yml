@@ -98,13 +98,15 @@ jobs:
         run: ./test/net/e2e.sh
 
   fuzz:
-    # Short smoke run of the libFuzzer targets for the untrusted-input decoders
-    # (membership, SWIM control, version, wire frame). libFuzzer needs Clang. The
-    # targets link only tier::core / header-only framing - no transport or
-    # OpenSSL - so this builds and runs fast. ASan + UBSan are on (TIER_SANITIZE),
-    # and the Tier libraries are coverage-instrumented (TIER_FUZZ), so libFuzzer
-    # guides into the real decoders and a memory or UB error aborts. A crash or
-    # sanitizer abort fails the job.
+    # libFuzzer targets for the untrusted-input decoders: membership, SWIM
+    # control + admin, version, wire frame, and the sealed-message / enc_keys
+    # decoder (fuzz_sealed also links tier::crypto, so it exercises the real
+    # signature, KEM and AEAD open paths, not just the byte parse). libFuzzer
+    # needs Clang. ASan + UBSan are on (TIER_SANITIZE) and the Tier libraries are
+    # coverage-instrumented (TIER_FUZZ), so libFuzzer guides into the real
+    # decoders and a memory or UB error aborts. A crash or sanitizer abort fails
+    # the job. The corpus is cached across runs so coverage accumulates instead of
+    # starting cold each time.
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v5
@@ -129,13 +131,25 @@ jobs:
       - name: Build fuzz targets
         run: |
           cmake --build build-fuzz -j \
-            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver
+            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed
+
+      - name: Restore fuzz corpus
+        uses: actions/cache@v4
+        with:
+          path: fuzz-corpus
+          # A fresh key each run (so the updated corpus is always saved), falling
+          # back to the most recent prior corpus so coverage carries over.
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-
 
       - name: Run each fuzzer briefly
         run: |
-          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver; do
+          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed; do
             echo "== $t =="
-            ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1
+            mkdir -p "fuzz-corpus/$t"
+            ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1 \
+              "fuzz-corpus/$t"
           done
 
   tidy:

@@ -3,6 +3,8 @@
 #include <vector>
 
 #include "tier/crypto/ed25519.hpp"
+#include "tier/crypto/kem.hpp"
+#include "tier/crypto/kx.hpp"
 #include "tier/crypto/primitives.hpp"
 
 namespace tier::crypto {
@@ -31,6 +33,15 @@ class NodeIdentity {
   }
 
   [[nodiscard]] const Ed25519Signer& signer() const noexcept { return signer_; }
+
+  // The node's long-term encryption keys, derived deterministically from the
+  // same identity seed (HKDF-SHA256 with distinct context strings), so the one
+  // stored seed reproduces the whole identity - signing key and both
+  // encryption keys - with no extra key file. Used by the message layer: the
+  // public halves are announced to peers, the secret halves open messages
+  // addressed to this node. Each call recomputes from the seed.
+  [[nodiscard]] X25519KeyPair x25519_identity_key() const;
+  [[nodiscard]] MlKem768KeyPair mlkem768_identity_key() const;
 
   // DER-encoded self-signed X.509 certificate signed by this identity. Throws
   // std::runtime_error on backend failure.

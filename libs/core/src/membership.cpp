@@ -12,7 +12,44 @@ bool supersedes(const PeerInfo& candidate, const PeerInfo& current) noexcept {
          static_cast<std::uint8_t>(current.liveness);
 }
 
+// Eviction value of an entry: higher is kept longer. Infrastructure (backbone)
+// outranks a plain client, and an alive peer outranks a suspect/dead one. The
+// least-valuable entry is the one evicted to admit a more valuable new record.
+int evict_rank(const PeerInfo& p) noexcept {
+  const int base = is_infrastructure(p.roles) ? 2 : 0;
+  const int alive = (p.liveness == Liveness::alive) ? 1 : 0;
+  return base + alive;
+}
+
 }  // namespace
+
+bool Membership::make_room_for(const PeerInfo& incoming) {
+  if (peers_.size() < max_entries_) {
+    return true;  // room to spare
+  }
+  // Full: find the least-valuable unpinned entry (ties broken by id order, which
+  // is deterministic since peers_ is an ordered map).
+  auto victim = peers_.end();
+  int victim_rank = 0;
+  for (auto it = peers_.begin(); it != peers_.end(); ++it) {
+    if (pinned_.has_value() && it->first == *pinned_) {
+      continue;  // never evict the node's own record
+    }
+    const int r = evict_rank(it->second);
+    if (victim == peers_.end() || r < victim_rank) {
+      victim = it;
+      victim_rank = r;
+    }
+  }
+  if (victim == peers_.end()) {
+    return false;  // nothing evictable (only the pinned entry)
+  }
+  if (evict_rank(incoming) <= victim_rank) {
+    return false;  // the new record is no more valuable than the least valuable
+  }
+  peers_.erase(victim);
+  return true;
+}
 
 bool Membership::apply(const PeerInfo& update) {
   const auto tomb = tombstones_.find(update.id);
@@ -25,6 +62,11 @@ bool Membership::apply(const PeerInfo& update) {
 
   const auto it = peers_.find(update.id);
   if (it == peers_.end()) {
+    // A new id is subject to the table budget (A3): admit it only if there is
+    // room, or an eviction of a strictly-less-valuable entry can make room.
+    if (!make_room_for(update)) {
+      return false;
+    }
     peers_.emplace(update.id, update);
     return true;
   }

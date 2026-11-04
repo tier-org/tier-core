@@ -211,6 +211,85 @@ void role_demotion_propagation() {
   }
 }
 
+// A6 remainder (docs/audit-2026-11-01.md, 0.5.0 re-review): a node that learned
+// the owner's fresh client record first, then receives a STALE infrastructure
+// announcement for the same owner from a neighbor, must push its newer record
+// back so the neighbor converges - instead of silently dropping the stale
+// record and leaving the neighbor to keep treating the demoted owner as
+// backbone. This covers the case where the node holding the fresh record never
+// witnessed the infra->client transition locally (no demotion window was set),
+// so only the push-back on a rejected stale merge carries the revocation.
+void role_demotion_pushback() {
+  using tier::core::Role;
+  const tier::core::RoleSet kTransmitter = tier::core::role_bit(Role::transmitter);
+  const tier::core::RoleSet kClient = tier::core::role_bit(Role::client);
+
+  tier::net::Node relay(tier::crypto::NodeIdentity::generate(), kTransmitter,
+                        "127.0.0.1", 0, {}, "review");
+  tier::net::Node downstream(tier::crypto::NodeIdentity::generate(), kTransmitter,
+                             "127.0.0.1", 0, {}, "review");
+  // One owner identity published through two endpoints, so the stale infra
+  // record and the fresh client record reach downstream and relay over separate
+  // connections - the fresh client record is never sent to downstream directly,
+  // so the only way downstream can learn it is relay's push-back.
+  const std::array<std::uint8_t, 32> owner_seed =
+      tier::crypto::NodeIdentity::generate().seed();
+  Publisher pub_d(owner_seed, "review");  // to downstream: infra@100
+  Publisher pub_r(owner_seed, "review");  // to relay: client@101
+
+  // Phase 1: the owner tells `downstream` it is a transmitter at incarnation 100.
+  pub_d.endpoint.connect("127.0.0.1", downstream.local_port());
+  for (int i = 0; i < 6000 && !sees_infrastructure(downstream, pub_d.id()); ++i) {
+    pub_d.publish(pub_d.record(kTransmitter, 100));
+    downstream.poll(2);
+    pub_d.endpoint.poll(2);
+  }
+  check(sees_infrastructure(downstream, pub_d.id()),
+        "A6 pushback: downstream holds the stale infrastructure record");
+
+  // Phase 2: the owner announces its demotion to client@101 only to `relay`.
+  // `relay` learns the fresh client record directly and, never having seen an
+  // infra->client transition for it, sets no demotion window and does not gossip
+  // it by role.
+  pub_r.endpoint.connect("127.0.0.1", relay.local_port());
+  bool relay_has_client = false;
+  for (int i = 0; i < 6000 && !relay_has_client; ++i) {
+    pub_r.publish(pub_r.record(kClient, 101));
+    relay.poll(2);
+    downstream.poll(2);
+    pub_d.endpoint.poll(2);
+    pub_r.endpoint.poll(2);
+    const auto rec = relay.membership().find(pub_r.id());
+    relay_has_client = rec.has_value() && rec->incarnation == 101 &&
+                       !tier::core::is_infrastructure(rec->roles);
+  }
+  check(relay_has_client, "A6 pushback: relay holds the fresh client record");
+  // downstream must still hold only the stale infra record at this point.
+  check(sees_infrastructure(downstream, pub_d.id()),
+        "A6 pushback: downstream has not learned the client record directly");
+
+  // Phase 3: connect relay and downstream. downstream gossips its stale infra
+  // record to relay; relay rejects it as older but must push its client@101 back
+  // so downstream converges. The owner never re-publishes to downstream here, so
+  // convergence can only come from relay's push-back.
+  downstream.connect("127.0.0.1", relay.local_port());
+  bool converged = false;
+  for (int i = 0; i < 6000 && !converged; ++i) {
+    relay.poll(2);
+    downstream.poll(2);
+    pub_d.endpoint.poll(2);
+    pub_r.endpoint.poll(2);
+    const auto rec = downstream.membership().find(pub_d.id());
+    converged = rec.has_value() && rec->incarnation == 101 &&
+                !tier::core::is_infrastructure(rec->roles);
+  }
+  const auto rec = downstream.membership().find(pub_d.id());
+  check(rec.has_value() && rec->incarnation == 101,
+        "A6 pushback: downstream converges to the client record via push-back");
+  check(rec.has_value() && !tier::core::is_infrastructure(rec->roles),
+        "A6 pushback: downstream drops the stale infrastructure status");
+}
+
 }  // namespace
 
 // Build n distinct, sorted backbone ids.
@@ -312,6 +391,7 @@ int main() {
 
   ring_properties();
   role_demotion_propagation();
+  role_demotion_pushback();
 
   // Role-based topology (docs/topology.md). A and B are infrastructure
   // (backbone); E1 and E2 are edge clients. Everyone bootstraps through the hub

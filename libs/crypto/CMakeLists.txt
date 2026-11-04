@@ -5,7 +5,11 @@
 add_library(tier_crypto STATIC
   src/ed25519.cpp
   src/identity.cpp
-  src/hash.cpp)
+  src/hash.cpp
+  src/kdf.cpp
+  src/aead.cpp
+  src/kx.cpp
+  src/kem.cpp)
 add_library(tier::crypto ALIAS tier_crypto)
 
 target_include_directories(tier_crypto PUBLIC include)

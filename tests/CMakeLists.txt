@@ -6,6 +6,18 @@ add_executable(test_identity test_identity.cpp)
 target_link_libraries(test_identity PRIVATE tier::crypto tier::options)
 add_test(NAME identity COMMAND test_identity)
 
+add_executable(test_crypto_primitives test_crypto_primitives.cpp)
+target_link_libraries(test_crypto_primitives PRIVATE tier::crypto tier::options)
+add_test(NAME crypto_primitives COMMAND test_crypto_primitives)
+
+add_executable(test_sealed test_sealed.cpp)
+target_link_libraries(test_sealed PRIVATE tier::msg tier::crypto tier::core tier::options)
+add_test(NAME sealed COMMAND test_sealed)
+
+add_executable(test_messaging test_messaging.cpp)
+target_link_libraries(test_messaging PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME messaging COMMAND test_messaging)
+
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)

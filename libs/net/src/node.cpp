@@ -142,6 +142,9 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
           }) {
   self_address_ = ip + ":" + std::to_string(endpoint_.local_port());
 
+  // Our own record must never be evicted when the table is full (A3 budget).
+  membership_.set_pinned(self_id_);
+
   tier::core::PeerInfo me;
   me.id = self_id_;
   // Advertise a bind address only if it is concrete. On a wildcard bind ("::"
@@ -177,13 +180,23 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
     if (const auto addr = endpoint_.remote_address(conn)) {
       endpoint_.send(conn, tier::core::encode_observed_addr(*addr));
     }
+    // Announce our encryption keys so the peer can send us sealed messages.
+    endpoint_.send(conn, tier::msg::make_enc_keys_announce(identity_, network_));
   });
   endpoint_.on_message([this](ConnId, const PeerId& key,
                               std::span<const tier::crypto::Byte> payload) {
     const tier::core::PeerId from = tier::crypto::sha256(key);
-    if (tier::core::peek_control_type(payload) ==
-        tier::core::ControlType::observed_addr) {
+    const auto ctype = tier::core::peek_control_type(payload);
+    if (ctype == tier::core::ControlType::observed_addr) {
       handle_observed(from, payload);
+      return;
+    }
+    if (ctype == tier::core::ControlType::enc_keys) {
+      handle_enc_keys(from, key, payload);
+      return;
+    }
+    if (ctype == tier::core::ControlType::app_sealed) {
+      handle_sealed(key, payload);
       return;
     }
     if (fd_.handle(std::chrono::steady_clock::now(), from, payload)) {
@@ -435,6 +448,34 @@ void Node::merge_message(std::span<const tier::crypto::Byte> payload) {
       if (on_change_) {
         on_change_(peer);
       }
+    } else {
+      // apply() rejected the incoming record as not newer than what we hold. If
+      // we actually hold a strictly newer record for this id, push ours back so
+      // the sender (and, via rumor, the rest of the network) converges onto it.
+      // This is what carries a demotion's revocation to a node that never
+      // witnessed the infrastructure->client transition (A6 remainder): a node
+      // that learned the fresh client record first, then receives a stale
+      // infrastructure announcement, re-gossips the client record instead of
+      // silently dropping the stale one and leaving the sender to keep dialing a
+      // now-demoted peer as backbone.
+      const auto cur = membership_.find(peer.id);
+      if (cur && cur->incarnation > peer.incarnation) {
+        const bool peer_infra = tier::core::is_infrastructure(peer.roles);
+        const bool cur_infra = tier::core::is_infrastructure(cur->roles);
+        if (peer_infra && !cur_infra) {
+          // The stale record still asserts the backbone status our newer record
+          // revokes: propagate the revocation network-wide for the demotion
+          // window, exactly as the node that witnessed the transition does.
+          demoted_until_[peer.id] =
+              std::chrono::steady_clock::now() + kDemotionGossipWindow;
+          rumor_queue_.push_back(*cur);
+        } else {
+          // Otherwise ours propagates by the normal scoping rule (a backbone
+          // record is re-gossiped; a client record stays local, which is fine -
+          // a client is only ever held by the backbone it attaches to).
+          queue_rumor(*cur);
+        }
+      }
     }
   }
 }
@@ -619,6 +660,64 @@ void Node::handle_observed(const tier::core::PeerId& from,
       on_change_(me);
     }
   }
+}
+
+void Node::handle_enc_keys(const tier::core::PeerId& from, const PeerId& sender_key,
+                           std::span<const tier::crypto::Byte> payload) {
+  auto keys = tier::msg::open_enc_keys_announce(network_, sender_key, payload);
+  if (!keys) {
+    return;  // malformed or signature did not verify: not this peer's keys
+  }
+  peer_enc_keys_[from] = *keys;
+}
+
+void Node::handle_sealed(const PeerId& sender_key,
+                         std::span<const tier::crypto::Byte> payload) {
+  auto opened = tier::msg::open(identity_, network_, sender_key, payload);
+  if (!opened) {
+    return;  // not for us, forged, or undecryptable: drop silently
+  }
+  ReceivedMessage rx;
+  rx.sender = opened->sender_id;
+  rx.suite = opened->suite;
+  rx.plaintext = std::move(opened->plaintext);
+  if (on_message_received_) {
+    on_message_received_(rx);
+  }
+  inbox_.push_back(std::move(rx));
+}
+
+bool Node::send_message(const tier::core::PeerId& to, tier::msg::Suite suite,
+                        std::span<const tier::crypto::Byte> plaintext) {
+  const auto conn = conn_by_peer_.find(to);
+  if (conn == conn_by_peer_.end()) {
+    return false;  // not connected
+  }
+  const auto keys = peer_enc_keys_.find(to);
+  if (keys == peer_enc_keys_.end()) {
+    return false;  // encryption keys not yet announced
+  }
+  tier::msg::Recipient recipient;
+  recipient.id = to;
+  recipient.keys = keys->second;
+  const std::vector<tier::crypto::Byte> sealed =
+      tier::msg::seal(identity_, network_, suite, recipient, plaintext);
+  endpoint_.send(conn->second, sealed);
+  return true;
+}
+
+bool Node::has_encryption_keys(const tier::core::PeerId& peer) const {
+  return peer_enc_keys_.find(peer) != peer_enc_keys_.end();
+}
+
+std::vector<Node::ReceivedMessage> Node::take_inbox() {
+  std::vector<ReceivedMessage> out;
+  out.swap(inbox_);
+  return out;
+}
+
+void Node::on_message_received(std::function<void(const ReceivedMessage&)> cb) {
+  on_message_received_ = std::move(cb);
 }
 
 std::optional<std::string> Node::select_dial_candidate(

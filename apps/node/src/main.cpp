@@ -28,6 +28,7 @@
 #include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
 #include "tier/crypto/primitives.hpp"
+#include "tier/msg/sealed.hpp"
 #include "tier/net/admin_listener.hpp"
 #include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
@@ -634,11 +635,33 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   }
   std::fflush(stdout);
   const auto admin_handler =
-      [&node](tier::core::AdminOp op) -> std::vector<std::uint8_t> {
-    if (op == tier::core::AdminOp::peers) {
-      return tier::core::encode_admin_peers(node.network(),
-                                            node.membership().snapshot(),
-                                            node.connected_peers());
+      [&node](const tier::core::AdminRequest& req) -> std::vector<std::uint8_t> {
+    switch (req.op) {
+      case tier::core::AdminOp::peers:
+        return tier::core::encode_admin_peers(node.network(),
+                                              node.membership().snapshot(),
+                                              node.connected_peers());
+      case tier::core::AdminOp::send: {
+        if (!tier::msg::is_known_suite(req.suite)) {
+          return tier::core::encode_admin_send_reply(false);
+        }
+        const bool ok = node.send_message(
+            req.recipient, static_cast<tier::msg::Suite>(req.suite),
+            std::span<const tier::crypto::Byte>(req.plaintext.data(),
+                                                req.plaintext.size()));
+        return tier::core::encode_admin_send_reply(ok);
+      }
+      case tier::core::AdminOp::inbox: {
+        std::vector<tier::core::AdminInboxMessage> out;
+        for (auto& m : node.take_inbox()) {
+          tier::core::AdminInboxMessage im;
+          im.sender = m.sender;
+          im.suite = static_cast<std::uint8_t>(m.suite);
+          im.plaintext = std::move(m.plaintext);
+          out.push_back(std::move(im));
+        }
+        return tier::core::encode_admin_inbox(out);
+      }
     }
     return {};
   };

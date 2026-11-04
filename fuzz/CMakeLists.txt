@@ -33,3 +33,10 @@ add_executable(fuzz_semver fuzz_semver.cpp)
 target_link_libraries(fuzz_semver PRIVATE tier::core tier::options)
 target_compile_options(fuzz_semver PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_semver PRIVATE -fsanitize=fuzzer)
+
+# Decoders of the sealed application message and the enc_keys announce
+# (untrusted peer input, with real signature/decrypt paths behind them).
+add_executable(fuzz_sealed fuzz_sealed.cpp)
+target_link_libraries(fuzz_sealed PRIVATE tier::msg tier::crypto tier::core tier::options)
+target_compile_options(fuzz_sealed PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_sealed PRIVATE -fsanitize=fuzzer)

@@ -33,8 +33,8 @@ std::string resolve_socket(const char* override_path) {
 
 // Connect, send the request, read the whole reply to EOF. Returns false (and
 // prints why) if the daemon is not reachable.
-bool query(const std::string& path, tier::core::AdminOp op,
-           std::vector<std::uint8_t>& out) {
+bool query_bytes(const std::string& path, const std::vector<std::uint8_t>& req,
+                 std::vector<std::uint8_t>& out) {
   const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0) {
     std::perror("socket");
@@ -57,7 +57,6 @@ bool query(const std::string& path, tier::core::AdminOp op,
     return false;
   }
 
-  const auto req = tier::core::encode_admin_request(op);
   if (::send(fd, req.data(), req.size(), 0) != static_cast<ssize_t>(req.size())) {
     std::perror("send");
     ::close(fd);
@@ -80,6 +79,12 @@ bool query(const std::string& path, tier::core::AdminOp op,
   }
   ::close(fd);
   return true;
+}
+
+// Convenience for the no-argument ops (peers, inbox).
+bool query(const std::string& path, tier::core::AdminOp op,
+           std::vector<std::uint8_t>& out) {
+  return query_bytes(path, tier::core::encode_admin_request(op), out);
 }
 
 std::string short_id(const tier::core::PeerId& id) {
@@ -169,10 +174,111 @@ int cmd_peers(const std::string& path) {
   return 0;
 }
 
+// Parse exactly 64 hex characters into a 32-byte peer id.
+std::optional<tier::core::PeerId> parse_peer_id(std::string_view s) {
+  if (s.size() != tier::core::PeerId{}.size() * 2) {
+    return std::nullopt;
+  }
+  auto nib = [](char c) -> int {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  tier::core::PeerId id{};
+  for (std::size_t i = 0; i < id.size(); ++i) {
+    const int hi = nib(s[2 * i]);
+    const int lo = nib(s[2 * i + 1]);
+    if (hi < 0 || lo < 0) {
+      return std::nullopt;
+    }
+    id[i] = static_cast<std::uint8_t>((hi << 4) | lo);
+  }
+  return id;
+}
+
+std::optional<std::uint8_t> parse_suite(std::string_view name) {
+  if (name == "classical") return static_cast<std::uint8_t>(1);
+  if (name == "hybrid") return static_cast<std::uint8_t>(2);
+  if (name == "pq") return static_cast<std::uint8_t>(3);
+  return std::nullopt;
+}
+
+const char* suite_name(std::uint8_t s) {
+  switch (s) {
+    case 1: return "classical";
+    case 2: return "hybrid";
+    case 3: return "pq";
+    default: return "?";
+  }
+}
+
+int cmd_send(const std::string& path, std::string_view peer_hex,
+             std::string_view suite_name_arg, std::string_view message) {
+  const auto id = parse_peer_id(peer_hex);
+  if (!id) {
+    std::fprintf(stderr, "invalid peer id (expected 64 hex chars)\n");
+    return 2;
+  }
+  const auto suite = parse_suite(suite_name_arg);
+  if (!suite) {
+    std::fprintf(stderr, "invalid suite (expected classical|hybrid|pq)\n");
+    return 2;
+  }
+  const std::vector<std::uint8_t> pt(message.begin(), message.end());
+  if (pt.size() > tier::core::kMaxAdminMessageBytes) {
+    std::fprintf(stderr, "message too large (max %zu bytes)\n",
+                 tier::core::kMaxAdminMessageBytes);
+    return 2;
+  }
+  const auto req = tier::core::encode_admin_send(
+      *id, *suite, std::span<const std::uint8_t>(pt.data(), pt.size()));
+  std::vector<std::uint8_t> reply;
+  if (!query_bytes(path, req, reply)) {
+    return 1;
+  }
+  const auto ok = tier::core::decode_admin_send_reply(reply);
+  if (!ok) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  if (!*ok) {
+    std::fprintf(stderr,
+                 "not sent: peer not connected or its encryption keys unknown\n");
+    return 1;
+  }
+  std::printf("sent (%s) to %s\n", suite_name(*suite), short_id(*id).c_str());
+  return 0;
+}
+
+int cmd_inbox(const std::string& path) {
+  std::vector<std::uint8_t> reply;
+  if (!query(path, tier::core::AdminOp::inbox, reply)) {
+    return 1;
+  }
+  const auto messages = tier::core::decode_admin_inbox(reply);
+  if (!messages) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  std::printf("%zu message(s)\n", messages->size());
+  for (const auto& m : *messages) {
+    std::string text(m.plaintext.begin(), m.plaintext.end());
+    std::printf("from %s  suite=%s  %zu bytes: %s\n", short_id(m.sender).c_str(),
+                suite_name(m.suite), m.plaintext.size(), text.c_str());
+  }
+  return 0;
+}
+
 int usage() {
   std::fputs(
-      "usage: tierctl [--sock <path>] peers\n"
-      "  peers   list the node's view of the mesh (known/connected)\n"
+      "usage: tierctl [--sock <path>] <command>\n"
+      "  peers                      list the node's view of the mesh\n"
+      "  send <peer-id> [suite] <message>\n"
+      "                             send an encrypted message to a peer\n"
+      "                             (peer-id: 64 hex chars; suite: "
+      "classical|hybrid|pq, default hybrid)\n"
+      "  inbox                      print and drain received messages\n"
       "\n"
       "The socket defaults to " "/run/tierd/tierd.sock"
       ", or $TIER_ADMIN_SOCK.\n",
@@ -184,7 +290,7 @@ int usage() {
 
 int main(int argc, char** argv) {
   const char* sock_override = nullptr;
-  std::string_view command = "peers";
+  std::vector<std::string_view> positional;
 
   for (int i = 1; i < argc; ++i) {
     const std::string_view arg = argv[i];
@@ -196,13 +302,29 @@ int main(int argc, char** argv) {
     } else if (arg == "-h" || arg == "--help") {
       return usage();
     } else {
-      command = arg;
+      positional.push_back(arg);
     }
   }
 
   const std::string path = resolve_socket(sock_override);
+  const std::string_view command = positional.empty() ? "peers" : positional[0];
+
   if (command == "peers") {
     return cmd_peers(path);
+  }
+  if (command == "inbox") {
+    return cmd_inbox(path);
+  }
+  if (command == "send") {
+    // send <peer-id> <message>            (suite defaults to hybrid)
+    // send <peer-id> <suite> <message>
+    if (positional.size() == 3) {
+      return cmd_send(path, positional[1], "hybrid", positional[2]);
+    }
+    if (positional.size() == 4) {
+      return cmd_send(path, positional[1], positional[2], positional[3]);
+    }
+    return usage();
   }
   return usage();
 }

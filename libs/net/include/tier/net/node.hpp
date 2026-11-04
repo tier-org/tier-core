@@ -15,6 +15,7 @@
 #include "tier/core/swim.hpp"
 #include "tier/core/version_range.hpp"
 #include "tier/crypto/identity.hpp"
+#include "tier/msg/sealed.hpp"
 #include "tier/net/endpoint.hpp"
 
 namespace tier::net {
@@ -64,6 +65,37 @@ class Node {
 
   // Peers this node currently holds a live connection to (handshake complete).
   [[nodiscard]] std::vector<tier::core::PeerId> connected_peers() const;
+
+  // --- end-to-end encrypted application messages -------------------------
+  // A decrypted, sender-authenticated message handed up from the control
+  // plane. `sender` is the authenticated peer id (it hashes to the identity
+  // key the message was signed with).
+  struct ReceivedMessage {
+    tier::core::PeerId sender{};
+    tier::msg::Suite suite{};
+    std::vector<tier::crypto::Byte> plaintext;
+  };
+
+  // Send an encrypted message to a peer under `suite`. The peer must be
+  // connected and must have announced its encryption keys (which happens on
+  // handshake). Returns false if it is not connected or its keys are not yet
+  // known; throws only on an unexpected crypto backend failure. v1 delivers
+  // only to a directly connected peer - relayed/offline delivery is future
+  // work (see docs/overnight-2026-11-03.md).
+  [[nodiscard]] bool send_message(const tier::core::PeerId& to,
+                                  tier::msg::Suite suite,
+                                  std::span<const tier::crypto::Byte> plaintext);
+
+  // Whether this node currently holds the encryption keys for a peer (i.e. the
+  // peer is reachable for send_message).
+  [[nodiscard]] bool has_encryption_keys(const tier::core::PeerId& peer) const;
+
+  // Remove and return every message received since the last call.
+  [[nodiscard]] std::vector<ReceivedMessage> take_inbox();
+
+  // Invoked for each decrypted message as it arrives (in addition to the
+  // inbox). Optional.
+  void on_message_received(std::function<void(const ReceivedMessage&)> cb);
 
   // Invoked whenever a membership entry is newly learned or updated by a merge.
   void on_membership_change(std::function<void(const tier::core::PeerInfo&)> cb);
@@ -150,6 +182,16 @@ class Node {
   // advertised address once enough peers agree.
   void handle_observed(const tier::core::PeerId& from,
                        std::span<const tier::crypto::Byte> payload);
+  // Verify a peer's signed enc_keys announce (against the identity key it
+  // authenticated with) and cache its encryption keys, so we can send it
+  // encrypted messages. A failed verification is dropped.
+  void handle_enc_keys(const tier::core::PeerId& from, const PeerId& sender_key,
+                       std::span<const tier::crypto::Byte> payload);
+  // Open a sealed application message and deliver it to the inbox. The sealed
+  // layer authenticates the sender against `sender_key` and checks it is
+  // addressed to us; a message that fails any check is dropped.
+  void handle_sealed(const PeerId& sender_key,
+                     std::span<const tier::crypto::Byte> payload);
   // Dial known peers we have learned of but are not yet connected to, forming a
   // mesh out of transitive discovery.
   void autodial(std::chrono::steady_clock::time_point now);
@@ -189,6 +231,12 @@ class Node {
   // Peer id -> live connection, rebuilt from the endpoint each poll; the failure
   // detector sends probes by peer id and this routes them.
   std::map<tier::core::PeerId, ConnId> conn_by_peer_;
+  // Per peer id, the encryption keys it announced (enc_keys). Populated on
+  // handshake; required to seal a message to that peer.
+  std::map<tier::core::PeerId, tier::msg::PeerEncKeys> peer_enc_keys_;
+  // Decrypted messages received and not yet drained by take_inbox().
+  std::vector<ReceivedMessage> inbox_;
+  std::function<void(const ReceivedMessage&)> on_message_received_;
   // Per reporting peer, the set of addresses it has observed us at
   // (observed_addr). A peer that has connected to us over both IPv4 and IPv6
   // reports each, so this accumulates rather than overwrites.

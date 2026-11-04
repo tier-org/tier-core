@@ -50,6 +50,34 @@ what the other presents. Ed25519 (classical) is quantum-vulnerable; this is
 accepted for v0 and addressed by the planned migration path, not by the current
 default.
 
+## Encrypted messaging
+
+Participants can send each other **end-to-end encrypted application messages**
+over the control plane (`tierctl send` / `inbox`, or the `Node::send_message` /
+`take_inbox` API). The message is sealed to the recipient's published encryption
+keys and signed by the sender's Ed25519 identity, so the recipient gets both
+confidentiality (only it can decrypt) and sender authenticity (it learns who
+sent it and that nothing was altered).
+
+Three cipher suites are offered; the sender picks one per message:
+
+- **classical** - X25519 ECDH -> HKDF-SHA256 -> ChaCha20-Poly1305.
+- **hybrid** (default) - X25519 **and** ML-KEM-768, both shared secrets folded
+  into the KDF, so the message stays secure if either primitive is later broken.
+- **pq** - ML-KEM-768 only, for a fully post-quantum posture.
+
+Each node's encryption keys (an X25519 key and an ML-KEM-768 key) are derived
+deterministically from its one Ed25519 identity seed, so there is no extra key
+file. A node announces its encryption public keys to each peer on connect, in an
+owner-signed message the peer verifies against the identity it authenticated
+with in the QUIC handshake - the large ML-KEM key therefore never travels in the
+gossiped membership table.
+
+v1 delivers only to a **directly connected** peer. Relayed/offline delivery,
+forward-secret sessions (a ratchet) and group messaging are future work; the
+sealing itself is independent of how a message is carried. Per-message ephemeral
+X25519 already gives forward secrecy for the classical key-agreement part.
+
 ## Dependencies
 
 Build-time:
@@ -253,9 +281,16 @@ Docker with IPv6 enabled on the daemon - see `test/net/README.md`.
 ## Diagnostics (tierctl)
 
 The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
-`$TIER_ADMIN_SOCK`). `tierctl` talks to it over that socket, read-only for now:
+`$TIER_ADMIN_SOCK`). `tierctl` talks to it over that socket:
 
     sudo tierctl peers        # the node's view of the mesh: known vs connected
+    sudo tierctl inbox        # print and drain encrypted messages received
+    sudo tierctl send <peer-id> [classical|hybrid|pq] <message>
+
+`send` encrypts a message end-to-end to a connected peer (see "Encrypted
+messaging" below); `<peer-id>` is the 64-hex id from `peers`, and the suite
+defaults to `hybrid`. `inbox` prints each received message with its
+authenticated sender and suite, then clears the queue.
 
 The header reports the node's own network (the cluster it joined) and the known
 versus connected counts. Each row is a peer: short id, whether a live connection
