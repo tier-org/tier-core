@@ -143,10 +143,10 @@ jobs:
       - name: Build fuzz targets
         run: |
           cmake --build build-fuzz -j \
-            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch
+            --target fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch fuzz_app
 
       - name: Restore fuzz corpus
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: fuzz-corpus
           # A fresh key each run (so the updated corpus is always saved), falling
@@ -157,7 +157,7 @@ jobs:
 
       - name: Run each fuzzer briefly
         run: |
-          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch; do
+          for t in fuzz_frame fuzz_membership fuzz_control fuzz_semver fuzz_sealed fuzz_presence fuzz_user fuzz_holepunch fuzz_app; do
             echo "== $t =="
             mkdir -p "fuzz-corpus/$t"
             ./build-fuzz/fuzz/"$t" -max_total_time=30 -print_final_stats=1 \
