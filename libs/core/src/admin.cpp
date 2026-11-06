@@ -129,6 +129,14 @@ std::vector<std::uint8_t> encode_admin_user_remove(const PeerId& user_id) {
   return out;
 }
 
+std::vector<std::uint8_t> encode_admin_subscribe(const PeerId& user_id) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminOp::subscribe));
+  out.insert(out.end(), user_id.begin(), user_id.end());
+  return out;
+}
+
 std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> in) {
   Reader r(in);
   std::uint8_t ver = 0;
@@ -217,6 +225,15 @@ std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> i
         return std::nullopt;
       }
       req.op = AdminOp::user_remove;
+      std::copy(id.begin(), id.end(), req.recipient.begin());
+      return req;
+    }
+    case AdminOp::subscribe: {
+      std::span<const std::uint8_t> id;
+      if (!r.bytes(kIdLen, id) || !r.at_end()) {
+        return std::nullopt;
+      }
+      req.op = AdminOp::subscribe;
       std::copy(id.begin(), id.end(), req.recipient.begin());
       return req;
     }
@@ -453,6 +470,75 @@ std::optional<std::vector<AdminInboxMessage>> decode_admin_inbox(
     return std::nullopt;
   }
   return out;
+}
+
+std::vector<std::uint8_t> encode_admin_stream_message(const AdminStreamMessage& m) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminStreamKind::message));
+  out.insert(out.end(), m.sender_user.begin(), m.sender_user.end());
+  out.push_back(m.suite);
+  put_u16(out, m.type);
+  out.insert(out.end(), m.msg_id.begin(), m.msg_id.end());
+  put_u32(out, static_cast<std::uint32_t>(m.payload.size()));
+  out.insert(out.end(), m.payload.begin(), m.payload.end());
+  return out;
+}
+
+std::vector<std::uint8_t> encode_admin_stream_receipt(const AdminStreamReceipt& rr) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminStreamKind::receipt));
+  out.insert(out.end(), rr.msg_id.begin(), rr.msg_id.end());
+  return out;
+}
+
+std::optional<AdminStreamEvent> decode_admin_stream_event(
+    std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t ver = 0;
+  std::uint8_t kind = 0;
+  if (!r.u8(ver) || ver != kAdminVersion || !r.u8(kind)) {
+    return std::nullopt;
+  }
+  AdminStreamEvent ev;
+  switch (static_cast<AdminStreamKind>(kind)) {
+    case AdminStreamKind::message: {
+      std::span<const std::uint8_t> su;
+      std::uint8_t suite = 0;
+      std::uint16_t type = 0;
+      std::span<const std::uint8_t> mid;
+      std::uint32_t len = 0;
+      if (!r.bytes(kIdLen, su) || !r.u8(suite) || !r.u16(type) ||
+          !r.bytes(ev.message.msg_id.size(), mid) || !r.u32(len)) {
+        return std::nullopt;
+      }
+      if (len > kMaxAdminMessageBytes) {
+        return std::nullopt;
+      }
+      std::span<const std::uint8_t> body;
+      if (!r.bytes(len, body) || !r.at_end()) {
+        return std::nullopt;
+      }
+      ev.kind = AdminStreamKind::message;
+      std::copy(su.begin(), su.end(), ev.message.sender_user.begin());
+      ev.message.suite = suite;
+      ev.message.type = type;
+      std::copy(mid.begin(), mid.end(), ev.message.msg_id.begin());
+      ev.message.payload.assign(body.begin(), body.end());
+      return ev;
+    }
+    case AdminStreamKind::receipt: {
+      std::span<const std::uint8_t> mid;
+      if (!r.bytes(ev.receipt.msg_id.size(), mid) || !r.at_end()) {
+        return std::nullopt;
+      }
+      ev.kind = AdminStreamKind::receipt;
+      std::copy(mid.begin(), mid.end(), ev.receipt.msg_id.begin());
+      return ev;
+    }
+  }
+  return std::nullopt;  // unknown kind
 }
 
 std::vector<std::uint8_t> encode_admin_peers(

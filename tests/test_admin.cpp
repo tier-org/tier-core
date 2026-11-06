@@ -324,6 +324,59 @@ int main() {
     check(all_rejected, "every truncation of the response is rejected");
   }
 
+  // --- subscribe request round-trip --------------------------------------
+  {
+    tier::core::PeerId user{};
+    for (std::size_t i = 0; i < user.size(); ++i) user[i] = static_cast<std::uint8_t>(i + 3);
+    const auto enc = tier::core::encode_admin_subscribe(user);
+    const auto dec = tier::core::decode_admin_request(enc);
+    check(dec.has_value(), "subscribe request decodes");
+    check(dec && dec->op == tier::core::AdminOp::subscribe, "subscribe op");
+    check(dec && dec->recipient == user, "subscribe carries the user id");
+    auto trailing = enc;
+    trailing.push_back(0x00);
+    check(!tier::core::decode_admin_request(trailing).has_value(),
+          "trailing byte in subscribe rejected");
+  }
+
+  // --- stream message event round-trip -----------------------------------
+  {
+    tier::core::AdminStreamMessage m;
+    for (std::size_t i = 0; i < m.sender_user.size(); ++i)
+      m.sender_user[i] = static_cast<std::uint8_t>(0x20 + i);
+    m.suite = 2;
+    m.type = 0x0001;
+    for (std::size_t i = 0; i < m.msg_id.size(); ++i)
+      m.msg_id[i] = static_cast<std::uint8_t>(0x40 + i);
+    const std::string body = "stream body";
+    m.payload.assign(body.begin(), body.end());
+    const auto enc = tier::core::encode_admin_stream_message(m);
+    const auto ev = tier::core::decode_admin_stream_event(enc);
+    check(ev.has_value(), "stream message decodes");
+    check(ev && ev->kind == tier::core::AdminStreamKind::message, "kind message");
+    check(ev && ev->message.sender_user == m.sender_user, "sender_user round-trips");
+    check(ev && ev->message.suite == m.suite, "suite round-trips");
+    check(ev && ev->message.type == m.type, "type round-trips");
+    check(ev && ev->message.msg_id == m.msg_id, "msg_id round-trips");
+    check(ev && ev->message.payload == m.payload, "payload round-trips");
+    auto trailing = enc;
+    trailing.push_back(0x00);
+    check(!tier::core::decode_admin_stream_event(trailing).has_value(),
+          "trailing byte in stream message rejected");
+  }
+
+  // --- stream receipt event round-trip -----------------------------------
+  {
+    tier::core::AdminStreamReceipt rr;
+    for (std::size_t i = 0; i < rr.msg_id.size(); ++i)
+      rr.msg_id[i] = static_cast<std::uint8_t>(0x70 + i);
+    const auto enc = tier::core::encode_admin_stream_receipt(rr);
+    const auto ev = tier::core::decode_admin_stream_event(enc);
+    check(ev.has_value(), "stream receipt decodes");
+    check(ev && ev->kind == tier::core::AdminStreamKind::receipt, "kind receipt");
+    check(ev && ev->receipt.msg_id == rr.msg_id, "receipt msg_id round-trips");
+  }
+
   if (g_failures == 0) {
     std::puts("ok");
     return 0;

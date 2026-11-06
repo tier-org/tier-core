@@ -4,3 +4,6 @@
 [submodule "vendor/openssl"]
 	path = vendor/openssl
 	url = https://github.com/openssl/openssl.git
+[submodule "vendor/ftxui"]
+	path = vendor/ftxui
+	url = https://github.com/ArthurSonzogni/FTXUI.git

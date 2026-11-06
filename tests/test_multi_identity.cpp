@@ -51,6 +51,17 @@ void pump(std::vector<tier::net::Node*> nodes, int n) {
   }
 }
 
+// User messages are not buffered on the node (online-only): they arrive only
+// through on_message_received. This collector stands in for the old inbox - it
+// accumulates every delivered message so the checks can scan it.
+struct Inbox {
+  std::vector<tier::net::Node::ReceivedMessage> msgs;
+  void attach(tier::net::Node& n) {
+    n.on_message_received(
+        [this](const tier::net::Node::ReceivedMessage& m) { msgs.push_back(m); });
+  }
+};
+
 }  // namespace
 
 int main() {
@@ -62,6 +73,8 @@ int main() {
   // user is delivered straight into the inbox, attributed and addressed.
   {
     tier::net::Node host = make_node(Role::client);
+    Inbox host_inbox;
+    host_inbox.attach(host);
     const auto alice = host.add_user(tier::crypto::NodeIdentity::generate());
     const auto bob = host.add_user(tier::crypto::NodeIdentity::generate());
     check(host.has_user(alice) && host.has_user(bob), "both users hosted");
@@ -73,7 +86,7 @@ int main() {
     check(res == tier::net::Node::SendResult::queued, "local send_as_user queued");
 
     bool got = false;
-    for (const auto& m : host.take_inbox()) {
+    for (const auto& m : host_inbox.msgs) {
       if (m.plaintext == pt) {
         got = true;
         check(m.sender_user && *m.sender_user == alice, "loopback sender is alice");
@@ -101,6 +114,10 @@ int main() {
   tier::net::Node device1 = make_node(Role::client);
   tier::net::Node device2 = make_node(Role::client);
   tier::net::Node sender = make_node(Role::client);
+  Inbox d1_inbox;
+  Inbox d2_inbox;
+  d1_inbox.attach(device1);
+  d2_inbox.attach(device2);
 
   // One user on two devices (same user seed on both).
   const auto user = tier::crypto::NodeIdentity::generate();
@@ -155,9 +172,9 @@ int main() {
   auto all_true = [](const std::vector<bool>& v) {
     return std::all_of(v.begin(), v.end(), [](bool b) { return b; });
   };
-  auto drain = [&](tier::net::Node& dev, std::vector<bool>& flags,
+  auto drain = [&](const Inbox& inbox, std::vector<bool>& flags,
                    const tier::core::PeerId& want_recipient) {
-    for (const auto& m : dev.take_inbox()) {
+    for (const auto& m : inbox.msgs) {
       for (std::size_t i = 0; i < msgs.size(); ++i) {
         if (m.plaintext == msgs[i].pt) {
           flags[i] = true;
@@ -171,8 +188,8 @@ int main() {
   };
   for (int i = 0; i < 8000 && !(all_true(got1) && all_true(got2)); ++i) {
     pump(all, 1);
-    drain(device1, got1, user_id);
-    drain(device2, got2, user_id);
+    drain(d1_inbox, got1, user_id);
+    drain(d2_inbox, got2, user_id);
   }
   check(all_true(got1), "device 1 received all three user messages");
   check(all_true(got2), "device 2 received all three user messages");
@@ -182,6 +199,8 @@ int main() {
   // to the other devices must still receive it: the recipient's device set is
   // resolved repeatedly within the send window, not frozen at the first result.
   tier::net::Node device3 = make_node(Role::client);
+  Inbox d3_inbox;
+  d3_inbox.attach(device3);
   device3.add_user(from_same_seed(user));
   const auto late_pt = bytes("to-user late-enroll");
   {
@@ -197,7 +216,7 @@ int main() {
   bool got3 = false;
   for (int i = 0; i < 20000 && !got3; ++i) {
     pump(all3, 1);
-    for (const auto& m : device3.take_inbox()) {
+    for (const auto& m : d3_inbox.msgs) {
       if (m.plaintext == late_pt) {
         got3 = true;
         check(m.sender_user && *m.sender_user == sender_user_id,

@@ -27,6 +27,7 @@ enum class AdminOp : std::uint8_t {
   user_list = 7,    // list the user ids hosted on the node
   user_remove = 8,  // stop hosting a user identity
   send_as = 9,      // send from a local user to a user id (fans out to devices)
+  subscribe = 10,   // stream messages/receipts for a local user (push mode)
 };
 
 // Bumped to 2 when the embedded membership record grew a version field, to 3
@@ -35,11 +36,13 @@ enum class AdminOp : std::uint8_t {
 // first arrived (a single boot-time user), and to 7 when user identities became
 // runtime-managed: the user_add / user_list / user_remove ops, send_as (send
 // from a chosen local user to a user), the recipient user id in inbox messages,
-// and the id reply carrying the device id only (users are listed separately).
+// and the id reply carrying the device id only (users are listed separately),
+// and to 8 when the subscribe op and the daemon-to-client push event stream
+// (message / receipt, used by tier-messenger and `tierctl stream`) arrived.
 // tierctl and tierd ship together in one package, so the admin plane need not
 // stay compatible across versions, but the bump makes a mismatched pair fail
 // cleanly.
-inline constexpr std::uint8_t kAdminVersion = 7;
+inline constexpr std::uint8_t kAdminVersion = 8;
 
 // Largest application-message plaintext accepted over the admin socket. Ample
 // for text messages; a node-to-node sealed message can be larger (up to the
@@ -66,6 +69,7 @@ struct AdminPeersReply {
 // sending local user in `from_user` and the recipient user in `recipient`, plus
 // `suite`/`plaintext`. `user_remove` puts the user id in `recipient`. `user_add`
 // sets `has_seed`/`seed` (a 32-byte Ed25519 seed to import, else generate).
+// `subscribe` puts the local user id to stream in `recipient`.
 struct AdminRequest {
   AdminOp op{};
   PeerId recipient{};   // device id (send), recipient user (send_as), user (user_remove)
@@ -97,6 +101,12 @@ std::vector<std::uint8_t> encode_admin_user_add(
 
 // request (user_remove): [version:1][op:8][user_id:32]
 std::vector<std::uint8_t> encode_admin_user_remove(const PeerId& user_id);
+
+// request (subscribe): [version:1][op:10][user_id:32]. After the daemon accepts
+// it the connection stays open and carries push events (below), newest last,
+// until either side closes. The client sends this, then half-closes its write
+// side (SHUT_WR) and reads events.
+std::vector<std::uint8_t> encode_admin_subscribe(const PeerId& user_id);
 
 // Decode any admin request. std::nullopt on a wrong version, unknown op,
 // oversize plaintext (> kMaxAdminMessageBytes) or trailing bytes.
@@ -153,6 +163,48 @@ struct AdminInboxMessage {
 std::vector<std::uint8_t> encode_admin_inbox(
     const std::vector<AdminInboxMessage>& messages);
 std::optional<std::vector<AdminInboxMessage>> decode_admin_inbox(
+    std::span<const std::uint8_t> in);
+
+// --- subscription push events (daemon -> client, on a subscribed connection) -
+// Each event is one self-contained record. The daemon writes them back to back;
+// a client frames them with an outer length prefix (handled at the call sites,
+// not here). `message` is a chat-visible application message delivered to the
+// subscribed user; `receipt` marks a msg_id the user previously sent as
+// delivered to a live peer. The subscribed user is implicit (the connection's),
+// so it is not repeated in the event.
+enum class AdminStreamKind : std::uint8_t {
+  message = 1,
+  receipt = 2,
+};
+
+struct AdminStreamMessage {
+  PeerId sender_user{};                 // authenticated sending user
+  std::uint8_t suite = 0;               // transport suite it arrived under
+  std::uint16_t type = 0;               // application type (tier::app::AppType)
+  std::array<std::uint8_t, 16> msg_id{};
+  std::vector<std::uint8_t> payload;    // application payload (e.g. UTF-8 text)
+};
+
+struct AdminStreamReceipt {
+  std::array<std::uint8_t, 16> msg_id{};  // the delivered message's id
+};
+
+// A decoded push event: exactly one of the members is meaningful per `kind`.
+struct AdminStreamEvent {
+  AdminStreamKind kind{};
+  AdminStreamMessage message;
+  AdminStreamReceipt receipt;
+};
+
+// message event:
+//   [version:1][kind:1=1][sender_user:32][suite:1][type:2 BE][msg_id:16]
+//   [len:4 BE][payload]
+std::vector<std::uint8_t> encode_admin_stream_message(const AdminStreamMessage& m);
+// receipt event: [version:1][kind:1=2][msg_id:16]
+std::vector<std::uint8_t> encode_admin_stream_receipt(const AdminStreamReceipt& r);
+// Decode one event record (no outer length prefix). std::nullopt on a wrong
+// version, unknown kind, oversize payload, or trailing bytes.
+std::optional<AdminStreamEvent> decode_admin_stream_event(
     std::span<const std::uint8_t> in);
 
 // peers response:

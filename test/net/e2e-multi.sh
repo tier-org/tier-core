@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Multi-identity gate (see docs/multi-identity.md). Two communicators, two client
-# "devices" that share one user identity, and a separate "sender" client with its
-# own user identity. User identities are created at runtime over the admin socket
-# (`tierctl user add <seed>`), not via configuration: the two devices import the
-# same seed (so they host the one user id on two distinct devices), the sender
-# imports its own. The sender then sends from its user to the shared user id and
-# both devices must receive the message, each showing the sender's user id. No
-# device has a prior connection to any other. Non-zero exit means discovery or
-# delivery failed.
+# Multi-identity gate (see docs/multi-identity.md, docs/app-protocol.md). Two
+# communicators, two client "devices" that share one user identity, and a
+# separate "sender" client with its own user identity. User identities are
+# created at runtime over the admin socket (`tierctl user add <seed>`): the two
+# devices import the same seed (so they host the one user id on two distinct
+# devices), the sender imports its own.
+#
+# User messages are not buffered on a node (online-only); they are delivered to
+# a live subscriber. So each device subscribes with `tierctl stream <user>`
+# (detached, output captured in the container) BEFORE the send. The sender then
+# sends from its user to the shared user id; both devices must receive every
+# message, each showing the sender's user id and being addressed as the shared
+# user, and the sender's own stream must show delivery receipts coming back.
+# Non-zero exit means discovery, delivery, or the receipt path failed.
 #
 # Env:
 #   CONVERGE_TIMEOUT   seconds to wait for the clients to attach (default 40).
@@ -54,6 +59,15 @@ add_user() {  # $1 = service, $2 = seed hex -> prints user id
     | sed -n 's/^user \([0-9a-f]\{64\}\).*/\1/p' | head -n1
 }
 
+# Start a detached `tierctl stream <user>` inside a container, capturing its
+# output to a file there. The subscription must exist before any send.
+start_stream() {  # $1 = service, $2 = user id
+  compose exec -d "$1" sh -c "tierctl stream $2 > /tmp/stream.log 2>&1"
+}
+read_stream() {  # $1 = service -> prints captured stream so far
+  compose exec -T "$1" cat /tmp/stream.log 2>/dev/null || true
+}
+
 echo "== waiting up to ${converge_timeout}s for the clients to attach =="
 start=$(date +%s)
 while :; do
@@ -89,6 +103,12 @@ fi
 echo "shared user id = $ua"
 echo "sender user id = $sender_user"
 
+# Subscribe before sending: user messages are delivered only to a live
+# subscriber. The sender subscribes too, to receive delivery receipts.
+start_stream devicea "$ua"
+start_stream deviceb "$ua"
+start_stream sender "$sender_user"
+
 # Let the user enrollments settle on the communicators.
 sleep "$settle_seconds"
 
@@ -107,28 +127,26 @@ for suite in $suites; do
   fi
 done
 
-# Accumulate each device's inbox until all three markers show up or we time out.
-collect() {  # $1 = service
-  local acc="" got deadline
+# Wait until each device's stream shows all three markers, or we time out.
+wait_for_markers() {  # $1 = service
+  local got deadline
   deadline=$(( $(date +%s) + message_timeout ))
   while :; do
-    got="$(compose exec -T "$1" tierctl inbox 2>/dev/null || true)"
-    acc="$acc
-$got"
+    got="$(read_stream "$1")"
     local have_all=1
     for suite in $suites; do
-      printf '%s\n' "$acc" | grep -q "$(marker_for "$suite")" || have_all=0
+      printf '%s\n' "$got" | grep -q "$(marker_for "$suite")" || have_all=0
     done
     [ "$have_all" = 1 ] && break
     [ "$(date +%s)" -ge "$deadline" ] && break
     sleep 1
   done
-  printf '%s' "$acc"
 }
 
 for dev in devicea deviceb; do
-  echo "---- $dev inbox ----"
-  acc="$(collect "$dev")"
+  echo "---- $dev stream ----"
+  wait_for_markers "$dev"
+  acc="$(read_stream "$dev")"
   printf '%s\n' "$acc" | grep -E '^from ' || true
   for suite in $suites; do
     if printf '%s\n' "$acc" | grep -q "suite=$suite.*$(marker_for "$suite")"; then
@@ -154,9 +172,23 @@ for dev in devicea deviceb; do
   fi
 done
 
+# The sender's stream must show delivery receipts coming back (one per message
+# the recipient's node delivered to a live subscriber).
+echo "---- sender stream (receipts) ----"
+sender_acc="$(read_stream sender)"
+printf '%s\n' "$sender_acc" | grep -E '^receipt ' || true
+receipts="$(printf '%s\n' "$sender_acc" | grep -c '^receipt ' || true)"
+if [ "${receipts:-0}" -ge 1 ]; then
+  echo "sender received $receipts delivery receipt(s)"
+else
+  echo "FAIL: sender received no delivery receipts"
+  failures=$((failures + 1))
+fi
+
 echo
 if [ "$failures" -eq 0 ]; then
-  echo "multi-identity e2e OK: a user on two devices both received, attributed to the sender's user"
+  echo "multi-identity e2e OK: a user on two devices both received over the live"
+  echo "stream, attributed to the sender's user, and the sender saw receipts"
   exit 0
 fi
 echo "multi-identity e2e FAILED: $failures check(s) failed"

@@ -7,13 +7,17 @@
 
 #include <array>
 #include <cerrno>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
 
+#include "tier/app/frame.hpp"
 #include "tier/core/admin.hpp"
 #include "tier/core/membership.hpp"
 
@@ -294,14 +298,29 @@ int cmd_send_as(const std::string& path, std::string_view from_hex,
     std::fprintf(stderr, "invalid suite (expected classical|hybrid|pq)\n");
     return 2;
   }
-  const std::vector<std::uint8_t> pt(message.begin(), message.end());
-  if (pt.size() > tier::core::kMaxAdminMessageBytes) {
+  // Wrap the text in a layer-2 application frame (type text, wanting a delivery
+  // receipt, with a random correlation id). The recipient node routes it to the
+  // recipient user's live subscriber and, on delivery, returns a receipt. See
+  // docs/app-protocol.md.
+  tier::app::AppFrame frame;
+  frame.type = tier::app::AppType::text;
+  frame.flags = tier::app::kFlagWantsReceipt;
+  {
+    std::random_device rd;
+    for (auto& b : frame.msg_id) {
+      b = static_cast<std::uint8_t>(rd());
+    }
+  }
+  frame.payload.assign(message.begin(), message.end());
+  const auto framed = tier::app::encode_app_frame(frame);
+  if (framed.size() > tier::core::kMaxAdminMessageBytes) {
     std::fprintf(stderr, "message too large (max %zu bytes)\n",
-                 tier::core::kMaxAdminMessageBytes);
+                 tier::core::kMaxAdminMessageBytes - 20);
     return 2;
   }
   const auto req = tier::core::encode_admin_send_as(
-      *from, *to, *suite, std::span<const std::uint8_t>(pt.data(), pt.size()));
+      *from, *to, *suite,
+      std::span<const std::uint8_t>(framed.data(), framed.size()));
   std::vector<std::uint8_t> reply;
   if (!query_bytes(path, req, reply)) {
     return 1;
@@ -417,6 +436,106 @@ int cmd_inbox(const std::string& path) {
   return 0;
 }
 
+std::string short_hex(const std::array<std::uint8_t, 16>& id) {
+  static const char* const hex = "0123456789abcdef";
+  std::string out;
+  for (std::size_t i = 0; i < 8; ++i) {  // first 8 bytes
+    out += hex[id[i] >> 4];
+    out += hex[id[i] & 0x0F];
+  }
+  return out;
+}
+
+// Subscribe as a local user and print the push event stream (chat messages and
+// delivery receipts) until the daemon closes or this process is stopped. This
+// is the observation path for user messages (they are not buffered in the
+// inbox); tier-messenger uses the same protocol. See docs/app-protocol.md.
+int cmd_stream(const std::string& path, std::string_view user_hex) {
+  const auto user = parse_peer_id(user_hex);
+  if (!user) {
+    std::fprintf(stderr, "invalid user id (expected 64 hex chars)\n");
+    return 2;
+  }
+
+  const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0) {
+    std::perror("socket");
+    return 1;
+  }
+  sockaddr_un addr{};
+  addr.sun_family = AF_UNIX;
+  if (path.size() + 1 > sizeof(addr.sun_path)) {
+    std::fprintf(stderr, "socket path too long: %s\n", path.c_str());
+    ::close(fd);
+    return 1;
+  }
+  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+    std::fprintf(stderr, "cannot connect to tierd at %s: %s\n", path.c_str(),
+                 std::strerror(errno));
+    ::close(fd);
+    return 1;
+  }
+
+  const auto req = tier::core::encode_admin_subscribe(*user);
+  if (::send(fd, req.data(), req.size(), 0) != static_cast<ssize_t>(req.size())) {
+    std::perror("send");
+    ::close(fd);
+    return 1;
+  }
+  ::shutdown(fd, SHUT_WR);  // half-close write; the daemon keeps pushing events
+
+  const std::string me = short_id(*user);
+  std::printf("streaming for user %s\n", me.c_str());
+  std::fflush(stdout);
+
+  // Events arrive as [u32 BE len][record]; accumulate and decode whole records.
+  std::vector<std::uint8_t> buf;
+  std::array<std::uint8_t, 4096> tmp{};
+  for (;;) {
+    const ssize_t n = ::recv(fd, tmp.data(), tmp.size(), 0);
+    if (n < 0) {
+      std::perror("recv");
+      ::close(fd);
+      return 1;
+    }
+    if (n == 0) {
+      break;  // daemon closed the stream
+    }
+    buf.insert(buf.end(), tmp.data(), tmp.data() + n);
+    for (;;) {
+      if (buf.size() < 4) {
+        break;
+      }
+      const std::uint32_t len = (static_cast<std::uint32_t>(buf[0]) << 24) |
+                                (static_cast<std::uint32_t>(buf[1]) << 16) |
+                                (static_cast<std::uint32_t>(buf[2]) << 8) |
+                                static_cast<std::uint32_t>(buf[3]);
+      if (buf.size() < 4 + len) {
+        break;  // record not fully arrived yet
+      }
+      const auto ev = tier::core::decode_admin_stream_event(
+          std::span<const std::uint8_t>(buf.data() + 4, len));
+      if (ev) {
+        if (ev->kind == tier::core::AdminStreamKind::message) {
+          const std::string text(ev->message.payload.begin(),
+                                 ev->message.payload.end());
+          std::printf("from user %s  to-user %s  suite=%s  type=0x%04x  %zu bytes: %s\n",
+                      short_id(ev->message.sender_user).c_str(), me.c_str(),
+                      suite_name(ev->message.suite), ev->message.type,
+                      ev->message.payload.size(), text.c_str());
+        } else {
+          std::printf("receipt %s\n", short_hex(ev->receipt.msg_id).c_str());
+        }
+        std::fflush(stdout);
+      }
+      buf.erase(buf.begin(), buf.begin() + 4 + static_cast<std::ptrdiff_t>(len));
+    }
+  }
+  ::close(fd);
+  return 0;
+}
+
 int usage() {
   std::fputs(
       "usage: tierctl [--sock <path>] <command>\n"
@@ -434,7 +553,9 @@ int usage() {
       "  send-user <from-user> <to-user> [suite] <message>\n"
       "                             send from a local user to a user (fans out to "
       "its online devices)\n"
-      "  inbox                      print and drain received messages\n"
+      "  stream <user-id>           subscribe as a local user and print its "
+      "message/receipt stream\n"
+      "  inbox                      print and drain received node messages\n"
       "\n"
       "The socket defaults to " "/run/tierd/tierd.sock"
       ", or $TIER_ADMIN_SOCK.\n",
@@ -514,6 +635,12 @@ int main(int argc, char** argv) {
     if (positional.size() == 5) {
       return cmd_send_as(path, positional[1], positional[2], positional[3],
                          positional[4]);
+    }
+    return usage();
+  }
+  if (command == "stream") {
+    if (positional.size() == 2) {
+      return cmd_stream(path, positional[1]);
     }
     return usage();
   }

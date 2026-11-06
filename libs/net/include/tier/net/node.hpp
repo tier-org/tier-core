@@ -144,11 +144,14 @@ class Node {
       const tier::core::PeerId& from_user, const tier::core::PeerId& to_user,
       tier::msg::Suite suite, std::span<const tier::crypto::Byte> plaintext);
 
-  // Remove and return every message received since the last call.
+  // Remove and return every plain node (device-to-device) message received
+  // since the last call. User messages are not buffered here (online-only, see
+  // docs/app-protocol.md); observe them through on_message_received.
   [[nodiscard]] std::vector<ReceivedMessage> take_inbox();
 
-  // Invoked for each decrypted message as it arrives (in addition to the
-  // inbox). Optional.
+  // Invoked for each decrypted message as it arrives. This is the only delivery
+  // path for user messages (which are not buffered); node messages also go to
+  // take_inbox. Optional.
   void on_message_received(std::function<void(const ReceivedMessage&)> cb);
 
   // Invoked whenever a membership entry is newly learned or updated by a merge.

@@ -21,6 +21,9 @@
 #include <system_error>
 #include <vector>
 
+#include "tier/app/dispatcher.hpp"
+#include "tier/app/frame.hpp"
+#include "tier/app/handler.hpp"
 #include "tier/core/admin.hpp"
 #include "tier/core/membership.hpp"
 #include "tier/core/seeds.hpp"
@@ -32,6 +35,7 @@
 #include "tier/net/admin_listener.hpp"
 #include "tier/net/endpoint.hpp"
 #include "tier/net/node.hpp"
+#include "tier/net/subscriber_hub.hpp"
 
 #include "config.hpp"
 
@@ -471,6 +475,54 @@ void load_users(tier::net::Node& node, const std::string& dir) {
   }
 }
 
+// Bridges the application dispatcher (layer 2) to the node and the subscriber
+// hub: it delivers chat messages and receipts to a user's live subscribers
+// (tier-messenger, `tierctl stream`) and sends frames via the node when a
+// handler emits one (e.g. a delivery receipt). See docs/app-protocol.md.
+class DaemonAppContext final : public tier::app::AppContext {
+ public:
+  DaemonAppContext(tier::net::Node& node, tier::net::SubscriberHub& hub)
+      : node_(node), hub_(hub) {}
+
+  bool deliver_message(const tier::core::PeerId& local_user,
+                       const tier::core::PeerId& sender_user,
+                       tier::msg::Suite suite,
+                       const tier::app::AppFrame& frame) override {
+    tier::core::AdminStreamMessage m;
+    m.sender_user = sender_user;
+    m.suite = static_cast<std::uint8_t>(suite);
+    m.type = static_cast<std::uint16_t>(frame.type);
+    m.msg_id = frame.msg_id;
+    m.payload = frame.payload;
+    const auto rec = tier::core::encode_admin_stream_message(m);
+    return hub_.publish(local_user,
+                        std::span<const std::uint8_t>(rec.data(), rec.size())) > 0;
+  }
+
+  bool deliver_receipt(
+      const tier::core::PeerId& local_user,
+      const std::array<std::uint8_t, tier::app::kMsgIdLen>& msg_id) override {
+    tier::core::AdminStreamReceipt r;
+    r.msg_id = msg_id;
+    const auto rec = tier::core::encode_admin_stream_receipt(r);
+    return hub_.publish(local_user,
+                        std::span<const std::uint8_t>(rec.data(), rec.size())) > 0;
+  }
+
+  void send_as(const tier::core::PeerId& from_user,
+               const tier::core::PeerId& to_user, tier::msg::Suite suite,
+               const tier::app::AppFrame& frame) override {
+    const auto bytes = tier::app::encode_app_frame(frame);
+    (void)node_.send_as_user(
+        from_user, to_user, suite,
+        std::span<const tier::crypto::Byte>(bytes.data(), bytes.size()));
+  }
+
+ private:
+  tier::net::Node& node_;
+  tier::net::SubscriberHub& hub_;
+};
+
 int usage() {
   std::fputs(
       "usage:\n"
@@ -631,6 +683,32 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   const std::string users_dir = resolve_users_dir();
   load_users(node, users_dir);
 
+  // Application layer (layer 2, see docs/app-protocol.md). The hub holds live
+  // subscriber connections; the dispatcher routes incoming user messages to the
+  // built-in handlers through the daemon context. Node (device-to-device)
+  // messages are untouched: they stay in the node inbox for `tierctl inbox`.
+  tier::net::SubscriberHub hub;
+  tier::app::AppDispatcher dispatcher;
+  dispatcher.register_handler(tier::app::make_text_handler());
+  dispatcher.register_handler(tier::app::make_receipt_handler());
+  DaemonAppContext app_ctx(node, hub);
+  // A user message is not buffered on the node; it arrives here and is enqueued
+  // for the dispatcher, which delivers it to the recipient user's subscribers or
+  // drops it (online-only). A plain node message carries no sender_user and is
+  // ignored here (it is in the inbox already).
+  node.on_message_received(
+      [&dispatcher](const tier::net::Node::ReceivedMessage& m) {
+        if (!m.sender_user || !m.recipient_user) {
+          return;
+        }
+        tier::app::RawUserMessage raw;
+        raw.sender_user = *m.sender_user;
+        raw.recipient_user = *m.recipient_user;
+        raw.suite = m.suite;
+        raw.frame_bytes = m.plaintext;
+        dispatcher.enqueue(std::move(raw));
+      });
+
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
     if (peer.id == self) {
@@ -776,17 +854,33 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
         }
         return tier::core::encode_admin_inbox(out);
       }
+      case tier::core::AdminOp::subscribe:
+        // Handled by the subscribe hook (the connection is kept open); if it
+        // ever reaches here, close the connection with no reply.
+        return {};
     }
     return {};
   };
 
   // Periodically report how many peers we know of versus how many we actually
   // hold a connection to, so mesh formation is visible at a glance.
+  // A subscribe request's connection is kept open and handed to the hub, keyed
+  // by the local user it streams. A user hosted here can be subscribed to even
+  // before it is added; delivery just finds no subscriber until one attaches.
+  const auto subscribe_hook = [&hub](const tier::core::AdminRequest& req,
+                                     int fd) -> bool {
+    hub.add(req.recipient, fd);
+    return true;
+  };
+
   auto last_status = std::chrono::steady_clock::now();
   for (;;) {
     node.poll(200);
+    // Route any user messages that arrived during the poll to their handlers
+    // (delivering to live subscribers, emitting receipts). Sequential for now.
+    dispatcher.drain(app_ctx);
     if (admin) {
-      admin->serve(admin_handler);
+      admin->serve(admin_handler, subscribe_hook);
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - last_status >= std::chrono::seconds(2)) {

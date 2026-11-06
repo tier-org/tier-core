@@ -47,9 +47,33 @@ enable_testing()
 add_subdirectory(libs/core)
 add_subdirectory(libs/crypto)
 add_subdirectory(libs/msg)
+add_subdirectory(libs/app)
 add_subdirectory(libs/net)
 add_subdirectory(apps/node)
 add_subdirectory(apps/cli)
+
+# tier-messenger: an interactive TUI client (FTXUI) with a local SQLite store.
+# Built and packaged by default, like tierd and tierctl; it needs the vendored
+# FTXUI (a submodule) and SQLite. CI and the release both check out submodules
+# recursively, so this builds everywhere. Set -DTIER_MESSENGER=OFF to skip it
+# (e.g. a minimal node-only build with no FTXUI).
+option(TIER_MESSENGER "Build the tier-messenger TUI client" ON)
+if(TIER_MESSENGER)
+  if(NOT EXISTS "${CMAKE_SOURCE_DIR}/vendor/ftxui/CMakeLists.txt")
+    message(FATAL_ERROR
+      "TIER_MESSENGER is ON but vendor/ftxui is empty; run "
+      "`git submodule update --init vendor/ftxui` (or configure with "
+      "-DTIER_MESSENGER=OFF for a node-only build)")
+  endif()
+  set(FTXUI_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+  set(FTXUI_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+  set(FTXUI_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(FTXUI_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(vendor/sqlite)
+  add_subdirectory(vendor/ftxui)
+  add_subdirectory(apps/messenger)
+endif()
+
 add_subdirectory(tests)
 
 if(TIER_FUZZ)

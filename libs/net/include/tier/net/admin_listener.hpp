@@ -22,6 +22,13 @@ class AdminListener {
   using Handler =
       std::function<std::vector<std::uint8_t>(const tier::core::AdminRequest&)>;
 
+  // Called for a `subscribe` request with the open connection fd. Returning
+  // true transfers ownership of the fd to the callee (the daemon's subscriber
+  // hub); the listener then leaves the connection open instead of closing it.
+  // Returning false (or no hook) falls through to the normal handler + close.
+  using SubscribeHook =
+      std::function<bool(const tier::core::AdminRequest&, int fd)>;
+
   // Bind and listen on `path` (any stale socket file is removed first). Throws
   // std::runtime_error on failure so the daemon can decide to run without admin.
   explicit AdminListener(std::string path);
@@ -32,7 +39,10 @@ class AdminListener {
   AdminListener& operator=(AdminListener&&) = delete;
 
   // Accept and fully serve up to `max_conns` pending connections, then return.
-  void serve(const Handler& handler, int max_conns = 4);
+  // A `subscribe` request is offered to `on_subscribe` (if set); when that takes
+  // the fd, the connection is kept open for the daemon to push events on.
+  void serve(const Handler& handler, const SubscribeHook& on_subscribe = {},
+             int max_conns = 4);
 
  private:
   int fd_ = -1;

@@ -55,3 +55,10 @@ add_executable(fuzz_holepunch fuzz_holepunch.cpp)
 target_link_libraries(fuzz_holepunch PRIVATE tier::msg tier::crypto tier::core tier::options)
 target_compile_options(fuzz_holepunch PRIVATE -fsanitize=fuzzer)
 target_link_options(fuzz_holepunch PRIVATE -fsanitize=fuzzer)
+
+# Decoders of the application frame (layer 2, remote-controlled inner plaintext)
+# and the admin stream-event push records.
+add_executable(fuzz_app fuzz_app.cpp)
+target_link_libraries(fuzz_app PRIVATE tier::app tier::core tier::options)
+target_compile_options(fuzz_app PRIVATE -fsanitize=fuzzer)
+target_link_options(fuzz_app PRIVATE -fsanitize=fuzzer)

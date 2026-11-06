@@ -800,7 +800,13 @@ void Node::handle_sealed(const PeerId& sender_key,
   if (on_message_received_) {
     on_message_received_(rx);
   }
-  inbox_.push_back(std::move(rx));
+  // Only plain node (device-to-device) messages are buffered for `tierctl
+  // inbox`. A user message is not stored on the node: it is emitted via the
+  // callback to the application layer, which delivers it to a live subscriber
+  // or drops it (online-only - see docs/app-protocol.md).
+  if (kind == kAppKindNode) {
+    inbox_.push_back(std::move(rx));
+  }
 }
 
 std::vector<tier::core::PeerId> Node::live_communicators() const {
@@ -1300,10 +1306,11 @@ Node::SendResult Node::send_as_user(const tier::core::PeerId& from_user,
     rx.sender_user = from_user;
     rx.recipient_user = to_user;
     rx.plaintext.assign(plaintext.begin(), plaintext.end());
+    // User messages are not buffered on the node; the loopback copy is emitted
+    // via the callback to the application layer, same as a networked one.
     if (on_message_received_) {
       on_message_received_(rx);
     }
-    inbox_.push_back(std::move(rx));
     pending.delivered.insert(self_id_);
   }
 

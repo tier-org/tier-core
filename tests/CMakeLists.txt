@@ -49,6 +49,10 @@ add_executable(test_user test_user.cpp)
 target_link_libraries(test_user PRIVATE tier::msg tier::crypto tier::core tier::options)
 add_test(NAME user COMMAND test_user)
 
+add_executable(test_app test_app.cpp)
+target_link_libraries(test_app PRIVATE tier::app tier::msg tier::core tier::options)
+add_test(NAME app COMMAND test_app)
+
 add_executable(test_rendezvous test_rendezvous.cpp)
 target_link_libraries(test_rendezvous PRIVATE tier::net tier::core tier::crypto tier::options)
 add_test(NAME rendezvous COMMAND test_rendezvous)
@@ -165,3 +169,11 @@ add_executable(test_admin_listener test_admin_listener.cpp)
 target_link_libraries(test_admin_listener PRIVATE tier::net tier::core tier::options)
 add_test(NAME admin_listener COMMAND test_admin_listener)
 set_tests_properties(admin_listener PROPERTIES TIMEOUT 30)
+
+# tier-messenger core (store + stream parser), only when the client is built.
+if(TIER_MESSENGER)
+  add_executable(test_messenger_store test_messenger_store.cpp)
+  target_link_libraries(test_messenger_store
+    PRIVATE tier::messenger_core tier::core tier::options)
+  add_test(NAME messenger_store COMMAND test_messenger_store)
+endif()

@@ -100,6 +100,15 @@ addressable and fanning the message out to the recipient's online devices (a
 recipient hosted on the same node is delivered locally). With no message storage
 in this version, both sender and recipient must be online.
 
+On top of the user layer sits an application protocol (layer 2, see
+docs/app-protocol.md): a user message carries a typed frame (today `text` and
+`delivery_receipt`), routed on the node by a per-type handler. A user message is
+not buffered - it is delivered to a live subscriber or dropped (online-only), so
+`tierctl inbox` is now node-to-node only and a user's stream is observed with
+`tierctl stream <user-id>`. A delivered `text` returns a receipt to the sender.
+New message types (transfers, call invites) are added as independent handlers
+under that protocol; `tier-messenger` is the interactive client built on it.
+
 Still future work: offline store-and-forward (keeper-backed, so an offline
 device can catch up), forward-secret sessions (a ratchet) and group messaging.
 The sealing itself is independent of how a message is carried. Per-message ephemeral X25519
@@ -138,6 +147,27 @@ statically into the binary.
 AddressSanitizer and UndefinedBehaviorSanitizer are on by default
 (`-DTIER_SANITIZE=OFF` to disable). Warnings are errors by default
 (`-DTIER_WERROR=OFF` to relax). Fuzz targets build with `-DTIER_FUZZ=ON` under Clang.
+
+### tier-messenger (interactive TUI client)
+
+A terminal messenger (FTXUI + a local SQLite store) built on the application
+protocol (docs/app-protocol.md). It is built and shipped by default alongside
+`tierd` and `tierctl` (it is in the release `.deb`); the normal build above
+produces it. Set `-DTIER_MESSENGER=OFF` for a minimal node-only build with no
+FTXUI. The vendored FTXUI is a submodule, so a fresh checkout needs:
+
+    git submodule update --init --recursive
+    cmake -S . -B build && cmake --build build -j   # builds tier-messenger too
+
+Run it against a local `tierd`: it connects to the admin socket, lets you pick
+(or create) which hosted user identity to chat as, add counterparties by id with
+an alias, open chats and send messages. All contacts, aliases and history live
+in the client's SQLite store (`$XDG_DATA_HOME/tier-messenger/store.db`, override
+with `--db`); the node stores nothing. Incoming messages arrive over the live
+subscription stream and outgoing ones show a delivered mark when a receipt comes
+back. `--sock` overrides the admin socket, `--as <user-id>` picks the identity.
+SQLite is vendored as the public-domain amalgamation under `vendor/sqlite`;
+FTXUI (MIT) is the `vendor/ftxui` submodule.
 
 ### Release (static) binary
 
@@ -312,12 +342,13 @@ The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
 
     sudo tierctl id           # this node's device id (64 hex)
     sudo tierctl peers        # the node's view of the mesh: known vs connected
-    sudo tierctl inbox        # print and drain encrypted messages received
+    sudo tierctl inbox        # print and drain received node (device) messages
     sudo tierctl send <peer-id> [classical|hybrid|pq] <message>
     sudo tierctl user add [seed]      # host a user identity (prints its user id)
     sudo tierctl user ls              # list hosted user ids
     sudo tierctl user rm <user-id>    # stop hosting a user identity
     sudo tierctl send-user <from-user> <to-user> [classical|hybrid|pq] <message>
+    sudo tierctl stream <user-id>     # watch a local user's message/receipt stream
 
 `send` encrypts a message end-to-end (see "Encrypted messaging" below);
 `<peer-id>` is the recipient's full 64-hex id - get it from `tierctl id` on that
@@ -326,9 +357,11 @@ suite defaults to `hybrid`. If the peer is not already connected, the node
 resolves it through a communicator and connects on demand, so `send` reports the
 message accepted (sent or queued). `send-user` instead sends from one of this
 node's hosted users (`user add`/`ls`/`rm` manage them at runtime) to a user id,
-fanning out to that user's online devices; `inbox` prints each received message
-with its authenticated sender (and, for a user message, the sending user and the
-local user it was addressed to) and suite, then clears the queue.
+fanning out to that user's online devices. `inbox` prints each received node
+(device-to-device) message with its authenticated sender and suite, then clears
+the queue; user messages are not buffered there (online-only), so `stream`
+subscribes as a local user and prints its live message and delivery-receipt
+stream instead (see docs/app-protocol.md).
 
 The header reports the node's own network (the cluster it joined) and the known
 versus connected counts. Each row is a peer: short id, whether a live connection

@@ -85,7 +85,8 @@ AdminListener::~AdminListener() {
   }
 }
 
-void AdminListener::serve(const Handler& handler, int max_conns) {
+void AdminListener::serve(const Handler& handler,
+                          const SubscribeHook& on_subscribe, int max_conns) {
   for (int i = 0; i < max_conns; ++i) {
     const int conn = ::accept4(fd_, nullptr, nullptr, SOCK_CLOEXEC);
     if (conn < 0) {
@@ -115,6 +116,12 @@ void AdminListener::serve(const Handler& handler, int max_conns) {
       const auto request = tier::core::decode_admin_request(
           std::span<const std::uint8_t>(req.data(), req.size()));
       if (request) {
+        // A subscribe request turns the connection into a push stream: hand the
+        // fd to the hook and, if it takes it, leave the connection open.
+        if (request->op == tier::core::AdminOp::subscribe && on_subscribe &&
+            on_subscribe(*request, conn)) {
+          continue;  // ownership transferred; do not close
+        }
         const std::vector<std::uint8_t> reply = handler(*request);
         if (!reply.empty()) {
           write_all(conn, reply);
