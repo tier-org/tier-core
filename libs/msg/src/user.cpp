@@ -154,11 +154,14 @@ bool verify_device_credential(std::string_view network,
 }
 
 std::vector<Byte> make_user_envelope(const tier::crypto::Ed25519PublicKey& sender_user_pub,
-                                     ByteSpan credential, ByteSpan inner_plaintext) {
+                                     ByteSpan credential,
+                                     const tier::core::PeerId& recipient_user_id,
+                                     ByteSpan inner_plaintext) {
   std::vector<Byte> out;
   put_bytes(out, ByteSpan(sender_user_pub.data(), sender_user_pub.size()));
   put_u16(out, static_cast<std::uint16_t>(credential.size()));
   put_bytes(out, credential);
+  put_bytes(out, ByteSpan(recipient_user_id.data(), recipient_user_id.size()));
   put_bytes(out, inner_plaintext);
   return out;
 }
@@ -181,9 +184,15 @@ std::optional<OpenedUser> open_user_envelope(std::string_view network,
     return std::nullopt;
   }
 
+  tier::core::PeerId recipient{};
+  ByteSpan rcpt;
+  if (!r.take(recipient.size(), rcpt)) return std::nullopt;
+  std::memcpy(recipient.data(), rcpt.data(), recipient.size());
+
   const ByteSpan inner = r.rest();
   OpenedUser out;
   out.sender_user_id = id_of(user_pub);
+  out.recipient_user_id = recipient;
   out.plaintext.assign(inner.begin(), inner.end());
   return out;
 }

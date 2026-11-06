@@ -1,8 +1,10 @@
-// Multi-identity end to end (see docs/multi-identity.md). One user is attached
-// to two devices; both enroll under the user via a communicator. A separate
-// sender, with its own user identity, sends to the user id - and the message
-// reaches both of the user's online devices, each authenticated as coming from
-// the sender's user id (not merely a device).
+// Multi-identity end to end (see docs/multi-identity.md). Users are hosted on
+// nodes at runtime (many per node), messages are sent from one user to another,
+// and each delivery is authenticated as coming from the sender's user id and
+// routed to the addressed recipient user. Covers: one user on two devices (fan
+// out to both), a device that enrolls after the send (resolved repeatedly), two
+// users co-resident on one node (local loopback), and the guard that a node
+// cannot send as a user it does not host.
 #include <algorithm>
 #include <cstdio>
 #include <string>
@@ -55,26 +57,62 @@ int main() {
   using tier::core::Role;
   using tier::msg::Suite;
 
+  // --- co-resident: two users on one node message each other (loopback) ------
+  // No communicator, no network: a send from one local user to another local
+  // user is delivered straight into the inbox, attributed and addressed.
+  {
+    tier::net::Node host = make_node(Role::client);
+    const auto alice = host.add_user(tier::crypto::NodeIdentity::generate());
+    const auto bob = host.add_user(tier::crypto::NodeIdentity::generate());
+    check(host.has_user(alice) && host.has_user(bob), "both users hosted");
+    check(host.user_ids().size() == 2, "node reports two hosted users");
+
+    const auto pt = bytes("alice -> bob, same box");
+    const auto res = host.send_as_user(
+        alice, bob, Suite::hybrid, std::span<const Byte>(pt.data(), pt.size()));
+    check(res == tier::net::Node::SendResult::queued, "local send_as_user queued");
+
+    bool got = false;
+    for (const auto& m : host.take_inbox()) {
+      if (m.plaintext == pt) {
+        got = true;
+        check(m.sender_user && *m.sender_user == alice, "loopback sender is alice");
+        check(m.recipient_user && *m.recipient_user == bob,
+              "loopback recipient is bob");
+      }
+    }
+    check(got, "co-resident user received the loopback message");
+
+    // A node cannot send as a user it does not host.
+    tier::net::Node other = make_node(Role::client);
+    const auto probe = bytes("x");
+    const auto bad = other.send_as_user(
+        alice, bob, Suite::hybrid,
+        std::span<const Byte>(probe.data(), probe.size()));
+    check(bad == tier::net::Node::SendResult::failed,
+          "send_as_user from an unhosted user fails");
+
+    // Removing a user: it is no longer hosted.
+    check(host.remove_user(alice) && !host.has_user(alice), "user removed");
+  }
+
+  // --- one user on two devices, reached over a communicator ------------------
   tier::net::Node comm = make_node(Role::communicator);
   tier::net::Node device1 = make_node(Role::client);
   tier::net::Node device2 = make_node(Role::client);
   tier::net::Node sender = make_node(Role::client);
 
-  // One user on two devices.
+  // One user on two devices (same user seed on both).
   const auto user = tier::crypto::NodeIdentity::generate();
-  const auto user_id = tier::msg::user_id_of(user.public_key());
-  device1.set_user_identity(from_same_seed(user));
-  device2.set_user_identity(from_same_seed(user));
-
-  // The sender has its own distinct user identity.
-  const auto sender_user = tier::crypto::NodeIdentity::generate();
-  const auto sender_user_id = tier::msg::user_id_of(sender_user.public_key());
-  sender.set_user_identity(from_same_seed(sender_user));
-
-  check(device1.user_id() == user_id && device2.user_id() == user_id,
-        "both devices share the one user id");
+  const auto user_id = device1.add_user(from_same_seed(user));
+  const auto user_id2 = device2.add_user(from_same_seed(user));
+  check(user_id == user_id2, "both devices host the one user id");
   check(device1.peer_id() != device2.peer_id(),
         "the two devices have distinct device ids");
+
+  // The sender hosts its own distinct user identity.
+  const auto sender_user_id =
+      sender.add_user(tier::crypto::NodeIdentity::generate());
 
   // Everyone attaches to the communicator.
   device1.connect("127.0.0.1", comm.local_port());
@@ -83,7 +121,6 @@ int main() {
 
   std::vector<tier::net::Node*> all{&comm, &device1, &device2, &sender};
 
-  // Converge: all clients reach the communicator.
   for (int i = 0; i < 8000 &&
                   !(device1.has_encryption_keys(comm.peer_id()) &&
                     device2.has_encryption_keys(comm.peer_id()) &&
@@ -96,12 +133,10 @@ int main() {
             sender.has_encryption_keys(comm.peer_id()),
         "all devices reached the communicator");
 
-  // Let presence + user enrollment settle on the communicator.
-  pump(all, 500);
+  pump(all, 500);  // let presence + user enrollment settle
 
-  // Send to the user id, one message per suite in quick succession (as three
-  // separate send_to_user calls). Both of the user's online devices must
-  // receive all three - this is the case the docker gate exercises.
+  // Send to the user id, one message per suite, from the sender's user. Both of
+  // the user's online devices must receive all three.
   struct Msg { Suite suite; std::vector<Byte> pt; };
   const std::vector<Msg> msgs = {
       {Suite::classical, bytes("to-user classical")},
@@ -109,58 +144,54 @@ int main() {
       {Suite::pq, bytes("to-user pq")},
   };
   for (const auto& m : msgs) {
-    const auto res = sender.send_to_user(
-        user_id, m.suite, std::span<const Byte>(m.pt.data(), m.pt.size()));
-    check(res == tier::net::Node::SendResult::queued, "send_to_user is queued");
+    const auto res = sender.send_as_user(
+        sender_user_id, user_id, m.suite,
+        std::span<const Byte>(m.pt.data(), m.pt.size()));
+    check(res == tier::net::Node::SendResult::queued, "send_as_user is queued");
   }
 
-  // Track, per device, which of the three payloads have arrived.
   std::vector<bool> got1(msgs.size(), false);
   std::vector<bool> got2(msgs.size(), false);
   auto all_true = [](const std::vector<bool>& v) {
     return std::all_of(v.begin(), v.end(), [](bool b) { return b; });
   };
-  auto drain = [&](tier::net::Node& dev, std::vector<bool>& flags) {
+  auto drain = [&](tier::net::Node& dev, std::vector<bool>& flags,
+                   const tier::core::PeerId& want_recipient) {
     for (const auto& m : dev.take_inbox()) {
       for (std::size_t i = 0; i < msgs.size(); ++i) {
         if (m.plaintext == msgs[i].pt) {
           flags[i] = true;
           check(m.sender_user && *m.sender_user == sender_user_id,
-                "sender authenticated as the sender's user id");
+                "authenticated as the sender's user id");
+          check(m.recipient_user && *m.recipient_user == want_recipient,
+                "addressed to the recipient user id");
         }
       }
     }
   };
   for (int i = 0; i < 8000 && !(all_true(got1) && all_true(got2)); ++i) {
     pump(all, 1);
-    drain(device1, got1);
-    drain(device2, got2);
+    drain(device1, got1, user_id);
+    drain(device2, got2, user_id);
   }
   check(all_true(got1), "device 1 received all three user messages");
   check(all_true(got2), "device 2 received all three user messages");
 
-  // Late-enrollment race (regression for the frozen fan-out bug that the docker
-  // multi-identity gate caught). A device that enrolls under the user AFTER a
-  // user send has already been resolved to the other devices must still receive
-  // it: the sender resolves the user's device set repeatedly within the send
-  // window, delivering to each newly seen device once, rather than freezing the
-  // set at the first result. Here device3 is not even connected when the send is
-  // issued and the first result (device1, device2) is answered; it must still be
-  // reached once it joins.
+  // --- late-enrollment race (regression for the frozen fan-out bug) ----------
+  // A device that enrolls under the user AFTER a send has already been resolved
+  // to the other devices must still receive it: the recipient's device set is
+  // resolved repeatedly within the send window, not frozen at the first result.
   tier::net::Node device3 = make_node(Role::client);
-  device3.set_user_identity(from_same_seed(user));
+  device3.add_user(from_same_seed(user));
   const auto late_pt = bytes("to-user late-enroll");
   {
-    const auto res = sender.send_to_user(
-        user_id, Suite::classical,
+    const auto res = sender.send_as_user(
+        sender_user_id, user_id, Suite::classical,
         std::span<const Byte>(late_pt.data(), late_pt.size()));
     check(res == tier::net::Node::SendResult::queued,
-          "late-enroll send_to_user is queued");
+          "late-enroll send_as_user is queued");
   }
-  // Resolve + fan out to the devices known so far (device3 is absent): this is
-  // the point at which the old code erased the pending send.
-  pump(all, 80);
-  // device3 now joins and enrolls under the user.
+  pump(all, 80);  // resolve + fan out to the devices known so far (not device3)
   device3.connect("127.0.0.1", comm.local_port());
   std::vector<tier::net::Node*> all3{&comm, &device1, &device2, &sender, &device3};
   bool got3 = false;
@@ -175,14 +206,6 @@ int main() {
     }
   }
   check(got3, "a device enrolling after the send still receives it");
-
-  // A node with no user identity cannot send to a user.
-  tier::net::Node plain = make_node(Role::client);
-  const auto probe = bytes("x");
-  const auto bad = plain.send_to_user(
-      user_id, Suite::hybrid, std::span<const Byte>(probe.data(), probe.size()));
-  check(bad == tier::net::Node::SendResult::failed,
-        "send_to_user without a user identity fails");
 
   if (g_failures == 0) {
     std::puts("multi-identity e2e: all checks passed");

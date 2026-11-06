@@ -423,6 +423,54 @@ void print_hex(const char* label, std::span<const tier::crypto::Byte> bytes) {
   std::fputc('\n', stdout);
 }
 
+// Lowercase hex of an id, for a user's seed-file name.
+std::string hex_of(std::span<const tier::crypto::Byte> bytes) {
+  static constexpr char kHex[] = "0123456789abcdef";
+  std::string out;
+  out.reserve(bytes.size() * 2);
+  for (const auto b : bytes) {
+    out.push_back(kHex[(b >> 4) & 0x0F]);
+    out.push_back(kHex[b & 0x0F]);
+  }
+  return out;
+}
+
+// Where runtime-managed user identities are stored: a `users` directory beside
+// the node key. Each hosted user is one <user-id-hex>.seed file (the Ed25519
+// seed, 0600), so the set survives a restart. Managed only via tierctl, never
+// configuration.
+std::string resolve_users_dir() {
+  const std::filesystem::path idp(resolve_id_path());
+  const auto parent =
+      idp.has_parent_path() ? idp.parent_path() : std::filesystem::path(".");
+  return (parent / "users").string();
+}
+
+// Load every persisted user seed from `dir` and host it on the node.
+void load_users(tier::net::Node& node, const std::string& dir) {
+  std::error_code ec;
+  if (!std::filesystem::is_directory(dir, ec)) {
+    return;
+  }
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+    if (ec) {
+      break;
+    }
+    if (!entry.is_regular_file() || entry.path().extension() != ".seed") {
+      continue;
+    }
+    bool absent = false;
+    auto id = read_existing_identity(entry.path().string(), absent);
+    if (!id) {
+      std::fprintf(stderr, "skipping unreadable user seed %s\n",
+                   entry.path().string().c_str());
+      continue;
+    }
+    const auto uid = node.add_user(std::move(*id));
+    print_hex("user:     ", uid);
+  }
+}
+
 int usage() {
   std::fputs(
       "usage:\n"
@@ -576,22 +624,12 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   tier::net::Node node(identity, *roles, "::", port, {}, network,
                        version_range);
 
-  // Optional user identity (multi-identity, see docs/multi-identity.md). If
-  // TIER_USER_ID_FILE names a seed, attach it: this device then enrolls under
-  // that user and can be addressed by, and send as, the user. The seed file is
-  // created if absent, exactly like the device key.
-  if (const char* const user_path = std::getenv("TIER_USER_ID_FILE");
-      user_path != nullptr && user_path[0] != '\0') {
-    auto user_identity = load_or_create_identity(user_path);
-    if (!user_identity) {
-      std::fprintf(stderr, "cannot load user identity from %s\n", user_path);
-      return 1;
-    }
-    node.set_user_identity(std::move(*user_identity));
-    if (const auto uid = node.user_id()) {
-      print_hex("user id:  ", *uid);
-    }
-  }
+  // User identities are hosted at runtime via tierctl (user add / ls / rm), not
+  // via configuration or environment. Load any previously added users from the
+  // node's state directory so they survive a restart; new ones are persisted
+  // there on add (see docs/multi-identity.md).
+  const std::string users_dir = resolve_users_dir();
+  load_users(node, users_dir);
 
   const tier::core::PeerId self = node.peer_id();
   node.on_membership_change([self](const tier::core::PeerInfo& peer) {
@@ -657,12 +695,12 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   }
   std::fflush(stdout);
   const auto admin_handler =
-      [&node](const tier::core::AdminRequest& req) -> std::vector<std::uint8_t> {
+      [&node, &users_dir](
+          const tier::core::AdminRequest& req) -> std::vector<std::uint8_t> {
     switch (req.op) {
       case tier::core::AdminOp::id: {
         tier::core::AdminId id;
         id.device_id = node.peer_id();
-        id.user_id = node.user_id();
         return tier::core::encode_admin_id_reply(id);
       }
       case tier::core::AdminOp::peers:
@@ -683,16 +721,47 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
             result != tier::net::Node::SendResult::failed;
         return tier::core::encode_admin_send_reply(accepted);
       }
-      case tier::core::AdminOp::send_user: {
+      case tier::core::AdminOp::send_as: {
         if (!tier::msg::is_known_suite(req.suite)) {
-          return tier::core::encode_admin_send_user_reply(false);
+          return tier::core::encode_admin_send_as_reply(false);
         }
-        const auto result = node.send_to_user(
-            req.recipient, static_cast<tier::msg::Suite>(req.suite),
+        const auto result = node.send_as_user(
+            req.from_user, req.recipient,
+            static_cast<tier::msg::Suite>(req.suite),
             std::span<const tier::crypto::Byte>(req.plaintext.data(),
                                                 req.plaintext.size()));
-        const bool accepted = result != tier::net::Node::SendResult::failed;
-        return tier::core::encode_admin_send_user_reply(accepted);
+        return tier::core::encode_admin_send_as_reply(
+            result != tier::net::Node::SendResult::failed);
+      }
+      case tier::core::AdminOp::user_add: {
+        tier::crypto::NodeIdentity ident =
+            req.has_seed
+                ? tier::crypto::NodeIdentity::from_seed(tier::crypto::ByteSpan(
+                      req.seed.data(), req.seed.size()))
+                : tier::crypto::NodeIdentity::generate();
+        const auto seed = ident.seed();  // copy before the identity is moved
+        tier::core::AdminUserAddReply rep;
+        rep.user_id = node.add_user(std::move(ident));
+        // Persist so the user survives a restart.
+        std::error_code ec;
+        std::filesystem::create_directories(users_dir, ec);
+        const std::string path =
+            users_dir + "/" + hex_of(rep.user_id) + ".seed";
+        rep.ok = persist_seed(path, tier::crypto::ByteSpan(
+                                         seed.data(), seed.size())) !=
+                 PersistResult::error;
+        return tier::core::encode_admin_user_add_reply(rep);
+      }
+      case tier::core::AdminOp::user_list:
+        return tier::core::encode_admin_user_list(node.user_ids());
+      case tier::core::AdminOp::user_remove: {
+        const bool existed = node.remove_user(req.recipient);
+        if (existed) {
+          std::error_code ec;
+          std::filesystem::remove(
+              users_dir + "/" + hex_of(req.recipient) + ".seed", ec);
+        }
+        return tier::core::encode_admin_user_remove_reply(existed);
       }
       case tier::core::AdminOp::inbox: {
         std::vector<tier::core::AdminInboxMessage> out;
@@ -700,6 +769,7 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
           tier::core::AdminInboxMessage im;
           im.sender = m.sender;
           im.sender_user = m.sender_user;
+          im.recipient_user = m.recipient_user;
           im.suite = static_cast<std::uint8_t>(m.suite);
           im.plaintext = std::move(m.plaintext);
           out.push_back(std::move(im));

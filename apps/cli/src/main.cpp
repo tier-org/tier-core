@@ -160,15 +160,9 @@ int cmd_id(const std::string& path) {
     std::fprintf(stderr, "malformed response from tierd\n");
     return 1;
   }
-  // The full 64-hex device id (what `tierctl send <peer-id>` expects) and, if a
-  // user identity is attached, the user id (what `tierctl send-user` expects).
-  // Share whichever one out of band with who wants to message this node/user.
+  // The full 64-hex device id (what `tierctl send <peer-id>` expects). User
+  // identities hosted on this node are listed separately by `tierctl user ls`.
   std::printf("device %s\n", full_id(id->device_id).c_str());
-  if (id->user_id) {
-    std::printf("user   %s\n", full_id(*id->user_id).c_str());
-  } else {
-    std::printf("user   -\n");
-  }
   return 0;
 }
 
@@ -286,10 +280,12 @@ int cmd_send(const std::string& path, std::string_view peer_hex,
   return 0;
 }
 
-int cmd_send_user(const std::string& path, std::string_view user_hex,
-                  std::string_view suite_name_arg, std::string_view message) {
-  const auto id = parse_peer_id(user_hex);
-  if (!id) {
+int cmd_send_as(const std::string& path, std::string_view from_hex,
+                std::string_view to_hex, std::string_view suite_name_arg,
+                std::string_view message) {
+  const auto from = parse_peer_id(from_hex);
+  const auto to = parse_peer_id(to_hex);
+  if (!from || !to) {
     std::fprintf(stderr, "invalid user id (expected 64 hex chars)\n");
     return 2;
   }
@@ -304,26 +300,95 @@ int cmd_send_user(const std::string& path, std::string_view user_hex,
                  tier::core::kMaxAdminMessageBytes);
     return 2;
   }
-  const auto req = tier::core::encode_admin_send_user(
-      *id, *suite, std::span<const std::uint8_t>(pt.data(), pt.size()));
+  const auto req = tier::core::encode_admin_send_as(
+      *from, *to, *suite, std::span<const std::uint8_t>(pt.data(), pt.size()));
   std::vector<std::uint8_t> reply;
   if (!query_bytes(path, req, reply)) {
     return 1;
   }
-  const auto ok = tier::core::decode_admin_send_user_reply(reply);
+  const auto ok = tier::core::decode_admin_send_as_reply(reply);
   if (!ok) {
     std::fprintf(stderr, "malformed response from tierd\n");
     return 1;
   }
   if (!*ok) {
     std::fprintf(stderr,
-                 "not accepted: unknown suite, or this node has no user identity\n");
+                 "not accepted: unknown suite, or the from-user is not hosted "
+                 "on this node\n");
     return 1;
   }
-  // Fans out to the user's online devices once resolved through a communicator.
-  std::printf("accepted (%s) for user %s\n", suite_name(*suite),
-              short_id(*id).c_str());
+  // Fans out to the recipient user's online devices once resolved through a
+  // communicator (a recipient on this same node is delivered locally).
+  std::printf("accepted (%s) from user %s to user %s\n", suite_name(*suite),
+              short_id(*from).c_str(), short_id(*to).c_str());
   return 0;
+}
+
+int cmd_user_add(const std::string& path,
+                 std::optional<std::string_view> seed_hex) {
+  std::optional<std::array<std::uint8_t, 32>> seed;
+  if (seed_hex) {
+    const auto parsed = parse_peer_id(*seed_hex);
+    if (!parsed) {
+      std::fprintf(stderr, "invalid seed (expected 64 hex chars)\n");
+      return 2;
+    }
+    std::array<std::uint8_t, 32> s{};
+    std::copy(parsed->begin(), parsed->end(), s.begin());
+    seed = s;
+  }
+  std::vector<std::uint8_t> reply;
+  if (!query_bytes(path, tier::core::encode_admin_user_add(seed), reply)) {
+    return 1;
+  }
+  const auto rep = tier::core::decode_admin_user_add_reply(reply);
+  if (!rep) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  if (!rep->ok) {
+    std::fprintf(stderr, "could not add user (could not persist the seed)\n");
+    return 1;
+  }
+  std::printf("user %s\n", full_id(rep->user_id).c_str());
+  return 0;
+}
+
+int cmd_user_list(const std::string& path) {
+  std::vector<std::uint8_t> reply;
+  if (!query(path, tier::core::AdminOp::user_list, reply)) {
+    return 1;
+  }
+  const auto users = tier::core::decode_admin_user_list(reply);
+  if (!users) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  std::printf("%zu user(s)\n", users->size());
+  for (const auto& u : *users) {
+    std::printf("%s\n", full_id(u).c_str());
+  }
+  return 0;
+}
+
+int cmd_user_remove(const std::string& path, std::string_view user_hex) {
+  const auto id = parse_peer_id(user_hex);
+  if (!id) {
+    std::fprintf(stderr, "invalid user id (expected 64 hex chars)\n");
+    return 2;
+  }
+  std::vector<std::uint8_t> reply;
+  if (!query_bytes(path, tier::core::encode_admin_user_remove(*id), reply)) {
+    return 1;
+  }
+  const auto existed = tier::core::decode_admin_user_remove_reply(reply);
+  if (!existed) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  std::printf("%s %s\n", *existed ? "removed" : "no such user",
+              full_id(*id).c_str());
+  return *existed ? 0 : 1;
 }
 
 int cmd_inbox(const std::string& path) {
@@ -341,9 +406,13 @@ int cmd_inbox(const std::string& path) {
     std::string text(m.plaintext.begin(), m.plaintext.end());
     const std::string user =
         m.sender_user ? ("user " + short_id(*m.sender_user)) : std::string("-");
-    std::printf("from %s (%s)  suite=%s  %zu bytes: %s\n",
-                short_id(m.sender).c_str(), user.c_str(), suite_name(m.suite),
-                m.plaintext.size(), text.c_str());
+    // For a user message, also show which local user it was addressed to.
+    const std::string to =
+        m.recipient_user ? ("  to-user " + short_id(*m.recipient_user))
+                         : std::string();
+    std::printf("from %s (%s)%s  suite=%s  %zu bytes: %s\n",
+                short_id(m.sender).c_str(), user.c_str(), to.c_str(),
+                suite_name(m.suite), m.plaintext.size(), text.c_str());
   }
   return 0;
 }
@@ -354,12 +423,17 @@ int usage() {
       "  id                         print this node's own peer id (64 hex)\n"
       "  peers                      list the node's view of the mesh\n"
       "  send <peer-id> [suite] <message>\n"
-      "                             send an encrypted message to a peer (device)\n"
+      "                             send an encrypted node message to a peer "
+      "(device)\n"
       "                             (peer-id: 64 hex chars; suite: "
       "classical|hybrid|pq, default hybrid)\n"
-      "  send-user <user-id> [suite] <message>\n"
-      "                             send to a user (fans out to its online "
-      "devices)\n"
+      "  user add [seed]            host a new user identity (optionally import a\n"
+      "                             64-hex Ed25519 seed); prints its user id\n"
+      "  user ls                    list the user ids hosted on this node\n"
+      "  user rm <user-id>          stop hosting a user identity\n"
+      "  send-user <from-user> <to-user> [suite] <message>\n"
+      "                             send from a local user to a user (fans out to "
+      "its online devices)\n"
       "  inbox                      print and drain received messages\n"
       "\n"
       "The socket defaults to " "/run/tierd/tierd.sock"
@@ -411,12 +485,35 @@ int main(int argc, char** argv) {
     }
     return usage();
   }
-  if (command == "send-user") {
-    if (positional.size() == 3) {
-      return cmd_send_user(path, positional[1], "hybrid", positional[2]);
+  if (command == "user") {
+    // user add [seed] | user ls | user rm <user-id>
+    if (positional.size() >= 2 && positional[1] == "add") {
+      if (positional.size() == 2) {
+        return cmd_user_add(path, std::nullopt);
+      }
+      if (positional.size() == 3) {
+        return cmd_user_add(path, positional[2]);
+      }
+      return usage();
     }
+    if (positional.size() == 2 && positional[1] == "ls") {
+      return cmd_user_list(path);
+    }
+    if (positional.size() == 3 && positional[1] == "rm") {
+      return cmd_user_remove(path, positional[2]);
+    }
+    return usage();
+  }
+  if (command == "send-user") {
+    // send-user <from-user> <to-user> <message>          (suite defaults hybrid)
+    // send-user <from-user> <to-user> <suite> <message>
     if (positional.size() == 4) {
-      return cmd_send_user(path, positional[1], positional[2], positional[3]);
+      return cmd_send_as(path, positional[1], positional[2], "hybrid",
+                         positional[3]);
+    }
+    if (positional.size() == 5) {
+      return cmd_send_as(path, positional[1], positional[2], positional[3],
+                         positional[4]);
     }
     return usage();
   }

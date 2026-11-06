@@ -80,9 +80,12 @@ class Node {
     tier::core::PeerId sender{};  // authenticated sender device id
     tier::msg::Suite suite{};
     std::vector<tier::crypto::Byte> plaintext;
-    // Set when the message carried a user envelope whose credential verified:
-    // the authenticated sender user id (see docs/multi-identity.md).
+    // Both set when the message was a user message whose credential verified:
+    // the authenticated sender user id, and which local user it was addressed to
+    // (a device may host several users). Unset for a plain node (device-to-device)
+    // message. See docs/multi-identity.md.
     std::optional<tier::core::PeerId> sender_user;
+    std::optional<tier::core::PeerId> recipient_user;
   };
 
   // Outcome of a send_message call.
@@ -108,29 +111,38 @@ class Node {
   [[nodiscard]] bool has_encryption_keys(const tier::core::PeerId& peer) const;
 
   // --- multi-identity (see docs/multi-identity.md) -----------------------
-  // Attach a user identity to this device. The node self-issues its own device
-  // credential (this device, signed by the user key) and begins publishing a
-  // user-directory enrollment so the user is addressable. A node without a user
-  // identity still sends and receives device-level messages as before.
-  void set_user_identity(tier::crypto::NodeIdentity user);
+  // Host a user identity on this device (many may coexist, all added and removed
+  // at runtime). The node self-issues this device's credential under the user
+  // key and begins publishing a user-directory enrollment so the user is
+  // addressable. Returns the user id. A node hosting no user identity still sends
+  // and receives plain node (device-to-device) messages as before.
+  tier::core::PeerId add_user(tier::crypto::NodeIdentity user);
 
-  // This node's user id, if a user identity is attached.
-  [[nodiscard]] std::optional<tier::core::PeerId> user_id() const;
+  // Stop hosting a user identity. Its directory enrollment is left to expire.
+  // Returns true if the user was hosted here.
+  bool remove_user(const tier::core::PeerId& user_id);
+
+  // The user ids currently hosted on this node.
+  [[nodiscard]] std::vector<tier::core::PeerId> user_ids() const;
+
+  // Whether a user id is hosted on this node.
+  [[nodiscard]] bool has_user(const tier::core::PeerId& user_id) const;
 
   // Test-only: simulate a restricted NAT in front of this node (see
   // Endpoint::set_simulated_restricted_nat). Lets NAT traversal be tested
   // without a real NAT. Never call on a live node.
   void set_simulated_restricted_nat(bool on);
 
-  // Send an encrypted message to a user (all of whose currently-online devices
-  // receive it). Resolves the user's devices through a communicator and fans the
-  // message out as device-level sends, each carrying a user envelope that proves
-  // our user identity. Requires a user identity attached here. With no storage,
-  // offline devices simply miss it. Same sent/queued/failed contract as
-  // send_message (queued while the user is being resolved).
-  [[nodiscard]] SendResult send_to_user(
-      const tier::core::PeerId& to_user, tier::msg::Suite suite,
-      std::span<const tier::crypto::Byte> plaintext);
+  // Send an encrypted message from a local user (`from_user`, which must be
+  // hosted here) to `to_user` (all of whose currently-online devices receive
+  // it). Resolves the recipient's devices through a communicator and fans the
+  // message out as node-level sends, each carrying a user envelope that proves
+  // the sending user and names the recipient user. A recipient device hosted on
+  // this same node is delivered locally (loopback). With no storage, offline
+  // devices simply miss it. Same sent/queued/failed contract as send_message.
+  [[nodiscard]] SendResult send_as_user(
+      const tier::core::PeerId& from_user, const tier::core::PeerId& to_user,
+      tier::msg::Suite suite, std::span<const tier::crypto::Byte> plaintext);
 
   // Remove and return every message received since the last call.
   [[nodiscard]] std::vector<ReceivedMessage> take_inbox();
@@ -261,6 +273,11 @@ class Node {
   // known. Returns false if the peer is not currently reachable this way.
   bool deliver_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
                       std::span<const tier::crypto::Byte> plaintext);
+  // Send already-framed application bytes (a kind tag + body) to a device: fast
+  // path if connected with known keys, else queue for resolution. The public
+  // send_message and the user fan-out both frame their payload and call this.
+  SendResult send_framed(const tier::core::PeerId& to, tier::msg::Suite suite,
+                         std::vector<tier::crypto::Byte> framed);
   // Dial the first dialable of `addresses` (rate-limited via dialed_), if not
   // already connected to `id`.
   void dial_addresses(const std::vector<std::string>& addresses,
@@ -364,15 +381,22 @@ class Node {
   // When this (edge client) node may next publish its presence record.
   std::chrono::steady_clock::time_point next_presence_register_{};
   // --- multi-identity state (see docs/multi-identity.md) -------------------
-  // The attached user identity, if any, and this device's self-issued
-  // credential under it (signed once at attach time).
-  std::optional<tier::crypto::NodeIdentity> user_identity_;
-  tier::core::PeerId user_id_{};
-  std::vector<tier::crypto::Byte> device_credential_;
+  // User identities hosted on this device, keyed by user id. Each carries its
+  // own self-issued device credential (this device signed by the user key) and
+  // its own directory re-enrollment schedule. Added and removed at runtime; a
+  // node may host zero, one, or many.
+  struct LocalUser {
+    tier::crypto::NodeIdentity identity;
+    std::vector<tier::crypto::Byte> device_credential;
+    std::chrono::steady_clock::time_point next_register{};
+  };
+  std::map<tier::core::PeerId, LocalUser> users_;
   // Communicator role only: user id -> enrolled device ids.
   UserDirectory user_directory_;
-  // A user-level message waiting for the user's devices to be resolved.
+  // A user-level message waiting for the recipient user's devices to be
+  // resolved. `from_user` is the local user it is sent on behalf of.
   struct PendingUserSend {
+    tier::core::PeerId from_user{};
     tier::msg::Suite suite;
     std::vector<tier::crypto::Byte> plaintext;
     std::chrono::steady_clock::time_point deadline;
@@ -386,8 +410,6 @@ class Node {
   // Target user id -> when we last sent a user lookup, to rate-limit lookups.
   std::map<tier::core::PeerId, std::chrono::steady_clock::time_point>
       user_lookup_sent_;
-  // When this node may next publish its user-directory enrollment.
-  std::chrono::steady_clock::time_point next_user_register_{};
   // --- hole-punch state (see docs/communicator.md, M-NAT) ------------------
   // Target id -> earliest time to escalate a stuck direct dial to a hole punch
   // (set when we first resolve the peer's addresses), and -> when we last sent a

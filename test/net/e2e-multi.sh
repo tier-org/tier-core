@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 # Multi-identity gate (see docs/multi-identity.md). Two communicators, two client
-# devices that share one user identity, and a separate sender with its own user
-# identity. The sender addresses the shared user id; both devices must receive
-# the message, each showing the sender's user id. No device has a prior
-# connection to any other. Non-zero exit means discovery or delivery failed.
+# "devices" that share one user identity, and a separate "sender" client with its
+# own user identity. User identities are created at runtime over the admin socket
+# (`tierctl user add <seed>`), not via configuration: the two devices import the
+# same seed (so they host the one user id on two distinct devices), the sender
+# imports its own. The sender then sends from its user to the shared user id and
+# both devices must receive the message, each showing the sender's user id. No
+# device has a prior connection to any other. Non-zero exit means discovery or
+# delivery failed.
 #
 # Env:
 #   CONVERGE_TIMEOUT   seconds to wait for the clients to attach (default 40).
-#   MESSAGE_TIMEOUT    seconds to wait for all three messages (default 25).
+#   MESSAGE_TIMEOUT    seconds to wait for all three messages (default 40).
 #   TIERD_BIN/TIERCTL_BIN  reuse prebuilt binaries (passed through to build.sh).
 set -euo pipefail
 
@@ -18,32 +22,21 @@ project="tier-multi-e2e"
 compose_file="docker-compose.multi.yml"
 converge_timeout="${CONVERGE_TIMEOUT:-40}"
 message_timeout="${MESSAGE_TIMEOUT:-40}"
-# Both devices must register presence AND enroll under the user, and that must
-# reach the responsible communicators, before a user send can resolve and fan
-# out. That is more to converge than the single-recipient gates, so settle
-# longer here.
+# Both devices must host the user AND enroll it, and that must reach the
+# responsible communicators, before a user send can resolve and fan out. That is
+# more to converge than the single-recipient gates, so settle longer here.
 settle_seconds="${SETTLE_SECONDS:-12}"
-
-# Seed files for the shared user (both devices) and the sender's user. A random
-# 32-byte file is a valid Ed25519 seed. Kept in a temp dir, removed on exit.
-seed_dir="$(mktemp -d)"
-export USER_SEED="$seed_dir/user.seed"
-export SENDER_SEED="$seed_dir/sender.seed"
-head -c 32 /dev/urandom > "$USER_SEED"
-head -c 32 /dev/urandom > "$SENDER_SEED"
-chmod 0644 "$USER_SEED" "$SENDER_SEED"
 
 compose() { docker compose -p "$project" -f "$compose_file" "$@"; }
 
 cleanup() {
   compose down -v --remove-orphans >/dev/null 2>&1 || true
-  rm -rf "$seed_dir"
 }
 trap cleanup EXIT
 
 "$here/build.sh"
 
-echo "== bringing up 2 communicators + 2 devices (shared user) + sender =="
+echo "== bringing up 2 communicators + 2 devices + sender =="
 compose up -d
 
 connected_count() {
@@ -52,10 +45,13 @@ connected_count() {
   printf '%s\n' "$out" | sed -n 's/.*connected=\([0-9]*\).*/\1/p' | head -n1
 }
 
-# The user id a service reports (from `tierctl id`, the "user <hex>" line).
-user_id_of() {
-  compose exec -T "$1" tierctl id 2>/dev/null \
-    | sed -n 's/^user *\([0-9a-f]\{64\}\).*/\1/p' | head -n1 || true
+# A fresh 32-byte Ed25519 seed as 64 lowercase hex chars.
+random_seed_hex() { head -c 32 /dev/urandom | od -An -v -tx1 | tr -d ' \n'; }
+
+# `tierctl user add <seed>` prints "user <64hex>"; extract that id.
+add_user() {  # $1 = service, $2 = seed hex -> prints user id
+  compose exec -T "$1" tierctl user add "$2" 2>/dev/null \
+    | sed -n 's/^user \([0-9a-f]\{64\}\).*/\1/p' | head -n1
 }
 
 echo "== waiting up to ${converge_timeout}s for the clients to attach =="
@@ -75,17 +71,25 @@ while :; do
   sleep 1
 done
 
-# Both devices must report the same (shared) user id.
-ua="$(user_id_of devicea)"; ub="$(user_id_of deviceb)"
+# Create the user identities at runtime. The two devices import one shared seed
+# (so they host the same user id); the sender imports its own.
+shared_seed="$(random_seed_hex)"
+sender_seed="$(random_seed_hex)"
+ua="$(add_user devicea "$shared_seed")"
+ub="$(add_user deviceb "$shared_seed")"
+sender_user="$(add_user sender "$sender_seed")"
 if [ -z "$ua" ] || [ "$ua" != "$ub" ]; then
-  echo "FAIL: devices do not share one user id (devicea=$ua deviceb=$ub)"
+  echo "FAIL: devices do not host one shared user id (devicea=$ua deviceb=$ub)"
   exit 1
 fi
-sender_user="$(user_id_of sender)"
+if [ -z "$sender_user" ]; then
+  echo "FAIL: sender could not create its user identity"
+  exit 1
+fi
 echo "shared user id = $ua"
 echo "sender user id = $sender_user"
 
-# Let presence + user enrollment settle on the communicators.
+# Let the user enrollments settle on the communicators.
 sleep "$settle_seconds"
 
 failures=0
@@ -94,8 +98,9 @@ suites="classical hybrid pq"
 marker_for() { printf 'multi-%s-%s' "$1" "$stamp"; }
 
 for suite in $suites; do
-  if compose exec -T sender tierctl send-user "$ua" "$suite" "$(marker_for "$suite")"; then
-    echo "sender sent $suite to the user"
+  if compose exec -T sender \
+       tierctl send-user "$sender_user" "$ua" "$suite" "$(marker_for "$suite")"; then
+    echo "sender sent $suite from its user to the shared user"
   else
     echo "FAIL: sender could not accept the $suite send-user"
     failures=$((failures + 1))
@@ -133,11 +138,18 @@ for dev in devicea deviceb; do
       failures=$((failures + 1))
     fi
   done
-  # Each delivered message must show the sender's user id.
+  # Each delivered message must show the sender's user id and be addressed to
+  # the shared user.
   if printf '%s\n' "$acc" | grep -q "user ${sender_user:0:16}"; then
     echo "$dev saw the sender's user id"
   else
     echo "FAIL: $dev did not attribute the message to the sender's user"
+    failures=$((failures + 1))
+  fi
+  if printf '%s\n' "$acc" | grep -q "to-user ${ua:0:16}"; then
+    echo "$dev was addressed as the shared user"
+  else
+    echo "FAIL: $dev was not addressed as the shared user"
     failures=$((failures + 1))
   fi
 done

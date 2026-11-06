@@ -43,23 +43,27 @@ using ByteSpan = tier::crypto::ByteSpan;
     const tier::core::PeerId& device_id, std::uint64_t now_unix,
     ByteSpan credential);
 
-// Assemble the user envelope that travels as the transport plaintext:
-// the sender's user public key, its device credential, and the inner payload.
+// Assemble the user envelope that travels as the transport plaintext: the
+// sender's user public key, its device credential, the recipient user id (which
+// local user the receiving device must route this to, since one device may host
+// many users), and the inner payload.
 [[nodiscard]] std::vector<Byte> make_user_envelope(
     const tier::crypto::Ed25519PublicKey& sender_user_pub, ByteSpan credential,
-    ByteSpan inner_plaintext);
+    const tier::core::PeerId& recipient_user_id, ByteSpan inner_plaintext);
 
 // A user envelope opened and authenticated.
 struct OpenedUser {
-  tier::core::PeerId sender_user_id{};  // authenticated via the credential chain
+  tier::core::PeerId sender_user_id{};     // authenticated via the credential chain
+  tier::core::PeerId recipient_user_id{};  // which local user this is addressed to
   std::vector<Byte> plaintext;
 };
 
 // Parse and authenticate a user envelope. `sender_device` is the device id the
 // transport already authenticated (the id of the connection the message arrived
-// on). Returns the sender's user id and the inner payload only if the embedded
-// credential proves `sender_device` is authorized by the envelope's user key for
-// `network` and is unexpired at `now_unix`; std::nullopt otherwise. Never throws.
+// on). Returns the sender's user id, the recipient user id, and the inner
+// payload only if the embedded credential proves `sender_device` is authorized
+// by the envelope's user key for `network` and is unexpired at `now_unix`;
+// std::nullopt otherwise. Never throws.
 [[nodiscard]] std::optional<OpenedUser> open_user_envelope(
     std::string_view network, const tier::core::PeerId& sender_device,
     std::uint64_t now_unix, ByteSpan envelope);

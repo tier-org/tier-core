@@ -57,6 +57,13 @@ constexpr std::uint64_t kUserEnrollTtlSeconds = 300;
 constexpr auto kUserRegisterInterval = std::chrono::seconds(120);
 constexpr std::uint64_t kDeviceCredentialTtlSeconds = 365ULL * 24 * 3600;
 
+// Application-message kind, the first byte of the sealed transport plaintext.
+// A node message is device-to-device with no user layer (unchanged behavior); a
+// user message carries a user envelope (sender user, recipient user, inner).
+// This framing is internal to the node: callers see only the inner payload.
+constexpr tier::crypto::Byte kAppKindNode = 0x00;
+constexpr tier::crypto::Byte kAppKindUser = 0x01;
+
 // Hole punch: how long to let a direct dial try before escalating to a
 // coordinated punch, and how often to re-issue a punch request while a target
 // stays unconnected (see docs/communicator.md, M-NAT).
@@ -757,20 +764,39 @@ void Node::handle_sealed(const PeerId& sender_key,
   if (!opened) {
     return;  // not for us, forged, or undecryptable: drop silently
   }
+  // The first byte of the plaintext is the application-message kind (see
+  // kAppKindNode/kAppKindUser). An empty or unknown-kind message is dropped.
+  if (opened->plaintext.empty()) {
+    return;
+  }
+  const tier::crypto::Byte kind = opened->plaintext.front();
+  const tier::crypto::ByteSpan body(opened->plaintext.data() + 1,
+                                    opened->plaintext.size() - 1);
+
   ReceivedMessage rx;
   rx.sender = opened->sender_id;
   rx.suite = opened->suite;
-  rx.plaintext = std::move(opened->plaintext);
-  // If the plaintext is a user envelope whose credential authenticates the
-  // sending device for a user, surface the user id and unwrap the inner payload.
-  // A plain device-level message does not verify as an envelope and is left as
-  // is (see docs/multi-identity.md).
-  if (auto u = tier::msg::open_user_envelope(
-          network_, rx.sender, unix_now(),
-          tier::crypto::ByteSpan(rx.plaintext.data(), rx.plaintext.size()))) {
+
+  if (kind == kAppKindNode) {
+    // Plain device-to-device message: no user layer.
+    rx.plaintext.assign(body.begin(), body.end());
+  } else if (kind == kAppKindUser) {
+    // User message: authenticate the sender user and route to the addressed
+    // local user. Drop a forged envelope or one not addressed to a user we host.
+    auto u = tier::msg::open_user_envelope(network_, rx.sender, unix_now(), body);
+    if (!u) {
+      return;
+    }
+    if (users_.find(u->recipient_user_id) == users_.end()) {
+      return;  // not addressed to any user hosted here
+    }
     rx.sender_user = u->sender_user_id;
+    rx.recipient_user = u->recipient_user_id;
     rx.plaintext = std::move(u->plaintext);
+  } else {
+    return;  // unknown kind
   }
+
   if (on_message_received_) {
     on_message_received_(rx);
   }
@@ -976,21 +1002,34 @@ void Node::service_pending_sends(std::chrono::steady_clock::time_point now) {
   }
 }
 
-void Node::set_user_identity(tier::crypto::NodeIdentity user) {
-  user_identity_ = std::move(user);
-  user_id_ = tier::msg::user_id_of(user_identity_->public_key());
-  // Self-issue this device's credential under the user (single-process case:
-  // the user key is held here). Every user envelope we send carries it.
-  device_credential_ = tier::msg::make_device_credential(
-      *user_identity_, network_, self_id_, unix_now() + kDeviceCredentialTtlSeconds);
-  next_user_register_ = {};  // publish on the next poll
+tier::core::PeerId Node::add_user(tier::crypto::NodeIdentity user) {
+  const tier::core::PeerId uid = tier::msg::user_id_of(user.public_key());
+  // Self-issue this device's credential under the user key held here. Every user
+  // envelope sent on behalf of this user carries it. Build it before moving the
+  // identity into the record (LocalUser holds a non-default-constructible key).
+  std::vector<tier::crypto::Byte> cred = tier::msg::make_device_credential(
+      user, network_, self_id_, unix_now() + kDeviceCredentialTtlSeconds);
+  LocalUser lu{std::move(user), std::move(cred),
+               std::chrono::steady_clock::time_point{}};
+  users_.insert_or_assign(uid, std::move(lu));
+  return uid;
 }
 
-std::optional<tier::core::PeerId> Node::user_id() const {
-  if (!user_identity_) {
-    return std::nullopt;
+bool Node::remove_user(const tier::core::PeerId& user_id) {
+  return users_.erase(user_id) > 0;
+}
+
+std::vector<tier::core::PeerId> Node::user_ids() const {
+  std::vector<tier::core::PeerId> out;
+  out.reserve(users_.size());
+  for (const auto& [uid, lu] : users_) {
+    out.push_back(uid);
   }
-  return user_id_;
+  return out;
+}
+
+bool Node::has_user(const tier::core::PeerId& user_id) const {
+  return users_.find(user_id) != users_.end();
 }
 
 void Node::set_simulated_restricted_nat(bool on) {
@@ -1104,7 +1143,7 @@ void Node::handle_user_lookup(ConnId conn,
 
 void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
                               std::chrono::steady_clock::time_point /*now*/) {
-  if (!user_identity_) {
+  if (users_.empty()) {
     return;  // nothing to send on behalf of
   }
   // Match the result to a user we are resolving.
@@ -1129,61 +1168,73 @@ void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
     return;
   }
   // Fan each queued message out to every returned device not yet delivered to,
-  // as a device-level send carrying our user envelope (send_message resolves /
+  // as a node-level send carrying a user envelope (send_framed resolves /
   // connects on demand). The device set is resolved repeatedly rather than once:
-  // the two devices of a user enroll asynchronously, and a lookup can be answered
-  // (even from a replica) before a device has registered, so a single result may
-  // list only some devices. We therefore do NOT erase the pending send here -
-  // each new device seen on a later result is delivered to once (deduplicated by
+  // a user's devices enroll asynchronously, and a lookup can be answered (even
+  // from a replica) before a device has registered, so a single result may list
+  // only some devices. We therefore do NOT erase the pending send here - each new
+  // device seen on a later result is delivered to once (deduplicated by
   // m.delivered), and service_user_sends drops the message when its deadline
-  // passes. This matches the online, direct-delivery model: reach every device
-  // that comes online within the send window.
+  // passes. A device hosted on this same node (self) is skipped: that copy was
+  // delivered synchronously by send_as_user (loopback).
   for (auto& m : it->second) {
+    const auto from = users_.find(m.from_user);
+    if (from == users_.end()) {
+      continue;  // the sending user was removed since this was queued
+    }
     for (const auto& device : devices) {
       if (device == self_id_) {
-        continue;  // do not echo to our own device
+        continue;  // local recipient already delivered by loopback
       }
       if (!m.delivered.insert(device).second) {
         continue;  // already fanned out to this device
       }
       const std::vector<tier::crypto::Byte> envelope = tier::msg::make_user_envelope(
-          user_identity_->public_key(),
-          tier::crypto::ByteSpan(device_credential_.data(), device_credential_.size()),
+          from->second.identity.public_key(),
+          tier::crypto::ByteSpan(from->second.device_credential.data(),
+                                 from->second.device_credential.size()),
+          user,  // recipient user id (the directory key we resolved)
           tier::crypto::ByteSpan(m.plaintext.data(), m.plaintext.size()));
-      (void)send_message(
-          device, m.suite,
-          tier::crypto::ByteSpan(envelope.data(), envelope.size()));
+      std::vector<tier::crypto::Byte> framed;
+      framed.reserve(envelope.size() + 1);
+      framed.push_back(kAppKindUser);
+      framed.insert(framed.end(), envelope.begin(), envelope.end());
+      (void)send_framed(device, m.suite, std::move(framed));
     }
   }
 }
 
 void Node::register_user(std::chrono::steady_clock::time_point now,
                          std::uint64_t now_unix) {
-  if (!user_identity_ || device_credential_.empty()) {
-    return;
-  }
-  if (now < next_user_register_) {
+  if (users_.empty()) {
     return;
   }
   const auto comms = live_communicators();
   if (comms.empty()) {
     return;
   }
-  const std::vector<tier::crypto::Byte> frame = tier::msg::make_user_register(
-      user_identity_->public_key(),
-      tier::crypto::ByteSpan(device_credential_.data(), device_credential_.size()),
-      now_unix, now_unix + kUserEnrollTtlSeconds);
-  const auto responsible =
-      responsible_communicators(user_id_, comms, kPresenceReplicas);
-  for (const auto& c : responsible) {
-    const auto conn = conn_by_peer_.find(c);
-    if (conn != conn_by_peer_.end()) {
-      endpoint_.send(conn->second, frame);
-    } else if (const auto info = membership_.find(c); info) {
-      dial_addresses(info->addresses, now);
+  // Enroll each hosted user with the communicators responsible for its id.
+  for (auto& [uid, lu] : users_) {
+    if (now < lu.next_register) {
+      continue;
     }
+    const std::vector<tier::crypto::Byte> frame = tier::msg::make_user_register(
+        lu.identity.public_key(),
+        tier::crypto::ByteSpan(lu.device_credential.data(),
+                               lu.device_credential.size()),
+        now_unix, now_unix + kUserEnrollTtlSeconds);
+    const auto responsible =
+        responsible_communicators(uid, comms, kPresenceReplicas);
+    for (const auto& c : responsible) {
+      const auto conn = conn_by_peer_.find(c);
+      if (conn != conn_by_peer_.end()) {
+        endpoint_.send(conn->second, frame);
+      } else if (const auto info = membership_.find(c); info) {
+        dial_addresses(info->addresses, now);
+      }
+    }
+    lu.next_register = now + kUserRegisterInterval;
   }
-  next_user_register_ = now + kUserRegisterInterval;
 }
 
 void Node::service_user_sends(std::chrono::steady_clock::time_point now) {
@@ -1226,16 +1277,36 @@ void Node::service_user_sends(std::chrono::steady_clock::time_point now) {
   }
 }
 
-Node::SendResult Node::send_to_user(const tier::core::PeerId& to_user,
+Node::SendResult Node::send_as_user(const tier::core::PeerId& from_user,
+                                    const tier::core::PeerId& to_user,
                                     tier::msg::Suite suite,
                                     std::span<const tier::crypto::Byte> plaintext) {
-  if (!user_identity_ || device_credential_.empty()) {
-    return SendResult::failed;  // no user identity to sign the envelope with
+  if (users_.find(from_user) == users_.end()) {
+    return SendResult::failed;  // from_user is not hosted here
   }
   PendingUserSend pending;
+  pending.from_user = from_user;
   pending.suite = suite;
   pending.plaintext.assign(plaintext.begin(), plaintext.end());
   pending.deadline = std::chrono::steady_clock::now() + kPendingSendTimeout;
+
+  // If the recipient user is hosted on this same node, deliver that copy locally
+  // right away (loopback) and mark our own device done so the network fan-out
+  // skips it. The user may also have remote devices, so we still resolve + queue.
+  if (users_.find(to_user) != users_.end()) {
+    ReceivedMessage rx;
+    rx.sender = self_id_;
+    rx.suite = suite;
+    rx.sender_user = from_user;
+    rx.recipient_user = to_user;
+    rx.plaintext.assign(plaintext.begin(), plaintext.end());
+    if (on_message_received_) {
+      on_message_received_(rx);
+    }
+    inbox_.push_back(std::move(rx));
+    pending.delivered.insert(self_id_);
+  }
+
   pending_user_sends_[to_user].push_back(std::move(pending));
   service_user_sends(std::chrono::steady_clock::now());
   return SendResult::queued;
@@ -1260,11 +1331,12 @@ bool Node::deliver_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
   return true;
 }
 
-Node::SendResult Node::send_message(
-    const tier::core::PeerId& to, tier::msg::Suite suite,
-    std::span<const tier::crypto::Byte> plaintext) {
+Node::SendResult Node::send_framed(const tier::core::PeerId& to,
+                                   tier::msg::Suite suite,
+                                   std::vector<tier::crypto::Byte> framed) {
   // Fast path: already connected with known keys.
-  if (deliver_sealed(to, suite, plaintext)) {
+  if (deliver_sealed(to, suite,
+                     std::span<const tier::crypto::Byte>(framed.data(), framed.size()))) {
     return SendResult::sent;
   }
   // Cannot reach a plain client without a communicator to resolve it through,
@@ -1276,12 +1348,24 @@ Node::SendResult Node::send_message(
   // flushes. seal() copies the plaintext at delivery, so keep our own copy now.
   PendingSend pending;
   pending.suite = suite;
-  pending.plaintext.assign(plaintext.begin(), plaintext.end());
+  pending.plaintext = std::move(framed);
   pending.deadline = std::chrono::steady_clock::now() + kPendingSendTimeout;
   pending_sends_[to].push_back(std::move(pending));
   // Kick resolution immediately so a reachable peer flushes on the next poll.
   service_pending_sends(std::chrono::steady_clock::now());
   return SendResult::queued;
+}
+
+Node::SendResult Node::send_message(
+    const tier::core::PeerId& to, tier::msg::Suite suite,
+    std::span<const tier::crypto::Byte> plaintext) {
+  // Frame as a plain node (device-to-device) message and hand to the common
+  // path. The kind tag is stripped by the receiver; callers see only the body.
+  std::vector<tier::crypto::Byte> framed;
+  framed.reserve(plaintext.size() + 1);
+  framed.push_back(kAppKindNode);
+  framed.insert(framed.end(), plaintext.begin(), plaintext.end());
+  return send_framed(to, suite, std::move(framed));
 }
 
 bool Node::has_encryption_keys(const tier::core::PeerId& peer) const {

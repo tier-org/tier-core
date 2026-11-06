@@ -1,3 +1,4 @@
+#include <array>
 #include <cstdio>
 #include <optional>
 #include <vector>
@@ -63,55 +64,69 @@ int main() {
     check(id_op.has_value() && id_op->op == AdminOp::id,
           "id request round-trips");
 
-    // send_user request round-trips like send.
-    tier::core::PeerId user{};
-    user.fill(0x5A);
+    // send_as request round-trips: from-user, to-user, suite, plaintext.
+    tier::core::PeerId from{};
+    from.fill(0x5A);
+    tier::core::PeerId to{};
+    to.fill(0x6B);
     const std::vector<std::uint8_t> up = {1, 2, 3};
-    const auto su_req = tier::core::encode_admin_send_user(
-        user, 2, std::span<const std::uint8_t>(up.data(), up.size()));
-    const auto su_op = tier::core::decode_admin_request(su_req);
-    check(su_op.has_value() && su_op->op == AdminOp::send_user &&
-              su_op->recipient == user && su_op->suite == 2 &&
-              su_op->plaintext == up,
-          "send_user request round-trips");
+    const auto sa_req = tier::core::encode_admin_send_as(
+        from, to, 2, std::span<const std::uint8_t>(up.data(), up.size()));
+    const auto sa_op = tier::core::decode_admin_request(sa_req);
+    check(sa_op.has_value() && sa_op->op == AdminOp::send_as &&
+              sa_op->from_user == from && sa_op->recipient == to &&
+              sa_op->suite == 2 && sa_op->plaintext == up,
+          "send_as request round-trips");
+
+    // user_list request (no params) round-trips.
+    const auto ul_req = tier::core::encode_admin_request(AdminOp::user_list);
+    const auto ul_op = tier::core::decode_admin_request(ul_req);
+    check(ul_op.has_value() && ul_op->op == AdminOp::user_list,
+          "user_list request round-trips");
+
+    // user_add request round-trips, generate (no seed) and import (seed).
+    const auto ua_gen_op =
+        tier::core::decode_admin_request(tier::core::encode_admin_user_add(std::nullopt));
+    check(ua_gen_op.has_value() && ua_gen_op->op == AdminOp::user_add &&
+              !ua_gen_op->has_seed,
+          "user_add (generate) request round-trips");
+    std::array<std::uint8_t, 32> seed{};
+    seed.fill(0x44);
+    const auto ua_imp_op =
+        tier::core::decode_admin_request(tier::core::encode_admin_user_add(seed));
+    check(ua_imp_op.has_value() && ua_imp_op->op == AdminOp::user_add &&
+              ua_imp_op->has_seed && ua_imp_op->seed == seed,
+          "user_add (import) request round-trips");
+
+    // user_remove request round-trips.
+    tier::core::PeerId ru{};
+    ru.fill(0x9E);
+    const auto ur_op =
+        tier::core::decode_admin_request(tier::core::encode_admin_user_remove(ru));
+    check(ur_op.has_value() && ur_op->op == AdminOp::user_remove &&
+              ur_op->recipient == ru,
+          "user_remove request round-trips");
   }
 
-  // id response round-trip: device id only, and device + user id.
+  // id response round-trip: device id only.
   {
     tier::core::PeerId dev{};
     for (std::size_t i = 0; i < dev.size(); ++i) {
       dev[i] = static_cast<std::uint8_t>(i * 7 + 1);
     }
-    // No user id.
-    {
-      tier::core::AdminId id;
-      id.device_id = dev;
-      const auto reply = tier::core::encode_admin_id_reply(id);
-      const auto got = tier::core::decode_admin_id_reply(reply);
-      check(got.has_value() && got->device_id == dev && !got->user_id,
-            "id reply (device only) round-trips");
-      auto trailing_id = reply;
-      trailing_id.push_back(0x00);
-      check(!tier::core::decode_admin_id_reply(trailing_id).has_value(),
-            "id reply with trailing byte rejected");
-    }
-    // With a user id.
-    {
-      tier::core::PeerId usr{};
-      usr.fill(0xC3);
-      tier::core::AdminId id;
-      id.device_id = dev;
-      id.user_id = usr;
-      const auto reply = tier::core::encode_admin_id_reply(id);
-      const auto got = tier::core::decode_admin_id_reply(reply);
-      check(got.has_value() && got->device_id == dev && got->user_id &&
-                *got->user_id == usr,
-            "id reply (device + user) round-trips");
-      auto truncated = reply;
-      truncated.pop_back();
-      check(!tier::core::decode_admin_id_reply(truncated).has_value(),
-            "truncated id reply rejected");
-    }
+    tier::core::AdminId id;
+    id.device_id = dev;
+    const auto reply = tier::core::encode_admin_id_reply(id);
+    const auto got = tier::core::decode_admin_id_reply(reply);
+    check(got.has_value() && got->device_id == dev, "id reply round-trips");
+    auto trailing_id = reply;
+    trailing_id.push_back(0x00);
+    check(!tier::core::decode_admin_id_reply(trailing_id).has_value(),
+          "id reply with trailing byte rejected");
+    auto truncated = reply;
+    truncated.pop_back();
+    check(!tier::core::decode_admin_id_reply(truncated).has_value(),
+          "truncated id reply rejected");
   }
 
   // send request round-trip and bounds.
@@ -160,6 +175,48 @@ int main() {
           "send reply fail round-trips");
   }
 
+  // send_as reply, and the user CRUD replies, round-trip.
+  {
+    check(tier::core::decode_admin_send_as_reply(
+              tier::core::encode_admin_send_as_reply(true)) == std::optional<bool>(true),
+          "send_as reply ok round-trips");
+    check(tier::core::decode_admin_send_as_reply(
+              tier::core::encode_admin_send_as_reply(false)) == std::optional<bool>(false),
+          "send_as reply fail round-trips");
+
+    tier::core::AdminUserAddReply rep;
+    rep.ok = true;
+    rep.user_id.fill(0xAB);
+    const auto enc = tier::core::encode_admin_user_add_reply(rep);
+    const auto got = tier::core::decode_admin_user_add_reply(enc);
+    check(got && got->ok && got->user_id == rep.user_id,
+          "user_add reply round-trips");
+    auto ua_tr = enc;
+    ua_tr.push_back(0x00);
+    check(!tier::core::decode_admin_user_add_reply(ua_tr).has_value(),
+          "user_add reply trailing byte rejected");
+
+    check(tier::core::decode_admin_user_remove_reply(
+              tier::core::encode_admin_user_remove_reply(true)) == std::optional<bool>(true),
+          "user_remove reply (existed) round-trips");
+    check(tier::core::decode_admin_user_remove_reply(
+              tier::core::encode_admin_user_remove_reply(false)) == std::optional<bool>(false),
+          "user_remove reply (absent) round-trips");
+
+    std::vector<tier::core::PeerId> users(2);
+    users[0].fill(0x01);
+    users[1].fill(0x02);
+    const auto ul = tier::core::encode_admin_user_list(users);
+    const auto ul_got = tier::core::decode_admin_user_list(ul);
+    check(ul_got && ul_got->size() == 2 && (*ul_got)[0] == users[0] &&
+              (*ul_got)[1] == users[1],
+          "user_list reply round-trips");
+    auto ul_tr = ul;
+    ul_tr.push_back(0x00);
+    check(!tier::core::decode_admin_user_list(ul_tr).has_value(),
+          "user_list reply trailing byte rejected");
+  }
+
   // inbox reply round-trip (two messages, including an empty one).
   {
     std::vector<tier::core::AdminInboxMessage> msgs;
@@ -171,7 +228,10 @@ int main() {
     m2.sender.fill(0x22);
     tier::core::PeerId u2{};
     u2.fill(0x77);
-    m2.sender_user = u2;  // this one carries an authenticated user sender
+    tier::core::PeerId r2{};
+    r2.fill(0x33);
+    m2.sender_user = u2;     // this one carries an authenticated user sender
+    m2.recipient_user = r2;  // and names the local user it was addressed to
     m2.suite = 3;
     m2.plaintext = {};
     msgs.push_back(m1);
@@ -181,12 +241,14 @@ int main() {
     check(dec.has_value() && dec->size() == 2, "inbox reply count round-trips");
     if (dec && dec->size() == 2) {
       check((*dec)[0].sender == m1.sender && !(*dec)[0].sender_user &&
-                (*dec)[0].suite == 1 && (*dec)[0].plaintext == m1.plaintext,
-            "inbox message 1 (no user) round-trips");
+                !(*dec)[0].recipient_user && (*dec)[0].suite == 1 &&
+                (*dec)[0].plaintext == m1.plaintext,
+            "inbox message 1 (node message, no user) round-trips");
       check((*dec)[1].sender == m2.sender && (*dec)[1].sender_user &&
-                *(*dec)[1].sender_user == u2 && (*dec)[1].suite == 3 &&
+                *(*dec)[1].sender_user == u2 && (*dec)[1].recipient_user &&
+                *(*dec)[1].recipient_user == r2 && (*dec)[1].suite == 3 &&
                 (*dec)[1].plaintext.empty(),
-            "inbox message 2 (with user) round-trips");
+            "inbox message 2 (user message, sender + recipient) round-trips");
     }
     auto trailing = enc;
     trailing.push_back(0x00);

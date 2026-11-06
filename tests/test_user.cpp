@@ -88,11 +88,13 @@ int main() {
     check(accepted == 0, "no single-byte flip of a credential verifies");
   }
 
-  // User envelope round-trip: the inner payload and authenticated sender user id.
+  // User envelope round-trip: inner payload, authenticated sender user id, and
+  // the recipient user id (which local user the receiver routes to).
   const std::string text = "hello from a user";
   const std::vector<Byte> inner(text.begin(), text.end());
-  const auto envelope =
-      tier::msg::make_user_envelope(user.public_key(), sp(cred), sp(inner));
+  const auto recipient_user = device_id_of(other_device);  // any 32-byte id
+  const auto envelope = tier::msg::make_user_envelope(user.public_key(), sp(cred),
+                                                      recipient_user, sp(inner));
 
   {
     const auto opened =
@@ -101,6 +103,8 @@ int main() {
     if (opened) {
       check(opened->sender_user_id == tier::msg::user_id_of(user.public_key()),
             "sender user id is the user key hash");
+      check(opened->recipient_user_id == recipient_user,
+            "recipient user id recovered");
       check(opened->plaintext == inner, "inner plaintext recovered");
     }
   }

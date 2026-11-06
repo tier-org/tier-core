@@ -90,17 +90,19 @@ A user identity (its own Ed25519 keypair) sits above the device identity, so one
 user can span several devices and a recipient learns which *user* sent a
 message, not merely which device (see docs/multi-identity.md). The user key signs
 a device credential authorizing each device; that credential travels in a user
-envelope inside the normal sealed message. Attach a user identity with
-`TIER_USER_ID_FILE` (a seed file, created if absent); the device then enrolls
-under the user at a communicator and can be addressed with `tierctl send-user
-<user-id>`. With no message storage in this version, a user send reaches
-whichever of the user's devices are online; both sender and recipient must be
-online.
+envelope inside the normal sealed message. User identities are managed entirely
+at runtime over the admin socket (`tierctl user add [seed]` to generate or
+import, `tierctl user ls`, `tierctl user rm <user-id>`); a node may host several
+at once and they persist across restarts. A device-to-device `send` carries no
+user layer; `tierctl send-user <from-user> <to-user>` sends from one of your
+local users to a user id, enrolling each user at a communicator so it is
+addressable and fanning the message out to the recipient's online devices (a
+recipient hosted on the same node is delivered locally). With no message storage
+in this version, both sender and recipient must be online.
 
-Still future work: NAT hole punching (coordinated simultaneous open) for clients
-behind NAT, offline store-and-forward (keeper-backed, so an offline device can
-catch up), forward-secret sessions (a ratchet) and group messaging. The sealing
-itself is independent of how a message is carried. Per-message ephemeral X25519
+Still future work: offline store-and-forward (keeper-backed, so an offline
+device can catch up), forward-secret sessions (a ratchet) and group messaging.
+The sealing itself is independent of how a message is carried. Per-message ephemeral X25519
 already gives forward secrecy for the classical key-agreement part.
 
 ## Dependencies
@@ -308,19 +310,25 @@ Docker with IPv6 enabled on the daemon - see `test/net/README.md`.
 The daemon exposes a local admin socket (default `/run/tierd/tierd.sock`, or
 `$TIER_ADMIN_SOCK`). `tierctl` talks to it over that socket:
 
-    sudo tierctl id           # this node's device id and user id (64 hex each)
+    sudo tierctl id           # this node's device id (64 hex)
     sudo tierctl peers        # the node's view of the mesh: known vs connected
     sudo tierctl inbox        # print and drain encrypted messages received
     sudo tierctl send <peer-id> [classical|hybrid|pq] <message>
-    sudo tierctl send-user <user-id> [classical|hybrid|pq] <message>
+    sudo tierctl user add [seed]      # host a user identity (prints its user id)
+    sudo tierctl user ls              # list hosted user ids
+    sudo tierctl user rm <user-id>    # stop hosting a user identity
+    sudo tierctl send-user <from-user> <to-user> [classical|hybrid|pq] <message>
 
 `send` encrypts a message end-to-end (see "Encrypted messaging" below);
 `<peer-id>` is the recipient's full 64-hex id - get it from `tierctl id` on that
 node and share it out of band (the `peers` table shows only a shortened id). The
 suite defaults to `hybrid`. If the peer is not already connected, the node
 resolves it through a communicator and connects on demand, so `send` reports the
-message accepted (sent or queued). `inbox` prints each received message with its
-authenticated sender and suite, then clears the queue.
+message accepted (sent or queued). `send-user` instead sends from one of this
+node's hosted users (`user add`/`ls`/`rm` manage them at runtime) to a user id,
+fanning out to that user's online devices; `inbox` prints each received message
+with its authenticated sender (and, for a user message, the sending user and the
+local user it was addressed to) and suite, then clears the queue.
 
 The header reports the node's own network (the cluster it joined) and the known
 versus connected counts. Each row is a peer: short id, whether a live connection
