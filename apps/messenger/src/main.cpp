@@ -47,7 +47,7 @@ int usage() {
       "  connects to the local tierd admin socket and opens an interactive\n"
       "  messenger. --as selects which hosted user identity to chat as; without\n"
       "  it, the sole identity is used, or one is created if none exist.\n"
-      "  Esc or Ctrl-C quits.\n",
+      "  The UI is modal (vim-like): press ? for help, q to quit.\n",
       stderr);
   return 2;
 }

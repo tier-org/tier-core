@@ -79,6 +79,28 @@ void test_hkdf() {
         "HKDF different info -> different output");
 }
 
+void test_pbkdf2() {
+  // Well-known PBKDF2-HMAC-SHA256 vectors (P="password", S="salt").
+  const auto pw = unhex("70617373776f7264");  // "password"
+  const auto salt = unhex("73616c74");        // "salt"
+  const auto c1 = tier::crypto::pbkdf2_sha256(span(pw), span(salt), 1, 32);
+  check(c1 == unhex("120fb6cffcf8b32c43e7225256c4f837"
+                    "a86548c92ccc35480805987cb70be17b"),
+        "PBKDF2-SHA256 c=1 known answer");
+  const auto c2 = tier::crypto::pbkdf2_sha256(span(pw), span(salt), 2, 32);
+  check(c2 == unhex("ae4d0c95af6b46d32d0adff928f06dd0"
+                    "2a303f8ef3c251dfd6e2d85a95474c43"),
+        "PBKDF2-SHA256 c=2 known answer");
+
+  // Different iteration counts and passwords diverge; same inputs are stable.
+  check(c1 != c2, "PBKDF2 iteration count changes output");
+  const auto bad = unhex("70617373776f7265");  // "passwore"
+  check(tier::crypto::pbkdf2_sha256(span(bad), span(salt), 1, 32) != c1,
+        "PBKDF2 different password -> different output");
+  check(tier::crypto::pbkdf2_sha256(span(pw), span(salt), 1, 32) == c1,
+        "PBKDF2 deterministic");
+}
+
 void test_aead() {
   // RFC 8439, Section 2.8.2.
   const auto key = to_array<tier::crypto::kAeadKeySize>(unhex(
@@ -209,6 +231,7 @@ void test_mlkem() {
 
 int main() {
   test_hkdf();
+  test_pbkdf2();
   test_aead();
   test_x25519();
   test_mlkem();

@@ -8,7 +8,8 @@ add_library(tier_messenger_core STATIC
 add_library(tier::messenger_core ALIAS tier_messenger_core)
 target_include_directories(tier_messenger_core PUBLIC src)
 target_link_libraries(tier_messenger_core
-  PUBLIC tier::core tier::app tier::sqlite tier::options)
+  PUBLIC tier::core tier::app tier::sqlite tier::options
+  PRIVATE tier::crypto)
 
 add_executable(tier-messenger
   src/main.cpp
