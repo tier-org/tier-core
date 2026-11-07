@@ -119,6 +119,60 @@ int main() {
   }
   std::remove(path.c_str());
 
+  // --- settings, per-contact suite/verified, auto-file, device lock --------
+  {
+    const std::string p2 =
+        "/tmp/tier-messenger-test2-" + std::to_string(::getpid()) + ".db";
+    std::remove(p2.c_str());
+    auto store = tier::messenger::Store::open(p2);
+    check(store.has_value(), "store2 opens");
+    if (store) {
+      // settings + default suite
+      check(store->default_suite() == 2, "default suite is hybrid when unset");
+      store->set_default_suite(3);
+      check(store->default_suite() == 3, "default suite stored");
+      store->set_setting("k", "v");
+      const auto gv = store->get_setting("k");
+      check(gv && *gv == "v", "setting round-trips");
+
+      // ensure_contact only fills if absent; never clobbers an alias
+      store->upsert_contact("aa", "Alice");
+      store->ensure_contact("aa");  // must not wipe the alias
+      const auto a = store->alias_of("aa");
+      check(a && *a == "Alice", "ensure_contact keeps existing alias");
+      store->ensure_contact("bb");  // auto-filed sender, no alias
+      const auto b = store->contact("bb");
+      check(b && b->alias.empty(), "ensure_contact creates empty alias");
+
+      // per-contact suite override + clear
+      check(!store->contact("aa")->suite.has_value(),
+            "contact suite starts unset");
+      store->set_contact_suite("aa", std::uint8_t{1});
+      check(store->contact("aa")->suite.value_or(0) == 1,
+            "contact suite override stored");
+      store->set_contact_suite("aa", std::nullopt);
+      check(!store->contact("aa")->suite.has_value(),
+            "contact suite cleared to default");
+
+      // verified flag
+      check(!store->contact("aa")->verified, "contact starts unverified");
+      store->set_contact_verified("aa", true);
+      check(store->contact("aa")->verified, "contact marked verified");
+
+      // device lock
+      check(!store->has_password(), "no lock by default");
+      store->set_password("hunter2");
+      check(store->has_password(), "lock enabled after set");
+      check(store->verify_password("hunter2"), "correct password verifies");
+      check(!store->verify_password("wrong"), "wrong password rejected");
+      store->clear_password();
+      check(!store->has_password(), "lock cleared");
+      check(!store->verify_password("hunter2"),
+            "verify false once lock cleared");
+    }
+    std::remove(p2.c_str());
+  }
+
   // --- StreamParser: frame several length-prefixed records, decode in order ---
   {
     tier::core::AdminStreamMessage m;

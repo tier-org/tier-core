@@ -159,15 +159,39 @@ FTXUI. The vendored FTXUI is a submodule, so a fresh checkout needs:
     git submodule update --init --recursive
     cmake -S . -B build && cmake --build build -j   # builds tier-messenger too
 
-Run it against a local `tierd`: it connects to the admin socket, lets you pick
-(or create) which hosted user identity to chat as, add counterparties by id with
-an alias, open chats and send messages. All contacts, aliases and history live
-in the client's SQLite store (`$XDG_DATA_HOME/tier-messenger/store.db`, override
-with `--db`); the node stores nothing. Incoming messages arrive over the live
-subscription stream and outgoing ones show a delivered mark when a receipt comes
-back. `--sock` overrides the admin socket, `--as <user-id>` picks the identity.
-SQLite is vendored as the public-domain amalgamation under `vendor/sqlite`;
-FTXUI (MIT) is the `vendor/ftxui` submodule.
+Run it against a local `tierd`: it connects to the admin socket and lets you
+pick (or create) which hosted user identity to chat as. All contacts, aliases,
+per-contact settings and history live in the client's SQLite store
+(`$XDG_DATA_HOME/tier-messenger/store.db`, override with `--db`); the node stores
+nothing. `--sock` overrides the admin socket, `--as <user-id>` picks the
+identity.
+
+The UI is modal (vim-like), keyboard-only, no mouse. NORMAL mode: `j`/`k` or
+arrows move the chat selection, `i` or Enter writes a message (INSERT; Enter
+sends, Esc returns), `:` opens the command line, `?` shows help, `q` quits
+cleanly (the terminal is restored, nothing is left behind). Commands use a
+slash grammar and prompt for any fields interactively:
+
+  - `:profile` - show your full user id (share it so others can verify you); the
+    id is the fingerprint of your identity key, so it is the only thing anyone
+    needs to confirm out of band. `:profile/name <name>` sets your display name.
+  - `:contacts` address book; `:contacts/add` (prompts id, then name);
+    `:contacts/rename`, `:contacts/remove`; `:contacts/verify` marks the selected
+    contact as id-confirmed; `:contacts/suite <classical|hybrid|pq|default>` sets
+    a per-contact crypto suite.
+  - `:set` settings; `:set suite <classical|hybrid|pq>` sets the account default
+    suite (used when a contact has no override). See "Cryptography" for what the
+    suites mean; hybrid is the default.
+  - `:password/set` / `:password/off` / `:lock` - an optional local device lock
+    (a salted PBKDF2-SHA256 hash kept in the store; off by default).
+
+Anyone who messages you is auto-filed into the address book (so you can name them
+later). Incoming messages arrive over the live subscription stream; outgoing
+ones show a middle dot until the recipient's node confirms delivery, then a
+check mark. The open chat shows the suite you send under, the suite the peer last
+sent under, and whether you have marked them verified. SQLite is vendored as the
+public-domain amalgamation under `vendor/sqlite`; FTXUI (MIT) is the
+`vendor/ftxui` submodule.
 
 ### Release (static) binary
 
