@@ -655,7 +655,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             text("  i or Enter        write a message (INSERT)"),
             text("  :                 command line"),
             text("  ?                 this help"),
-            text("  q                 quit"),
+            text("  :q                quit (no bare q)"),
             text("INSERT: type, Enter sends, Esc back to NORMAL."),
             separator(),
             text("Commands:"),
@@ -830,7 +830,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
                          flex});
     } else {
       bottom = hbox({text(" NORMAL ") | bold | inverted,
-                     text("  j/k move  h/l pane  i write  : command  ? help  q quit") |
+                     text("  j/k move  h/l pane  i write  : command  ? help  :q quit") |
                          dim});
     }
 
@@ -907,7 +907,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         case Mode::Normal:
           overlay = Overlay::None;
           status =
-              "Ctrl+C does not quit - q or :q to quit, ? help, i write, : command";
+              "Ctrl+C does not quit - :q to quit, ? help, i write, : command";
           break;
       }
       return true;
@@ -1090,11 +1090,8 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       overlay = Overlay::Help;
       return true;
     }
-    if (e == Event::Character("q")) {
-      reader.stop();
-      screen.Exit();
-      return true;
-    }
+    // Quit is deliberately only ':q' (vim-style), never a bare 'q', so a stray
+    // keypress cannot drop the user out of the messenger.
     return true;  // swallow any other key in NORMAL
   });
 
