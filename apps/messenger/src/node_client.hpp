@@ -58,6 +58,15 @@ class NodeClient {
                            const tier::core::PeerId& to, std::uint8_t suite,
                            const std::string& body);
 
+  // Acknowledge an incoming message end to end: send a delivery_receipt for
+  // `msg_id` from the local user `from` back to its original sender `to`. This is
+  // the client-originated receipt that makes the sender's checkmark truthful (the
+  // node never acks on our behalf). Best-effort and fire-and-forget: returns true
+  // only if the node accepted it, but a dropped receipt just means no checkmark,
+  // never a lost message.
+  bool send_receipt(const tier::core::PeerId& from, const tier::core::PeerId& to,
+                    std::uint8_t suite, const MsgId& msg_id);
+
   // Ask the node for `user`'s online status (presence). Returns unknown if the
   // node was unreachable or replied malformed, as well as when it is genuinely
   // not resolved yet.
