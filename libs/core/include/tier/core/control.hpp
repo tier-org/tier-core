@@ -59,6 +59,11 @@ enum class ControlType : std::uint8_t {
   //                        an origin, carrying the origin's candidate addresses.
   hole_punch_request = 14,
   hole_punch_signal = 15,
+  // user_deregister - a device removes its own enrollment under a user id from
+  // the responsible communicator (presence: the device's last subscriber went
+  // away, so the user is no longer online). Same body and credential check as
+  // user_register; the communicator drops the (user, device) directory entry.
+  user_deregister = 16,
 };
 
 // Peek the control type of a received message without decoding it. Returns

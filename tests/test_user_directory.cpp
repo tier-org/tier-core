@@ -51,6 +51,22 @@ int main() {
     check(d.lookup(id_from(999), 50).empty(), "unknown user resolves empty");
   }
 
+  // remove(): a single (user, device) enrollment is dropped on demand (an
+  // authenticated user_deregister), and the user disappears once empty.
+  {
+    UserDirectory d;
+    const auto user = id_from(1);
+    d.enroll(user, id_from(10), 1, /*expiry=*/100, 0);
+    d.enroll(user, id_from(11), 1, /*expiry=*/100, 0);
+    check(!d.remove(user, id_from(99)), "removing an unknown device is a no-op");
+    check(d.remove(user, id_from(10)), "device 1 removed");
+    check(d.lookup(user, 50).size() == 1, "only device 2 remains");
+    check(d.remove(user, id_from(11)), "device 2 removed");
+    check(d.lookup(user, 50).empty() && d.user_count() == 0,
+          "user dropped once it has no devices");
+    check(!d.remove(id_from(999), id_from(10)), "removing from an unknown user is a no-op");
+  }
+
   // Expiry: a device drops out at its expiry, and the user disappears once it
   // has no live devices.
   {

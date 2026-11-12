@@ -145,6 +145,29 @@ int main() {
                                              1000, tier::crypto::ByteSpan()),
         "empty credential rejected");
 
+  // user_deregister codec: round-trips the user key and credential, and is
+  // distinct from a register frame (the type byte differs, so neither parser
+  // accepts the other's frame).
+  {
+    const auto dereg =
+        tier::msg::make_user_deregister(user.public_key(), sp(cred), /*issued=*/7);
+    const auto opened = tier::msg::open_user_deregister(sp(dereg));
+    check(opened.has_value(), "deregister frame parses");
+    if (opened) {
+      check(opened->user_pub == user.public_key(),
+            "deregister carries the user key");
+      check(opened->credential == cred, "deregister carries the credential");
+    }
+    check(!tier::msg::open_user_register(sp(dereg)).has_value(),
+          "a register parser rejects a deregister frame");
+    const auto reg = tier::msg::make_user_register(user.public_key(), sp(cred),
+                                                   /*issued=*/7, /*expiry=*/99);
+    check(!tier::msg::open_user_deregister(sp(reg)).has_value(),
+          "a deregister parser rejects a register frame");
+    check(!tier::msg::open_user_deregister(tier::crypto::ByteSpan()).has_value(),
+          "empty deregister rejected");
+  }
+
   if (g_failures == 0) {
     std::puts("ok");
     return 0;

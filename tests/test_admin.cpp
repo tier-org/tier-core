@@ -177,12 +177,22 @@ int main() {
 
   // send_as reply, and the user CRUD replies, round-trip.
   {
-    check(tier::core::decode_admin_send_as_reply(
-              tier::core::encode_admin_send_as_reply(true)) == std::optional<bool>(true),
-          "send_as reply ok round-trips");
-    check(tier::core::decode_admin_send_as_reply(
-              tier::core::encode_admin_send_as_reply(false)) == std::optional<bool>(false),
-          "send_as reply fail round-trips");
+    using tier::core::SendStatus;
+    for (const auto s : {SendStatus::accepted, SendStatus::failed,
+                         SendStatus::recipient_offline}) {
+      check(tier::core::decode_admin_send_as_reply(
+                tier::core::encode_admin_send_as_reply(s)) ==
+                std::optional<SendStatus>(s),
+            "send_as reply status round-trips");
+    }
+    using tier::core::UserPresence;
+    for (const auto p : {UserPresence::unknown, UserPresence::online,
+                         UserPresence::offline}) {
+      check(tier::core::decode_admin_user_status_reply(
+                tier::core::encode_admin_user_status_reply(p)) ==
+                std::optional<UserPresence>(p),
+            "user_status reply round-trips");
+    }
 
     tier::core::AdminUserAddReply rep;
     rep.ok = true;

@@ -801,15 +801,32 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
       }
       case tier::core::AdminOp::send_as: {
         if (!tier::msg::is_known_suite(req.suite)) {
-          return tier::core::encode_admin_send_as_reply(false);
+          return tier::core::encode_admin_send_as_reply(
+              tier::core::SendStatus::failed);
         }
         const auto result = node.send_as_user(
             req.from_user, req.recipient,
             static_cast<tier::msg::Suite>(req.suite),
             std::span<const tier::crypto::Byte>(req.plaintext.data(),
                                                 req.plaintext.size()));
-        return tier::core::encode_admin_send_as_reply(
-            result != tier::net::Node::SendResult::failed);
+        tier::core::SendStatus status = tier::core::SendStatus::accepted;
+        if (result == tier::net::Node::SendResult::failed) {
+          status = tier::core::SendStatus::failed;
+        } else if (result ==
+                   tier::net::Node::SendResult::recipient_offline) {
+          status = tier::core::SendStatus::recipient_offline;
+        }
+        return tier::core::encode_admin_send_as_reply(status);
+      }
+      case tier::core::AdminOp::user_status: {
+        const auto p = node.query_user_presence(req.recipient);
+        tier::core::UserPresence up = tier::core::UserPresence::unknown;
+        if (p == tier::net::Node::Presence::online) {
+          up = tier::core::UserPresence::online;
+        } else if (p == tier::net::Node::Presence::offline) {
+          up = tier::core::UserPresence::offline;
+        }
+        return tier::core::encode_admin_user_status_reply(up);
       }
       case tier::core::AdminOp::user_add: {
         tier::crypto::NodeIdentity ident =
@@ -864,12 +881,22 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
 
   // Periodically report how many peers we know of versus how many we actually
   // hold a connection to, so mesh formation is visible at a glance.
+  // Presence: a user is online exactly while it has a live subscriber. A debounce
+  // on going offline absorbs a client that reconnects quickly (restart, chat
+  // reopen), so we do not flap the directory enrollment on every blip.
+  constexpr auto kPresenceOfflineGrace = std::chrono::seconds(3);
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> offline_at;
+
   // A subscribe request's connection is kept open and handed to the hub, keyed
   // by the local user it streams. A user hosted here can be subscribed to even
   // before it is added; delivery just finds no subscriber until one attaches.
-  const auto subscribe_hook = [&hub](const tier::core::AdminRequest& req,
-                                     int fd) -> bool {
+  // Attaching marks the user online and cancels any pending offline.
+  const auto subscribe_hook = [&hub, &node, &offline_at](
+                                  const tier::core::AdminRequest& req,
+                                  int fd) -> bool {
     hub.add(req.recipient, fd);
+    offline_at.erase(req.recipient);
+    node.set_user_presence(req.recipient, true);
     return true;
   };
 
@@ -883,6 +910,25 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
       admin->serve(admin_handler, subscribe_hook);
     }
     const auto now = std::chrono::steady_clock::now();
+    // Presence maintenance: a client that fully closed its connection makes its
+    // user a candidate for offline after the grace window; a re-subscribe before
+    // then cancels it. Only flip to offline once the grace elapses and the user
+    // still has no subscriber.
+    for (const auto& user : hub.reap_closed()) {
+      if (!hub.has(user)) {
+        offline_at[user] = now + kPresenceOfflineGrace;
+      }
+    }
+    for (auto it = offline_at.begin(); it != offline_at.end();) {
+      if (hub.has(it->first)) {
+        it = offline_at.erase(it);  // re-subscribed within the grace
+      } else if (now >= it->second) {
+        node.set_user_presence(it->first, false);
+        it = offline_at.erase(it);
+      } else {
+        ++it;
+      }
+    }
     if (now - last_status >= std::chrono::seconds(2)) {
       std::printf("status: known=%zu connected=%zu\n", node.membership().size(),
                   node.connected_peers().size());

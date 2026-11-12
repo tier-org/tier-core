@@ -62,6 +62,13 @@ constexpr auto kUserRegisterInterval = std::chrono::seconds(120);
 // added user or node stays unreachable for up to the refresh interval. Shared
 // by register_user and register_presence.
 constexpr auto kRegisterRetry = std::chrono::seconds(2);
+// Presence cache (sender side, for query_user_presence). A reading older than
+// kPresenceTtl ages back to unknown; while the app keeps asking, a fresh lookup
+// is issued no more often than kPresenceRefresh; a user the app has not asked
+// about for kPresenceWatchIdle is dropped from the watch set.
+constexpr auto kPresenceTtl = std::chrono::seconds(15);
+constexpr auto kPresenceRefresh = std::chrono::seconds(2);
+constexpr auto kPresenceWatchIdle = std::chrono::seconds(30);
 constexpr std::uint64_t kDeviceCredentialTtlSeconds = 365ULL * 24 * 3600;
 
 // Application-message kind, the first byte of the sealed transport plaintext.
@@ -263,6 +270,10 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
       handle_user_register(from, payload, unix_now());
       return;
     }
+    if (ctype == tier::core::ControlType::user_deregister) {
+      handle_user_deregister(from, payload, unix_now());
+      return;
+    }
     if (ctype == tier::core::ControlType::user_lookup) {
       handle_user_lookup(conn, payload, unix_now());
       return;
@@ -406,6 +417,7 @@ void Node::poll(int timeout_ms) {
   // are a communicator).
   register_user(now, unow);
   service_user_sends(now);
+  service_presence(now);
   user_directory_.prune(unow);
 
   // Expire demotion-propagation windows: once elapsed, a demoted peer's client
@@ -1059,6 +1071,94 @@ bool Node::has_user(const tier::core::PeerId& user_id) const {
   return users_.find(user_id) != users_.end();
 }
 
+void Node::set_user_presence(const tier::core::PeerId& user_id, bool online) {
+  const auto it = users_.find(user_id);
+  if (it == users_.end()) {
+    return;  // not hosted here
+  }
+  LocalUser& lu = it->second;
+  if (lu.present == online) {
+    return;  // no change
+  }
+  lu.present = online;
+  if (online) {
+    // Coming online: enroll promptly, and cancel any pending de-enroll.
+    lu.deregister_pending = false;
+    lu.next_register = std::chrono::steady_clock::time_point{};
+  } else {
+    // Going offline: register_user owes a deregister to the responsible set.
+    lu.deregister_pending = true;
+  }
+}
+
+Node::Presence Node::query_user_presence(const tier::core::PeerId& user_id) {
+  // A locally hosted user is answered exactly from its own subscriber state;
+  // nothing to resolve over the network.
+  if (const auto it = users_.find(user_id); it != users_.end()) {
+    return it->second.present ? Presence::online : Presence::offline;
+  }
+  const auto now = std::chrono::steady_clock::now();
+  auto& e = presence_[user_id];
+  e.last_query = now;
+  // Force a fresh lookup on this query (the app asks at its own cadence, ~1.5s,
+  // so this is not spammy) rather than waiting out the background refresh gate,
+  // then expire a stale reading back to unknown.
+  e.last_lookup = {};
+  service_presence(now);
+  if (e.state != Presence::unknown && now - e.updated > kPresenceTtl) {
+    e.state = Presence::unknown;
+  }
+  return e.state;
+}
+
+void Node::service_presence(std::chrono::steady_clock::time_point now) {
+  if (presence_.empty()) {
+    return;
+  }
+  const auto comms = live_communicators();
+  const std::uint64_t now_unix = unix_now();
+  for (auto it = presence_.begin(); it != presence_.end();) {
+    const tier::core::PeerId& user = it->first;
+    PresenceEntry& e = it->second;
+    // Drop users the app has stopped asking about.
+    if (now - e.last_query > kPresenceWatchIdle) {
+      it = presence_.erase(it);
+      continue;
+    }
+    // Expire a stale reading.
+    if (e.state != Presence::unknown && now - e.updated > kPresenceTtl) {
+      e.state = Presence::unknown;
+    }
+    if (now - e.last_lookup < kPresenceRefresh) {
+      ++it;
+      continue;
+    }
+    e.last_lookup = now;
+    // Fast path: this node may itself be a responsible communicator - consult the
+    // local directory, which answers presence without a round trip.
+    if (is_responsible_for(self_id_, user, comms, kPresenceReplicas)) {
+      const bool online = !user_directory_.lookup(user, now_unix).empty();
+      e.state = online ? Presence::online : Presence::offline;
+      e.updated = now;
+    }
+    // Also ask the remote responsible communicators (a replica may hold the entry
+    // when the local one does not, and vice versa); the result updates the cache.
+    const auto responsible =
+        responsible_communicators(user, comms, kPresenceReplicas);
+    for (const auto& c : responsible) {
+      if (c == self_id_) {
+        continue;
+      }
+      if (const auto conn = conn_by_peer_.find(c); conn != conn_by_peer_.end()) {
+        endpoint_.send(conn->second, tier::msg::make_user_lookup(user));
+      } else if (const auto info = membership_.find(c); info) {
+        dial_addresses(info->addresses, now);
+      }
+    }
+    ++it;
+  }
+}
+
 void Node::set_simulated_restricted_nat(bool on) {
   endpoint_.set_simulated_restricted_nat(on);
 }
@@ -1154,6 +1254,26 @@ void Node::handle_user_register(const tier::core::PeerId& from_device,
                          reg->issued_unix, expiry, now_unix);
 }
 
+void Node::handle_user_deregister(const tier::core::PeerId& from_device,
+                                  std::span<const tier::crypto::Byte> payload,
+                                  std::uint64_t now_unix) {
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto reg = tier::msg::open_user_deregister(payload);
+  if (!reg) {
+    return;
+  }
+  // The credential must still authorize exactly the device on the other end, so
+  // only the enrolled device itself can remove its entry (not a third party).
+  if (!tier::msg::verify_device_credential(
+          network_, reg->user_pub, from_device, now_unix,
+          tier::crypto::ByteSpan(reg->credential.data(), reg->credential.size()))) {
+    return;
+  }
+  (void)user_directory_.remove(tier::msg::user_id_of(reg->user_pub), from_device);
+}
+
 void Node::handle_user_lookup(ConnId conn,
                               std::span<const tier::crypto::Byte> payload,
                               std::uint64_t now_unix) {
@@ -1169,27 +1289,46 @@ void Node::handle_user_lookup(ConnId conn,
 }
 
 void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
-                              std::chrono::steady_clock::time_point /*now*/) {
-  if (users_.empty()) {
-    return;  // nothing to send on behalf of
-  }
-  // Match the result to a user we are resolving.
+                              std::chrono::steady_clock::time_point now) {
+  // Match the result to a user we are resolving - a queued send or a watched
+  // presence. The frame carries one user id and open_user_result needs it as the
+  // expected id, so try each candidate (pending sends first, then presence).
   tier::core::PeerId user{};
   std::vector<tier::core::PeerId> devices;
   bool matched = false;
   for (const auto& [u, queue] : pending_user_sends_) {
-    const auto res = tier::msg::open_user_result(u, payload);
-    if (res) {
+    if (const auto res = tier::msg::open_user_result(u, payload)) {
       user = u;
       devices = res->device_ids;
       matched = true;
       break;
     }
   }
-  if (!matched || devices.empty()) {
-    return;  // keep the queued message pending (retry/time out) if no devices yet
+  if (!matched) {
+    for (const auto& [u, e] : presence_) {
+      if (const auto res = tier::msg::open_user_result(u, payload)) {
+        user = u;
+        devices = res->device_ids;
+        matched = true;
+        break;
+      }
+    }
   }
-  deliver_resolved_user(user, devices);
+  if (!matched) {
+    return;
+  }
+  // Update the presence cache: a non-empty device set means online, an empty one
+  // offline. In steady state both responsible replicas agree (a user enrolls
+  // with, and de-enrolls from, all of them), so the last answer in a round is
+  // authoritative; any flicker is confined to the brief enroll/de-enroll window
+  // where the state is genuinely changing anyway.
+  if (const auto pit = presence_.find(user); pit != presence_.end()) {
+    pit->second.state = devices.empty() ? Presence::offline : Presence::online;
+    pit->second.updated = now;
+  }
+  if (!devices.empty()) {
+    deliver_resolved_user(user, devices);
+  }
 }
 
 void Node::deliver_resolved_user(
@@ -1242,15 +1381,42 @@ void Node::register_user(std::chrono::steady_clock::time_point now,
     return;
   }
   const auto comms = live_communicators();
-  if (comms.empty()) {
-    return;
-  }
-  // Enroll each hosted user with the communicators responsible for its id. The
-  // responsible set is recomputed every tick: it depends on the live
-  // communicator set, which grows as membership converges and shifts when a
-  // communicator joins or leaves, so we must react to a change immediately
-  // rather than only on the refresh timer.
+  // Enroll each ONLINE hosted user with the communicators responsible for its
+  // id, and de-enroll any that went offline. The responsible set is recomputed
+  // every tick: it depends on the live communicator set, which grows as
+  // membership converges and shifts when a communicator joins or leaves, so we
+  // react to a change immediately rather than only on the refresh timer.
   for (auto& [uid, lu] : users_) {
+    // Offline: de-enroll from wherever it was last enrolled, then stop
+    // refreshing. The directory TTL is the backstop if a responsible
+    // communicator is unreachable right now.
+    if (!lu.present) {
+      if (lu.deregister_pending || !lu.enrolled_to.empty()) {
+        const std::vector<tier::crypto::Byte> dereg =
+            tier::msg::make_user_deregister(
+                lu.identity.public_key(),
+                tier::crypto::ByteSpan(lu.device_credential.data(),
+                                       lu.device_credential.size()),
+                now_unix);
+        for (const auto& c : lu.enrolled_to) {
+          if (c == self_id_) {
+            (void)user_directory_.remove(uid, self_id_);
+            continue;
+          }
+          if (const auto conn = conn_by_peer_.find(c);
+              conn != conn_by_peer_.end()) {
+            endpoint_.send(conn->second, dereg);
+          }
+        }
+        lu.enrolled_to.clear();
+        lu.deregister_pending = false;
+      }
+      continue;
+    }
+
+    if (comms.empty()) {
+      continue;  // online, but no communicator known yet; retry next tick
+    }
     const auto responsible =
         responsible_communicators(uid, comms, kPresenceReplicas);
     const bool set_changed = responsible != lu.enrolled_to;
@@ -1353,6 +1519,20 @@ Node::SendResult Node::send_as_user(const tier::core::PeerId& from_user,
                                     std::span<const tier::crypto::Byte> plaintext) {
   if (users_.find(from_user) == users_.end()) {
     return SendResult::failed;  // from_user is not hosted here
+  }
+  // Presence gate: refuse rather than silently drop when the recipient has no
+  // online device. A locally hosted recipient is exact (its own subscriber
+  // state); a remote one is refused only on positive, fresh evidence of offline
+  // (a not-yet-resolved `unknown` still queues and resolves as before, so a
+  // client that has not consulted presence is not newly broken).
+  if (const auto local = users_.find(to_user); local != users_.end()) {
+    if (!local->second.present) {
+      return SendResult::recipient_offline;
+    }
+  } else if (const auto p = presence_.find(to_user);
+             p != presence_.end() && p->second.state == Presence::offline &&
+             std::chrono::steady_clock::now() - p->second.updated <= kPresenceTtl) {
+    return SendResult::recipient_offline;
   }
   PendingUserSend pending;
   pending.from_user = from_user;

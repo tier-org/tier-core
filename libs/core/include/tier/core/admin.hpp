@@ -28,6 +28,24 @@ enum class AdminOp : std::uint8_t {
   user_remove = 8,  // stop hosting a user identity
   send_as = 9,      // send from a local user to a user id (fans out to devices)
   subscribe = 10,   // stream messages/receipts for a local user (push mode)
+  user_status = 11, // query a recipient user id's online status (presence)
+};
+
+// Status of a send_as (user) send. `accepted` means sent or queued; `failed`
+// means it could not be accepted at all (e.g. the sending user is not hosted);
+// `recipient_offline` means the recipient user has no online device, so the
+// message was refused rather than dropped (see docs/multi-identity.md presence).
+enum class SendStatus : std::uint8_t {
+  accepted = 0,
+  failed = 1,
+  recipient_offline = 2,
+};
+
+// A recipient user's online status, as the node reports it to a client.
+enum class UserPresence : std::uint8_t {
+  unknown = 0,  // not resolved yet (keep asking)
+  online = 1,
+  offline = 2,
 };
 
 // Bumped to 2 when the embedded membership record grew a version field, to 3
@@ -41,8 +59,9 @@ enum class AdminOp : std::uint8_t {
 // (message / receipt, used by tier-messenger and `tierctl stream`) arrived.
 // tierctl and tierd ship together in one package, so the admin plane need not
 // stay compatible across versions, but the bump makes a mismatched pair fail
-// cleanly.
-inline constexpr std::uint8_t kAdminVersion = 8;
+// cleanly. Bumped to 9 when presence arrived: the user_status op, and the
+// send_as reply carrying a recipient_offline status (not just ok/failed).
+inline constexpr std::uint8_t kAdminVersion = 9;
 
 // Largest application-message plaintext accepted over the admin socket. Ample
 // for text messages; a node-to-node sealed message can be larger (up to the
@@ -116,8 +135,16 @@ std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> i
 // (status 0 = accepted - sent or queued, 1 = failed). `op` echoes the request.
 std::vector<std::uint8_t> encode_admin_send_reply(bool ok);
 std::optional<bool> decode_admin_send_reply(std::span<const std::uint8_t> in);
-std::vector<std::uint8_t> encode_admin_send_as_reply(bool ok);
-std::optional<bool> decode_admin_send_as_reply(std::span<const std::uint8_t> in);
+// send_as reply: [version:1][op:9][status:1] where status is a SendStatus.
+std::vector<std::uint8_t> encode_admin_send_as_reply(SendStatus status);
+std::optional<SendStatus> decode_admin_send_as_reply(std::span<const std::uint8_t> in);
+
+// user_status request: [version:1][op:11][user_id:32]. Reply:
+// [version:1][op:11][state:1] where state is a UserPresence.
+std::vector<std::uint8_t> encode_admin_user_status(const PeerId& user_id);
+std::vector<std::uint8_t> encode_admin_user_status_reply(UserPresence state);
+std::optional<UserPresence> decode_admin_user_status_reply(
+    std::span<const std::uint8_t> in);
 
 // user_add response: [version:1][op:6][status:1][user_id:32] (user id zeroed on
 // failure). user_remove response: [version:1][op:8][existed:1].

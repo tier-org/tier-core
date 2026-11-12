@@ -186,11 +186,26 @@ done
 # Every sender must get one delivery receipt back per message it sent. This is
 # the assertion the star gates approximate (>=1) but here it must hold for every
 # ordered pair across the all-role mesh.
+# A receipt is itself a user message, resolved and routed back asynchronously, so
+# wait for it like we wait for delivery rather than counting once.
+receipt_count() {  # $1 = service -> prints how many receipts its stream shows
+  printf '%s\n' "$(read_stream "$1")" | grep -c '^receipt ' || true
+}
+wait_for_receipts() {  # $1 = service, $2 = wanted count
+  local deadline
+  deadline=$(( $(date +%s) + message_timeout ))
+  while :; do
+    [ "$(receipt_count "$1")" -ge "$2" ] && break
+    [ "$(date +%s)" -ge "$deadline" ] && break
+    sleep 1
+  done
+}
+
 echo "== verifying delivery receipts (one per sent message, per sender) =="
 for s in $nodes; do
-  acc="$(read_stream "$s")"
-  got="$(printf '%s\n' "$acc" | grep -c '^receipt ' || true)"
   want="${sent_count[$s]}"
+  wait_for_receipts "$s" "$want"
+  got="$(receipt_count "$s")"
   if [ "${got:-0}" -ge "$want" ]; then
     echo "$s received $got receipt(s) (sent $want)"
   else

@@ -272,6 +272,7 @@ bool FailureDetector::handle(Clock::time_point now, const PeerId& from,
     case ControlType::presence_lookup:
     case ControlType::presence_result:
     case ControlType::user_register:
+    case ControlType::user_deregister:
     case ControlType::user_lookup:
     case ControlType::user_result:
     case ControlType::hole_punch_request:

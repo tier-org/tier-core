@@ -55,6 +55,19 @@ bool UserDirectory::enroll(const tier::core::PeerId& user,
   return true;
 }
 
+bool UserDirectory::remove(const tier::core::PeerId& user,
+                           const tier::core::PeerId& device) {
+  const auto user_it = users_.find(user);
+  if (user_it == users_.end()) {
+    return false;
+  }
+  const bool erased = user_it->second.erase(device) != 0;
+  if (user_it->second.empty()) {
+    users_.erase(user_it);
+  }
+  return erased;
+}
+
 std::vector<tier::core::PeerId> UserDirectory::lookup(
     const tier::core::PeerId& user, std::uint64_t now_unix) const {
   std::vector<tier::core::PeerId> out;

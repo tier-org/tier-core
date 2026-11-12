@@ -92,6 +92,15 @@ struct UserRegister {
 // credential against the connection's device id with verify_device_credential).
 [[nodiscard]] std::optional<UserRegister> open_user_register(ByteSpan message);
 
+// A device removes its own enrollment under a user id (presence: its last
+// subscriber went away). Same body and credential check as a register, so the
+// communicator proves the device controls the enrollment before dropping it;
+// the expiry field is unused. Parsed back into UserRegister (expiry ignored).
+[[nodiscard]] std::vector<Byte> make_user_deregister(
+    const tier::crypto::Ed25519PublicKey& user_pub, ByteSpan credential,
+    std::uint64_t issued_unix);
+[[nodiscard]] std::optional<UserRegister> open_user_deregister(ByteSpan message);
+
 // Resolve a user id to its enrolled device ids.
 [[nodiscard]] std::vector<Byte> make_user_lookup(const tier::core::PeerId& user_id);
 [[nodiscard]] std::optional<tier::core::PeerId> open_user_lookup(ByteSpan message);

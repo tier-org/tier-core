@@ -78,6 +78,10 @@ int main() {
     host_inbox.attach(host);
     const auto alice = host.add_user(tier::crypto::NodeIdentity::generate());
     const auto bob = host.add_user(tier::crypto::NodeIdentity::generate());
+    // Online = a client is subscribed; the Node tests stand in for that hub by
+    // marking hosted users present so they enroll and become addressable.
+    host.set_user_presence(alice, true);
+    host.set_user_presence(bob, true);
     check(host.has_user(alice) && host.has_user(bob), "both users hosted");
     check(host.user_ids().size() == 2, "node reports two hosted users");
 
@@ -124,6 +128,8 @@ int main() {
   const auto user = tier::crypto::NodeIdentity::generate();
   const auto user_id = device1.add_user(from_same_seed(user));
   const auto user_id2 = device2.add_user(from_same_seed(user));
+  device1.set_user_presence(user_id, true);
+  device2.set_user_presence(user_id2, true);
   check(user_id == user_id2, "both devices host the one user id");
   check(device1.peer_id() != device2.peer_id(),
         "the two devices have distinct device ids");
@@ -131,6 +137,7 @@ int main() {
   // The sender hosts its own distinct user identity.
   const auto sender_user_id =
       sender.add_user(tier::crypto::NodeIdentity::generate());
+  sender.set_user_presence(sender_user_id, true);
 
   // Everyone attaches to the communicator.
   device1.connect("127.0.0.1", comm.local_port());
@@ -203,6 +210,7 @@ int main() {
   Inbox d3_inbox;
   d3_inbox.attach(device3);
   device3.add_user(from_same_seed(user));
+  device3.set_user_presence(user_id, true);
   const auto late_pt = bytes("to-user late-enroll");
   {
     const auto res = sender.send_as_user(
@@ -246,6 +254,8 @@ int main() {
     ib.attach(nb);
     const auto ua = na.add_user(tier::crypto::NodeIdentity::generate());
     const auto ub = nb.add_user(tier::crypto::NodeIdentity::generate());
+    na.set_user_presence(ua, true);
+    nb.set_user_presence(ub, true);
 
     na.connect("127.0.0.1", nb.local_port());
     std::vector<tier::net::Node*> both{&na, &nb};
@@ -311,6 +321,7 @@ int main() {
       mesh.push_back(nodes[i].get());
       inbox[i].attach(*nodes[i]);
       uid[i] = nodes[i]->add_user(tier::crypto::NodeIdentity::generate());
+      nodes[i]->set_user_presence(uid[i], true);
     }
     // Full mesh: connect every pair so each node learns every other.
     for (std::size_t i = 0; i < kN; ++i) {
@@ -375,6 +386,118 @@ int main() {
     }
     check(all_delivered(),
           "every ordered user pair delivered across the all-role mesh");
+  }
+
+  // --- presence: online/offline gating (docs/multi-identity.md) --------------
+  // A user is addressable only while it has a live subscriber; set_user_presence
+  // stands in for the subscriber hub. A send to an offline user is refused
+  // (recipient_offline) instead of silently dropped, and query_user_presence
+  // reports the status the messenger shows.
+  {
+    using Presence = tier::net::Node::Presence;
+    using SendResult = tier::net::Node::SendResult;
+
+    // Co-resident: exact and synchronous (a node knows its own users' presence).
+    {
+      tier::net::Node host = make_node(Role::client);
+      Inbox hi;
+      hi.attach(host);
+      const auto ua = host.add_user(tier::crypto::NodeIdentity::generate());
+      const auto ub = host.add_user(tier::crypto::NodeIdentity::generate());
+      host.set_user_presence(ua, true);  // ub is left offline
+      const auto p = bytes("to local user");
+      check(host.send_as_user(ua, ub, Suite::hybrid,
+                              std::span<const Byte>(p.data(), p.size())) ==
+                SendResult::recipient_offline,
+            "co-resident send to an offline user is refused");
+      check(host.query_user_presence(ub) == Presence::offline,
+            "local offline user reads offline");
+      host.set_user_presence(ub, true);
+      check(host.query_user_presence(ub) == Presence::online,
+            "local online user reads online");
+      check(host.send_as_user(ua, ub, Suite::hybrid,
+                              std::span<const Byte>(p.data(), p.size())) ==
+                SendResult::queued,
+            "co-resident send to an online user is accepted");
+      bool got = false;
+      for (int i = 0; i < 300 && !got; ++i) {
+        host.poll(2);
+        for (const auto& m : hi.msgs) {
+          if (m.plaintext == p && m.recipient_user && *m.recipient_user == ub) {
+            got = true;
+          }
+        }
+      }
+      check(got, "co-resident online delivery (loopback) works");
+    }
+
+    // Cross-node: presence flows through the directory - offline refuses, online
+    // delivers, going offline again refuses once more.
+    {
+      tier::net::Node na(tier::crypto::NodeIdentity::generate(),
+                         tier::core::kAllRoles, "127.0.0.1", 0);
+      tier::net::Node nb(tier::crypto::NodeIdentity::generate(),
+                         tier::core::kAllRoles, "127.0.0.1", 0);
+      Inbox ib;
+      ib.attach(nb);
+      const auto ua = na.add_user(tier::crypto::NodeIdentity::generate());
+      const auto ub = nb.add_user(tier::crypto::NodeIdentity::generate());
+      na.set_user_presence(ua, true);  // ub starts offline (no subscriber)
+      na.connect("127.0.0.1", nb.local_port());
+      std::vector<tier::net::Node*> both{&na, &nb};
+      for (int i = 0; i < 8000 && !(na.has_encryption_keys(nb.peer_id()) &&
+                                    nb.has_encryption_keys(na.peer_id()));
+           ++i) {
+        pump(both, 1);
+      }
+      check(na.has_encryption_keys(nb.peer_id()), "presence: nodes meshed");
+
+      const auto settle_presence = [&](Presence want) {
+        for (int i = 0; i < 6000; ++i) {
+          pump(both, 1);
+          if (na.query_user_presence(ub) == want) {
+            return true;
+          }
+        }
+        return false;
+      };
+
+      check(settle_presence(Presence::offline),
+            "remote offline user resolves to offline");
+      const auto p1 = bytes("to offline remote");
+      check(na.send_as_user(ua, ub, Suite::hybrid,
+                            std::span<const Byte>(p1.data(), p1.size())) ==
+                SendResult::recipient_offline,
+            "cross-node send to an offline user is refused");
+
+      nb.set_user_presence(ub, true);
+      check(settle_presence(Presence::online),
+            "remote user resolves to online once a subscriber attaches");
+      const auto p2 = bytes("to online remote");
+      check(na.send_as_user(ua, ub, Suite::hybrid,
+                            std::span<const Byte>(p2.data(), p2.size())) ==
+                SendResult::queued,
+            "cross-node send to an online user is accepted");
+      bool delivered = false;
+      for (int i = 0; i < 20000 && !delivered; ++i) {
+        pump(both, 1);
+        for (const auto& m : ib.msgs) {
+          if (m.plaintext == p2 && m.recipient_user && *m.recipient_user == ub) {
+            delivered = true;
+          }
+        }
+      }
+      check(delivered, "cross-node online delivery works");
+
+      nb.set_user_presence(ub, false);
+      check(settle_presence(Presence::offline),
+            "remote user resolves back to offline after de-enroll");
+      const auto p3 = bytes("to offline again");
+      check(na.send_as_user(ua, ub, Suite::hybrid,
+                            std::span<const Byte>(p3.data(), p3.size())) ==
+                SendResult::recipient_offline,
+            "cross-node send after going offline is refused again");
+    }
   }
 
   if (g_failures == 0) {

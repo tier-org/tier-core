@@ -19,6 +19,8 @@ constexpr std::uint8_t kUserLookupType =
     static_cast<std::uint8_t>(tier::core::ControlType::user_lookup);
 constexpr std::uint8_t kUserResultType =
     static_cast<std::uint8_t>(tier::core::ControlType::user_result);
+constexpr std::uint8_t kUserDeregisterType =
+    static_cast<std::uint8_t>(tier::core::ControlType::user_deregister);
 
 // Bounds for the directory codecs (untrusted input).
 constexpr std::uint16_t kMaxCredBlob = 256;    // expiry+siglen+sig, ~138 bytes
@@ -214,6 +216,43 @@ std::optional<UserRegister> open_user_register(ByteSpan message) {
   Reader r(message);
   std::uint8_t type = 0;
   if (!r.take_u8(type) || type != kUserRegisterType) return std::nullopt;
+
+  UserRegister reg;
+  ByteSpan pub;
+  if (!r.take(reg.user_pub.size(), pub)) return std::nullopt;
+  std::memcpy(reg.user_pub.data(), pub.data(), reg.user_pub.size());
+  if (!r.take_u64(reg.issued_unix) || !r.take_u64(reg.expiry_unix)) {
+    return std::nullopt;
+  }
+  std::uint16_t cred_len = 0;
+  ByteSpan cred;
+  if (!r.take_u16(cred_len) || cred_len > kMaxCredBlob || !r.take(cred_len, cred) ||
+      !r.rest().empty()) {
+    return std::nullopt;
+  }
+  reg.credential.assign(cred.begin(), cred.end());
+  return reg;
+}
+
+std::vector<Byte> make_user_deregister(
+    const tier::crypto::Ed25519PublicKey& user_pub, ByteSpan credential,
+    std::uint64_t issued_unix) {
+  // Same body as a register (so the communicator runs the identical credential
+  // check), only the type byte differs and the expiry field is unused (0).
+  std::vector<Byte> out;
+  out.push_back(kUserDeregisterType);
+  put_bytes(out, ByteSpan(user_pub.data(), user_pub.size()));
+  put_u64(out, issued_unix);
+  put_u64(out, 0);
+  put_u16(out, static_cast<std::uint16_t>(credential.size()));
+  put_bytes(out, credential);
+  return out;
+}
+
+std::optional<UserRegister> open_user_deregister(ByteSpan message) {
+  Reader r(message);
+  std::uint8_t type = 0;
+  if (!r.take_u8(type) || type != kUserDeregisterType) return std::nullopt;
 
   UserRegister reg;
   ByteSpan pub;

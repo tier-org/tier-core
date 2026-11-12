@@ -43,12 +43,25 @@ class NodeClient {
       std::optional<std::array<std::uint8_t, 32>> seed);
   bool remove_user(const tier::core::PeerId& user);
 
+  // Outcome of a send_text. `accepted` carries the correlation id (to match a
+  // later receipt); `offline` means the recipient has no online device (the node
+  // refused rather than dropping); `failed` is any other rejection or unreachable
+  // node.
+  enum class SendOutcome : std::uint8_t { accepted, offline, failed };
+  struct SendTextResult {
+    SendOutcome outcome = SendOutcome::failed;
+    MsgId id{};
+  };
+
   // Send `body` as a text frame from `from` to `to`, requesting a receipt.
-  // Returns the random correlation id on acceptance (to match a later receipt),
-  // or nullopt if the node rejected or was unreachable.
-  std::optional<MsgId> send_text(const tier::core::PeerId& from,
-                                 const tier::core::PeerId& to, std::uint8_t suite,
-                                 const std::string& body);
+  SendTextResult send_text(const tier::core::PeerId& from,
+                           const tier::core::PeerId& to, std::uint8_t suite,
+                           const std::string& body);
+
+  // Ask the node for `user`'s online status (presence). Returns unknown if the
+  // node was unreachable or replied malformed, as well as when it is genuinely
+  // not resolved yet.
+  tier::core::UserPresence user_status(const tier::core::PeerId& user);
 
   // Open a blocking connection subscribed to `user`. Returns the socket fd
   // (caller owns and closes it) or -1 on failure. Read records with StreamParser.

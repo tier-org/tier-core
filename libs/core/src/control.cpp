@@ -364,6 +364,8 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
       return ControlType::presence_result;
     case static_cast<std::uint8_t>(ControlType::user_register):
       return ControlType::user_register;
+    case static_cast<std::uint8_t>(ControlType::user_deregister):
+      return ControlType::user_deregister;
     case static_cast<std::uint8_t>(ControlType::user_lookup):
       return ControlType::user_lookup;
     case static_cast<std::uint8_t>(ControlType::user_result):

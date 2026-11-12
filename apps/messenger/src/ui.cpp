@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
@@ -169,6 +170,81 @@ class StreamReader {
   std::deque<tier::core::AdminStreamEvent> events_;
 };
 
+// Background poller of one contact's online status. user_status is a blocking
+// admin round-trip, so it never runs on the UI thread; the result is read
+// atomically by the renderer. The target follows the selected chat; switching
+// target resets to unknown and polls promptly.
+class PresencePoller {
+ public:
+  PresencePoller(NodeClient& client, ScreenInteractive& screen)
+      : client_(client), screen_(screen) {}
+  ~PresencePoller() { stop(); }
+  PresencePoller(const PresencePoller&) = delete;
+  PresencePoller& operator=(const PresencePoller&) = delete;
+
+  void start() {
+    stop_ = false;
+    thread_ = std::thread([this] { run(); });
+  }
+  void stop() {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    if (thread_.joinable()) {
+      thread_.join();
+    }
+  }
+  void set_target(const tier::core::PeerId& user) {
+    {
+      std::lock_guard<std::mutex> lk(mu_);
+      if (has_target_ && target_ == user) {
+        return;
+      }
+      target_ = user;
+      has_target_ = true;
+      state_.store(tier::core::UserPresence::unknown);
+    }
+    cv_.notify_all();
+  }
+  void clear_target() {
+    std::lock_guard<std::mutex> lk(mu_);
+    has_target_ = false;
+    state_.store(tier::core::UserPresence::unknown);
+  }
+  [[nodiscard]] tier::core::UserPresence state() const { return state_.load(); }
+
+ private:
+  void run() {
+    std::unique_lock<std::mutex> lk(mu_);
+    while (!stop_) {
+      if (has_target_) {
+        const tier::core::PeerId target = target_;
+        lk.unlock();
+        const auto s = client_.user_status(target);
+        lk.lock();
+        if (has_target_ && target_ == target) {
+          state_.store(s);
+          screen_.PostEvent(Event::Custom);
+        }
+      }
+      cv_.wait_for(lk, std::chrono::milliseconds(1500));
+    }
+  }
+
+  NodeClient& client_;
+  ScreenInteractive& screen_;
+  std::thread thread_;
+  bool stop_ = true;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  tier::core::PeerId target_{};
+  bool has_target_ = false;
+  std::atomic<tier::core::UserPresence> state_{
+      tier::core::UserPresence::unknown};
+};
+
 enum class Mode : std::uint8_t { Normal, Insert, Command, Prompt, Locked };
 enum class Overlay : std::uint8_t { None, Help, Profile, Settings, Book };
 // Which panel NORMAL-mode up/down navigates: the chat list or the message
@@ -292,6 +368,11 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
   StreamReader reader(client, screen);
   reader.start(account);
 
+  // Background online/offline poller for the selected contact (updated as the
+  // selection changes; see the draw loop).
+  PresencePoller poller(client, screen);
+  poller.start();
+
   // Pull queued stream events: store incoming messages (auto-filing the sender
   // as a contact so they can be named) and mark receipts delivered. UI thread.
   auto apply_events = [&] {
@@ -395,17 +476,30 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       status = "selected chat has an invalid id";
       return;
     }
+    // Proactive block: if we already know the contact is offline, do not even
+    // try - the node would refuse anyway. (unknown/online fall through; the node
+    // is the hard gate.)
+    if (poller.state() == tier::core::UserPresence::offline) {
+      status = "recipient is offline - cannot send";
+      return;
+    }
     const std::uint8_t suite = send_suite_for(peer);
-    const auto mid = client.send_text(account, *to, suite, draft);
-    if (!mid) {
-      status = "send rejected (recipient offline or not hosted?)";
+    const auto res = client.send_text(account, *to, suite, draft);
+    if (res.outcome == NodeClient::SendOutcome::offline) {
+      // The node refused because the recipient has no online device. Keep the
+      // draft so nothing is lost.
+      status = "not sent: recipient is offline";
+      return;
+    }
+    if (res.outcome != NodeClient::SendOutcome::accepted) {
+      status = "send rejected (is the node reachable?)";
       return;
     }
     ChatMessage m;
     m.account = account_hex;
     m.peer = peer;
     m.direction = Direction::outgoing;
-    m.msg_id = *mid;
+    m.msg_id = res.id;
     m.suite = suite;
     m.body = draft;
     m.ts = static_cast<std::int64_t>(std::time(nullptr));
@@ -754,6 +848,30 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     const std::vector<ChatMessage> hist =
         peer.empty() ? std::vector<ChatMessage>()
                      : store.history(account_hex, peer);
+
+    // Drive the online/offline poller for the open chat and render a badge.
+    tier::core::UserPresence presence = tier::core::UserPresence::unknown;
+    if (peer.empty()) {
+      poller.clear_target();
+    } else if (const auto pid = from_hex(peer)) {
+      poller.set_target(*pid);
+      presence = poller.state();
+    }
+    Element presence_badge = text("");
+    if (!peer.empty()) {
+      switch (presence) {
+        case tier::core::UserPresence::online:
+          presence_badge = text(" Online ") | color(Color::Green);
+          break;
+        case tier::core::UserPresence::offline:
+          presence_badge = text(" Offline ") | color(Color::Red);
+          break;
+        case tier::core::UserPresence::unknown:
+          presence_badge = text(" ... ") | dim;
+          break;
+      }
+    }
+
     Element status_sub = text("");
     if (!peer.empty()) {
       const auto c = store.contact(peer);
@@ -844,6 +962,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             border,
         vbox({
             hbox({text("Chat: ") | bold, text(chat_title) | bold | flex,
+                  presence_badge,
                   pane == Pane::Messages
                       ? text("[j/k]") | color(Color::Cyan)
                       : text("")}),
@@ -1071,6 +1190,9 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         e == Event::Return) {
       if (selected_id().empty()) {
         status = "no contact - add one with :contacts/add";
+      } else if (poller.state() == tier::core::UserPresence::offline) {
+        // Composer blocked while the contact is offline (online-only delivery).
+        status = "recipient is offline - cannot send";
       } else {
         draft_cursor = static_cast<int>(draft.size());
         active_tab = 0;
@@ -1116,6 +1238,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
   }
   reader.stop();
+  poller.stop();
   return 0;
 }
 

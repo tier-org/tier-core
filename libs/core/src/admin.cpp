@@ -237,6 +237,15 @@ std::optional<AdminRequest> decode_admin_request(std::span<const std::uint8_t> i
       std::copy(id.begin(), id.end(), req.recipient.begin());
       return req;
     }
+    case AdminOp::user_status: {
+      std::span<const std::uint8_t> id;
+      if (!r.bytes(kIdLen, id) || !r.at_end()) {
+        return std::nullopt;
+      }
+      req.op = AdminOp::user_status;
+      std::copy(id.begin(), id.end(), req.recipient.begin());
+      return req;
+    }
   }
   return std::nullopt;  // unknown op
 }
@@ -259,22 +268,50 @@ std::optional<bool> decode_admin_send_reply(std::span<const std::uint8_t> in) {
   return status == 0;
 }
 
-std::vector<std::uint8_t> encode_admin_send_as_reply(bool ok) {
+std::vector<std::uint8_t> encode_admin_send_as_reply(SendStatus status) {
   return {kAdminVersion, static_cast<std::uint8_t>(AdminOp::send_as),
-          static_cast<std::uint8_t>(ok ? 0 : 1)};
+          static_cast<std::uint8_t>(status)};
 }
 
-std::optional<bool> decode_admin_send_as_reply(std::span<const std::uint8_t> in) {
+std::optional<SendStatus> decode_admin_send_as_reply(
+    std::span<const std::uint8_t> in) {
   Reader r(in);
   std::uint8_t ver = 0;
   std::uint8_t op = 0;
   std::uint8_t status = 0;
   if (!r.u8(ver) || ver != kAdminVersion || !r.u8(op) ||
       op != static_cast<std::uint8_t>(AdminOp::send_as) || !r.u8(status) ||
-      !r.at_end()) {
+      !r.at_end() || status > static_cast<std::uint8_t>(SendStatus::recipient_offline)) {
     return std::nullopt;
   }
-  return status == 0;
+  return static_cast<SendStatus>(status);
+}
+
+std::vector<std::uint8_t> encode_admin_user_status(const PeerId& user_id) {
+  std::vector<std::uint8_t> out;
+  out.push_back(kAdminVersion);
+  out.push_back(static_cast<std::uint8_t>(AdminOp::user_status));
+  out.insert(out.end(), user_id.begin(), user_id.end());
+  return out;
+}
+
+std::vector<std::uint8_t> encode_admin_user_status_reply(UserPresence state) {
+  return {kAdminVersion, static_cast<std::uint8_t>(AdminOp::user_status),
+          static_cast<std::uint8_t>(state)};
+}
+
+std::optional<UserPresence> decode_admin_user_status_reply(
+    std::span<const std::uint8_t> in) {
+  Reader r(in);
+  std::uint8_t ver = 0;
+  std::uint8_t op = 0;
+  std::uint8_t state = 0;
+  if (!r.u8(ver) || ver != kAdminVersion || !r.u8(op) ||
+      op != static_cast<std::uint8_t>(AdminOp::user_status) || !r.u8(state) ||
+      !r.at_end() || state > static_cast<std::uint8_t>(UserPresence::offline)) {
+    return std::nullopt;
+  }
+  return static_cast<UserPresence>(state);
 }
 
 std::vector<std::uint8_t> encode_admin_user_add_reply(const AdminUserAddReply& rep) {

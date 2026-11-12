@@ -325,12 +325,17 @@ int cmd_send_as(const std::string& path, std::string_view from_hex,
   if (!query_bytes(path, req, reply)) {
     return 1;
   }
-  const auto ok = tier::core::decode_admin_send_as_reply(reply);
-  if (!ok) {
+  const auto status = tier::core::decode_admin_send_as_reply(reply);
+  if (!status) {
     std::fprintf(stderr, "malformed response from tierd\n");
     return 1;
   }
-  if (!*ok) {
+  if (*status == tier::core::SendStatus::recipient_offline) {
+    std::fprintf(stderr,
+                 "not sent: the recipient user is offline (no online device)\n");
+    return 1;
+  }
+  if (*status != tier::core::SendStatus::accepted) {
     std::fprintf(stderr,
                  "not accepted: unknown suite, or the from-user is not hosted "
                  "on this node\n");
@@ -450,6 +455,31 @@ std::string short_hex(const std::array<std::uint8_t, 16>& id) {
 // delivery receipts) until the daemon closes or this process is stopped. This
 // is the observation path for user messages (they are not buffered in the
 // inbox); tier-messenger uses the same protocol. See docs/app-protocol.md.
+int cmd_status(const std::string& path, std::string_view user_hex) {
+  const auto user = parse_peer_id(user_hex);
+  if (!user) {
+    std::fprintf(stderr, "invalid user id (expected 64 hex chars)\n");
+    return 2;
+  }
+  std::vector<std::uint8_t> reply;
+  if (!query_bytes(path, tier::core::encode_admin_user_status(*user), reply)) {
+    return 1;
+  }
+  const auto state = tier::core::decode_admin_user_status_reply(reply);
+  if (!state) {
+    std::fprintf(stderr, "malformed response from tierd\n");
+    return 1;
+  }
+  const char* s = "unknown";
+  if (*state == tier::core::UserPresence::online) {
+    s = "online";
+  } else if (*state == tier::core::UserPresence::offline) {
+    s = "offline";
+  }
+  std::printf("%s %s\n", short_id(*user).c_str(), s);
+  return 0;
+}
+
 int cmd_stream(const std::string& path, std::string_view user_hex) {
   const auto user = parse_peer_id(user_hex);
   if (!user) {
@@ -555,6 +585,8 @@ int usage() {
       "its online devices)\n"
       "  stream <user-id>           subscribe as a local user and print its "
       "message/receipt stream\n"
+      "  status <user-id>           print a user's online status "
+      "(online|offline|unknown)\n"
       "  inbox                      print and drain received node messages\n"
       "\n"
       "The socket defaults to " "/run/tierd/tierd.sock"
@@ -641,6 +673,12 @@ int main(int argc, char** argv) {
   if (command == "stream") {
     if (positional.size() == 2) {
       return cmd_stream(path, positional[1]);
+    }
+    return usage();
+  }
+  if (command == "status") {
+    if (positional.size() == 2) {
+      return cmd_status(path, positional[1]);
     }
     return usage();
   }

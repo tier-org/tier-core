@@ -34,6 +34,11 @@ class UserDirectory {
               std::uint64_t issued_unix, std::uint64_t expiry_unix,
               std::uint64_t now_unix);
 
+  // Remove a single (user, device) enrollment, e.g. on an authenticated
+  // user_deregister (the device went offline). Returns true if an entry was
+  // removed. The user is dropped if it is left with no devices.
+  bool remove(const tier::core::PeerId& user, const tier::core::PeerId& device);
+
   // The live device ids enrolled under `user` at `now_unix` (sorted, unique).
   [[nodiscard]] std::vector<tier::core::PeerId> lookup(
       const tier::core::PeerId& user, std::uint64_t now_unix) const;

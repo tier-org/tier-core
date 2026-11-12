@@ -93,7 +93,15 @@ class Node {
     sent,    // sealed and handed to the transport on an existing connection
     queued,  // held pending discovery/connection; delivered or dropped later
     failed,  // could not be accepted (e.g. no way to reach the peer at all)
+    recipient_offline,  // user send refused: the recipient user has no online
+                        // device (presence), so it could only be dropped
   };
+
+  // A user's online status as this node currently knows it (see
+  // set_user_presence and query_user_presence). For a locally hosted user this
+  // is exact (its own subscriber state); for a remote user it is the latest
+  // directory resolution - `unknown` until a lookup has answered.
+  enum class Presence : std::uint8_t { unknown, online, offline };
 
   // Send an encrypted message to a peer under `suite`. If the peer is already
   // connected and its encryption keys are known, the message is sealed and sent
@@ -127,6 +135,22 @@ class Node {
 
   // Whether a user id is hosted on this node.
   [[nodiscard]] bool has_user(const tier::core::PeerId& user_id) const;
+
+  // Mark a hosted user online (a client subscribed) or offline (its last
+  // subscriber went away). Online gates directory enrollment: the user is
+  // enrolled with its responsible communicators while online and de-enrolled
+  // when it goes offline, so remote lookups reflect reachability. No-op for a
+  // user not hosted here. The daemon drives this from the subscriber hub (with
+  // a short debounce on going offline, to absorb client restarts).
+  void set_user_presence(const tier::core::PeerId& user_id, bool online);
+
+  // Report a recipient user's online status, and register interest so the node
+  // keeps it fresh by issuing directory lookups (for a remote user). A locally
+  // hosted user is answered exactly from its own subscriber state. The messenger
+  // calls this to show Online/Offline and to gate sending. Remote status is
+  // `unknown` until the first lookup answers, then online/offline, and ages back
+  // to unknown if interest lapses.
+  Presence query_user_presence(const tier::core::PeerId& user_id);
 
   // Test-only: simulate a restricted NAT in front of this node (see
   // Endpoint::set_simulated_restricted_nat). Lets NAT traversal be tested
@@ -291,6 +315,11 @@ class Node {
   void handle_user_register(const tier::core::PeerId& from_device,
                             std::span<const tier::crypto::Byte> payload,
                             std::uint64_t now_unix);
+  // Communicator side: a device removes its own enrollment (it went offline).
+  // Same credential check as register, then drop the (user, device) entry.
+  void handle_user_deregister(const tier::core::PeerId& from_device,
+                              std::span<const tier::crypto::Byte> payload,
+                              std::uint64_t now_unix);
   // Communicator side: answer a user lookup on `conn` with the enrolled devices.
   void handle_user_lookup(ConnId conn,
                           std::span<const tier::crypto::Byte> payload,
@@ -409,6 +438,17 @@ class Node {
     // refresh interval - otherwise the entry sits on the wrong nodes and lookups
     // (which use the current set) miss it.
     std::vector<tier::core::PeerId> enrolled_to{};
+    // Presence: a user is "online" (addressable) only while a client (messenger
+    // or `tierctl stream`) is subscribed to it on this node. The daemon flips
+    // this from the subscriber hub. Enrollment with the responsible
+    // communicators is gated on it: an offline user is de-enrolled so lookups
+    // (and therefore sends) see it as unreachable, instead of resolving to a
+    // device with no live subscriber that would silently drop the message.
+    bool present = false;
+    // Set when presence drops to false: register_user owes the responsible
+    // communicators a deregister (and a local directory removal) before it
+    // stops refreshing. Cleared once that has been issued.
+    bool deregister_pending = false;
   };
   std::map<tier::core::PeerId, LocalUser> users_;
   // Communicator role only: user id -> enrolled device ids.
@@ -430,6 +470,20 @@ class Node {
   // Target user id -> when we last sent a user lookup, to rate-limit lookups.
   std::map<tier::core::PeerId, std::chrono::steady_clock::time_point>
       user_lookup_sent_;
+  // Presence cache for REMOTE users the app has asked about (query_user_presence).
+  // Kept fresh by periodic directory lookups while interest lasts; dropped once
+  // the app stops asking. A locally hosted user is never cached here (answered
+  // from its own subscriber state).
+  struct PresenceEntry {
+    Presence state = Presence::unknown;
+    std::chrono::steady_clock::time_point updated{};     // when `state` was set
+    std::chrono::steady_clock::time_point last_query{};  // when the app last asked
+    std::chrono::steady_clock::time_point last_lookup{}; // when we last looked up
+  };
+  std::map<tier::core::PeerId, PresenceEntry> presence_;
+  // Issue directory lookups for watched remote users, refresh/expire the cache,
+  // and drop users the app has stopped asking about.
+  void service_presence(std::chrono::steady_clock::time_point now);
   // --- hole-punch state (see docs/communicator.md, M-NAT) ------------------
   // Target id -> earliest time to escalate a stuck direct dial to a hole punch
   // (set when we first resolve the peer's addresses), and -> when we last sent a

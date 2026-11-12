@@ -131,10 +131,10 @@ bool NodeClient::remove_user(const tier::core::PeerId& user) {
   return existed && *existed;
 }
 
-std::optional<MsgId> NodeClient::send_text(const tier::core::PeerId& from,
-                                           const tier::core::PeerId& to,
-                                           std::uint8_t suite,
-                                           const std::string& body) {
+NodeClient::SendTextResult NodeClient::send_text(const tier::core::PeerId& from,
+                                                 const tier::core::PeerId& to,
+                                                 std::uint8_t suite,
+                                                 const std::string& body) {
   tier::app::AppFrame frame;
   frame.type = tier::app::AppType::text;
   frame.flags = tier::app::kFlagWantsReceipt;
@@ -149,20 +149,37 @@ std::optional<MsgId> NodeClient::send_text(const tier::core::PeerId& from,
   frame.payload.assign(body.begin(), body.end());
   const auto framed = tier::app::encode_app_frame(frame);
   if (framed.size() > tier::core::kMaxAdminMessageBytes) {
-    return std::nullopt;
+    return {SendOutcome::failed, {}};
   }
   const auto req = tier::core::encode_admin_send_as(
       from, to, suite, std::span<const std::uint8_t>(framed.data(), framed.size()));
   const auto reply = query(req);
   if (!reply) {
-    return std::nullopt;
+    return {SendOutcome::failed, {}};
   }
-  const auto ok = tier::core::decode_admin_send_as_reply(
+  const auto status = tier::core::decode_admin_send_as_reply(
       std::span<const std::uint8_t>(reply->data(), reply->size()));
-  if (!ok || !*ok) {
-    return std::nullopt;
+  if (!status) {
+    return {SendOutcome::failed, {}};
   }
-  return id;
+  if (*status == tier::core::SendStatus::recipient_offline) {
+    return {SendOutcome::offline, {}};
+  }
+  if (*status != tier::core::SendStatus::accepted) {
+    return {SendOutcome::failed, {}};
+  }
+  return {SendOutcome::accepted, id};
+}
+
+tier::core::UserPresence NodeClient::user_status(const tier::core::PeerId& user) {
+  const auto req = tier::core::encode_admin_user_status(user);
+  const auto reply = query(req);
+  if (!reply) {
+    return tier::core::UserPresence::unknown;
+  }
+  const auto state = tier::core::decode_admin_user_status_reply(
+      std::span<const std::uint8_t>(reply->data(), reply->size()));
+  return state.value_or(tier::core::UserPresence::unknown);
 }
 
 int NodeClient::open_stream(const tier::core::PeerId& user) {

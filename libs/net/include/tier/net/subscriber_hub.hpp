@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <map>
 #include <span>
+#include <vector>
 
 #include "tier/core/membership.hpp"
 
@@ -35,6 +36,13 @@ class SubscriberHub {
 
   // Number of subscriber connections across all users.
   [[nodiscard]] std::size_t size() const noexcept { return subs_.size(); }
+
+  // Poll every held connection and drop any whose client has fully closed. A
+  // subscriber half-closes its write side after subscribing (SHUT_WR), so a
+  // read-EOF is normal and is NOT a disconnect; only a full close (POLLHUP /
+  // error) is. Returns the users whose subscriber count dropped to zero as a
+  // result (i.e. that just went from online to offline). Cheap to call per tick.
+  [[nodiscard]] std::vector<tier::core::PeerId> reap_closed();
 
   // Write one event record to every subscriber of `user`, length-prefixed
   // ([u32 BE len][record]). A connection whose write fails is closed and

@@ -1,9 +1,11 @@
 #include "tier/net/subscriber_hub.hpp"
 
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
 #include <array>
+#include <set>
 #include <vector>
 
 namespace tier::net {
@@ -57,6 +59,32 @@ std::size_t SubscriberHub::publish(const tier::core::PeerId& user,
     }
   }
   return delivered;
+}
+
+std::vector<tier::core::PeerId> SubscriberHub::reap_closed() {
+  std::set<tier::core::PeerId> touched;
+  for (auto it = subs_.begin(); it != subs_.end();) {
+    struct pollfd pfd {};
+    pfd.fd = it->second;
+    pfd.events = 0;  // POLLHUP/POLLERR/POLLNVAL arrive in revents regardless
+    const int n = ::poll(&pfd, 1, 0);
+    const bool closed =
+        n > 0 && (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0;
+    if (closed) {
+      touched.insert(it->first);
+      ::close(it->second);
+      it = subs_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  std::vector<tier::core::PeerId> emptied;
+  for (const auto& user : touched) {
+    if (subs_.find(user) == subs_.end()) {
+      emptied.push_back(user);
+    }
+  }
+  return emptied;
 }
 
 void SubscriberHub::close_all() {
