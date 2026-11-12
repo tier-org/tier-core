@@ -1,6 +1,7 @@
 #include "ui.hpp"
 
 #include <sys/socket.h>
+#include <termios.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -170,6 +171,9 @@ class StreamReader {
 
 enum class Mode : std::uint8_t { Normal, Insert, Command, Prompt, Locked };
 enum class Overlay : std::uint8_t { None, Help, Profile, Settings, Book };
+// Which panel NORMAL-mode up/down navigates: the chat list or the message
+// transcript. Left/right (or h/l) switch between them.
+enum class Pane : std::uint8_t { Chats, Messages };
 
 }  // namespace
 
@@ -187,6 +191,11 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
   // first. Rebuilt whenever either changes.
   std::vector<std::string> chat_ids;  // peer user ids (hex)
   int chat_selected = 0;
+  // Message-transcript navigation. `pane` is which panel up/down drives;
+  // `msg_selected` is the highlighted message index in the active chat's history
+  // (0 = oldest), only meaningful while pane == Messages.
+  Pane pane = Pane::Chats;
+  int msg_selected = 0;
 
   auto display_name = [&](const std::string& id) -> std::string {
     const auto a = store.alias_of(id);
@@ -220,6 +229,54 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       return {};
     }
     return chat_ids[static_cast<std::size_t>(chat_selected)];
+  };
+  // Number of messages in the selected chat (for message-navigation bounds).
+  auto history_count = [&]() -> int {
+    const std::string peer = selected_id();
+    if (peer.empty()) {
+      return 0;
+    }
+    return static_cast<int>(store.history(account_hex, peer).size());
+  };
+  // Copy text to the terminal clipboard via OSC 52. This reaches the user's
+  // LOCAL clipboard even when the messenger runs over SSH (the terminal emulator
+  // interprets the sequence), with no external tool like xclip/pbcopy. Works
+  // where the terminal supports OSC 52 - most modern ones; tmux/screen need
+  // clipboard passthrough enabled. The write runs on the UI thread, between
+  // frames, so it does not interleave with FTXUI's own rendering.
+  auto copy_to_clipboard = [](const std::string& text) {
+    static constexpr char kB64[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string enc;
+    enc.reserve(((text.size() + 2) / 3) * 4);
+    std::size_t i = 0;
+    for (; i + 3 <= text.size(); i += 3) {
+      const unsigned n = (static_cast<unsigned>(static_cast<unsigned char>(text[i])) << 16) |
+                         (static_cast<unsigned>(static_cast<unsigned char>(text[i + 1])) << 8) |
+                         static_cast<unsigned>(static_cast<unsigned char>(text[i + 2]));
+      enc.push_back(kB64[(n >> 18) & 63U]);
+      enc.push_back(kB64[(n >> 12) & 63U]);
+      enc.push_back(kB64[(n >> 6) & 63U]);
+      enc.push_back(kB64[n & 63U]);
+    }
+    const std::size_t rem = text.size() - i;
+    if (rem == 1) {
+      const unsigned n = static_cast<unsigned>(static_cast<unsigned char>(text[i])) << 16;
+      enc.push_back(kB64[(n >> 18) & 63U]);
+      enc.push_back(kB64[(n >> 12) & 63U]);
+      enc.append("==");
+    } else if (rem == 2) {
+      const unsigned n = (static_cast<unsigned>(static_cast<unsigned char>(text[i])) << 16) |
+                         (static_cast<unsigned>(static_cast<unsigned char>(text[i + 1])) << 8);
+      enc.push_back(kB64[(n >> 18) & 63U]);
+      enc.push_back(kB64[(n >> 12) & 63U]);
+      enc.push_back(kB64[(n >> 6) & 63U]);
+      enc.push_back('=');
+    }
+    const std::string seq = "\033]52;c;" + enc + "\a";
+    if (::write(STDOUT_FILENO, seq.data(), seq.size()) < 0) {
+      // Best-effort: a failed write just means no copy; nothing to recover.
+    }
   };
   // The suite we encrypt to a peer with: their override, else the account
   // default.
@@ -289,7 +346,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
   draft_opt.multiline = false;
   draft_opt.cursor_position = &draft_cursor;
   draft_opt.transform = input_style;
-  auto in_draft = Input(&draft, "", draft_opt);
+  auto in_draft = Input(&draft, "Type a message, Enter to send", draft_opt);
 
   InputOption cmd_opt;
   cmd_opt.multiline = false;
@@ -591,8 +648,10 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             text("Help") | bold,
             separator(),
             text("NORMAL mode keys:"),
-            text("  j / k or arrows   move selection"),
-            text("  g / G             top / bottom"),
+            text("  h / l or left/right   focus chats / messages pane"),
+            text("  j / k or up/down      move within the focused pane"),
+            text("  g / G                 top / bottom of the pane"),
+            text("  y                     copy selected message (messages pane)"),
             text("  i or Enter        write a message (INSERT)"),
             text("  :                 command line"),
             text("  ?                 this help"),
@@ -718,8 +777,16 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       });
     }
 
+    // When the Messages pane is focused, one message is selected (clamped to the
+    // live history) and gets highlighted; otherwise nothing is selected and the
+    // newest line stays in view.
+    const int msg_sel =
+        (pane == Pane::Messages && !hist.empty())
+            ? std::clamp(msg_selected, 0, static_cast<int>(hist.size()) - 1)
+            : -1;
     Elements tr;
     {
+      int idx = 0;
       for (const auto& m : hist) {
         const bool out = m.direction == Direction::outgoing;
         const std::string who = out ? "me" : "<<";
@@ -727,16 +794,24 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         if (out) {
           tick = m.delivered ? " ✓" : " ·";  // check vs middle dot
         }
-        tr.push_back(hbox({
+        Element row = hbox({
             text(clock_hhmm(m.ts) + " ") | dim,
             text(who + " ") | (out ? color(Color::Green) : color(Color::Cyan)),
             paragraph(m.body) | flex,
             text(tick) | color(Color::GrayDark),
-        }));
+        });
+        if (idx == msg_sel) {
+          row = row | inverted;
+        }
+        tr.push_back(std::move(row));
+        ++idx;
       }
     }
     if (tr.empty()) {
       tr.push_back(text("(no messages yet)") | dim);
+    } else if (msg_sel >= 0) {
+      tr[static_cast<std::size_t>(msg_sel)] =
+          tr[static_cast<std::size_t>(msg_sel)] | focus;  // scroll to selection
     } else {
       tr.back() = tr.back() | focus;  // keep the newest line in view
     }
@@ -744,7 +819,8 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     // Bottom bar: mode indicator plus whichever line is being edited.
     Element bottom;
     if (mode == Mode::Insert) {
-      bottom = hbox({text(" INSERT ") | bold | inverted, text(" "),
+      bottom = hbox({text(" INSERT ") | bold | inverted,
+                     text(" > ") | color(Color::Green),
                      in_draft->Render() | flex});
     } else if (mode == Mode::Command) {
       bottom = hbox({text(":"), in_cmd->Render() | flex});
@@ -754,19 +830,23 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
                          flex});
     } else {
       bottom = hbox({text(" NORMAL ") | bold | inverted,
-                     text("  j/k move  i write  : command  ? help  q quit") |
+                     text("  j/k move  h/l pane  i write  : command  ? help  q quit") |
                          dim});
     }
 
     auto body = hbox({
         vbox({
-            text("Chats") | bold,
+            text("Chats") | bold |
+                (pane == Pane::Chats ? color(Color::Cyan) : dim),
             separator(),
             vbox(std::move(list)) | vscroll_indicator | yframe | flex,
         }) | size(WIDTH, EQUAL, 28) |
             border,
         vbox({
-            hbox({text("Chat: ") | bold, text(chat_title) | bold | flex}),
+            hbox({text("Chat: ") | bold, text(chat_title) | bold | flex,
+                  pane == Pane::Messages
+                      ? text("[j/k]") | color(Color::Cyan)
+                      : text("")}),
             status_sub,
             separator(),
             vbox(std::move(tr)) | vscroll_indicator | yframe | flex,
@@ -789,6 +869,48 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     }
     if (e.is_mouse()) {
       return true;  // the UI is keyboard-only; swallow all mouse input
+    }
+
+    // Ctrl+C never quits the messenger. While typing (any input mode) it
+    // resets/aborts the current input; in NORMAL it flashes a reminder of how to
+    // quit. Handled here, above every mode branch, so the raw 0x03 byte can
+    // never leak into an input buffer. (The terminal's INTR character is
+    // disabled around the loop so Ctrl+C arrives as this event instead of a
+    // SIGINT that FTXUI would exit on.)
+    if (e == Event::Special(std::string(1, '\x03'))) {
+      switch (mode) {
+        case Mode::Insert:
+          draft.clear();
+          draft_cursor = 0;
+          status = "input cleared";
+          break;
+        case Mode::Command:
+          cmdline.clear();
+          cmd_cursor = 0;
+          mode = Mode::Normal;
+          status = "cancelled";
+          break;
+        case Mode::Prompt:
+          prompt_cb = nullptr;
+          cmdline.clear();
+          pwbuf.clear();
+          cmd_cursor = 0;
+          pw_cursor = 0;
+          mode = Mode::Normal;
+          status = "cancelled";
+          break;
+        case Mode::Locked:
+          pwbuf.clear();
+          pw_cursor = 0;
+          status = "enter password to unlock";
+          break;
+        case Mode::Normal:
+          overlay = Overlay::None;
+          status =
+              "Ctrl+C does not quit - q or :q to quit, ? help, i write, : command";
+          break;
+      }
+      return true;
     }
 
     if (mode == Mode::Locked) {
@@ -873,24 +995,76 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
 
     // NORMAL mode: single-key navigation and commands. Everything is consumed
     // so no keystroke leaks into an input.
+    // Left/right (or h/l) switch which panel is focused; up/down then navigate
+    // within it - the chat list, or the messages of the open chat.
+    if (e == Event::ArrowLeft || e == Event::Character("h")) {
+      pane = Pane::Chats;
+      return true;
+    }
+    if (e == Event::ArrowRight || e == Event::Character("l")) {
+      if (!selected_id().empty()) {
+        pane = Pane::Messages;
+        const int n = history_count();
+        msg_selected = n > 0 ? n - 1 : 0;  // enter at the newest message
+      }
+      return true;
+    }
     if (e == Event::ArrowDown || e == Event::Character("j")) {
-      if (chat_selected + 1 < static_cast<int>(chat_ids.size())) {
+      if (pane == Pane::Messages) {
+        if (msg_selected + 1 < history_count()) {
+          ++msg_selected;
+        }
+      } else if (chat_selected + 1 < static_cast<int>(chat_ids.size())) {
         ++chat_selected;
       }
       return true;
     }
     if (e == Event::ArrowUp || e == Event::Character("k")) {
-      if (chat_selected > 0) {
+      if (pane == Pane::Messages) {
+        if (msg_selected > 0) {
+          --msg_selected;
+        }
+      } else if (chat_selected > 0) {
         --chat_selected;
       }
       return true;
     }
     if (e == Event::Character("g")) {
-      chat_selected = 0;
+      if (pane == Pane::Messages) {
+        msg_selected = 0;
+      } else {
+        chat_selected = 0;
+      }
       return true;
     }
     if (e == Event::Character("G")) {
-      chat_selected = chat_ids.empty() ? 0 : static_cast<int>(chat_ids.size()) - 1;
+      if (pane == Pane::Messages) {
+        const int n = history_count();
+        msg_selected = n > 0 ? n - 1 : 0;
+      } else {
+        chat_selected =
+            chat_ids.empty() ? 0 : static_cast<int>(chat_ids.size()) - 1;
+      }
+      return true;
+    }
+    // y: copy the selected message to the clipboard (messages pane only).
+    if (e == Event::Character("y")) {
+      if (pane != Pane::Messages) {
+        status = "focus the messages pane (l) to copy";
+        return true;
+      }
+      const std::string peer = selected_id();
+      const std::vector<ChatMessage> hist =
+          peer.empty() ? std::vector<ChatMessage>()
+                       : store.history(account_hex, peer);
+      if (hist.empty()) {
+        status = "no message to copy";
+        return true;
+      }
+      const int idx =
+          std::clamp(msg_selected, 0, static_cast<int>(hist.size()) - 1);
+      copy_to_clipboard(hist[static_cast<std::size_t>(idx)].body);
+      status = "message copied to clipboard";
       return true;
     }
     if (e == Event::Character("i") || e == Event::Character("a") ||
@@ -900,6 +1074,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       } else {
         draft_cursor = static_cast<int>(draft.size());
         active_tab = 0;
+        pane = Pane::Chats;  // writing: keep the newest messages in view
         mode = Mode::Insert;
       }
       return true;
@@ -923,7 +1098,26 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     return true;  // swallow any other key in NORMAL
   });
 
+  // Keep Ctrl+C from quitting. FTXUI leaves ISIG enabled, so by default Ctrl+C
+  // raises SIGINT and FTXUI exits before any component sees it. Disable only the
+  // INTR control character (not all of ISIG, so Ctrl+Z / suspend still works):
+  // Ctrl+C then arrives as an ordinary input byte, surfaced as
+  // Event::Special("\x03") and handled in the event router above. FTXUI snapshots
+  // and restores this termios around its own loop, so we restore the true
+  // original once Loop returns.
+  struct termios saved_termios {};
+  const bool have_termios = tcgetattr(STDIN_FILENO, &saved_termios) == 0;
+  if (have_termios) {
+    struct termios t = saved_termios;
+    t.c_cc[VINTR] = _POSIX_VDISABLE;
+    tcsetattr(STDIN_FILENO, TCSANOW, &t);
+  }
+
   screen.Loop(root);
+
+  if (have_termios) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+  }
   reader.stop();
   return 0;
 }
