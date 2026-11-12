@@ -7,6 +7,7 @@
 // cannot send as a user it does not host.
 #include <algorithm>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -225,6 +226,156 @@ int main() {
     }
   }
   check(got3, "a device enrolling after the send still receives it");
+
+  // --- regression: a node that is itself a responsible communicator for its
+  // own hosted user. In production every node holds the communicator role and
+  // also hosts users, so a user frequently rendezvous-maps onto its own host.
+  // The directory enroll/resolve paths only talked to *remote* responsible
+  // communicators: the self replica was never written on enroll nor consulted
+  // on resolve, so such a user could not be reached from the nodes that needed
+  // that replica (messages and delivery receipts silently failed one way). Two
+  // all-role nodes, each hosting a user, must message each other both ways. ----
+  {
+    tier::net::Node na(tier::crypto::NodeIdentity::generate(),
+                       tier::core::kAllRoles, "127.0.0.1", 0);
+    tier::net::Node nb(tier::crypto::NodeIdentity::generate(),
+                       tier::core::kAllRoles, "127.0.0.1", 0);
+    Inbox ia;
+    Inbox ib;
+    ia.attach(na);
+    ib.attach(nb);
+    const auto ua = na.add_user(tier::crypto::NodeIdentity::generate());
+    const auto ub = nb.add_user(tier::crypto::NodeIdentity::generate());
+
+    na.connect("127.0.0.1", nb.local_port());
+    std::vector<tier::net::Node*> both{&na, &nb};
+    for (int i = 0; i < 8000 && !(na.has_encryption_keys(nb.peer_id()) &&
+                                  nb.has_encryption_keys(na.peer_id()));
+         ++i) {
+      pump(both, 1);
+    }
+    check(na.has_encryption_keys(nb.peer_id()) &&
+              nb.has_encryption_keys(na.peer_id()),
+          "two all-role nodes meshed");
+    pump(both, 500);  // let user enrollment settle on both directories
+
+    const auto pa = bytes("A->B hello");
+    const auto pb = bytes("B->A hello");
+    check(na.send_as_user(ua, ub, Suite::hybrid,
+                          std::span<const Byte>(pa.data(), pa.size())) ==
+              tier::net::Node::SendResult::queued,
+          "A->B send_as_user queued");
+    check(nb.send_as_user(ub, ua, Suite::hybrid,
+                          std::span<const Byte>(pb.data(), pb.size())) ==
+              tier::net::Node::SendResult::queued,
+          "B->A send_as_user queued");
+
+    bool a_to_b = false;
+    bool b_to_a = false;
+    for (int i = 0; i < 20000 && !(a_to_b && b_to_a); ++i) {
+      pump(both, 1);
+      for (const auto& m : ib.msgs) {
+        if (m.plaintext == pa && m.sender_user && *m.sender_user == ua &&
+            m.recipient_user && *m.recipient_user == ub) {
+          a_to_b = true;
+        }
+      }
+      for (const auto& m : ia.msgs) {
+        if (m.plaintext == pb && m.sender_user && *m.sender_user == ub &&
+            m.recipient_user && *m.recipient_user == ua) {
+          b_to_a = true;
+        }
+      }
+    }
+    check(a_to_b, "A->B delivered (host is itself a responsible communicator)");
+    check(b_to_a, "B->A delivered (self directory replica is consulted)");
+  }
+
+  // --- production-shaped topology: N all-role nodes meshed, each hosting a
+  // user, every ordered pair must deliver. This is what the deployed network
+  // actually looks like (every node holds every role and hosts users), and the
+  // directory self-replica bug hid precisely because no test ran this shape -
+  // the earlier tests use a dedicated communicator plus single-role hosts. ----
+  {
+    constexpr std::size_t kN = 3;
+    std::vector<std::unique_ptr<tier::net::Node>> nodes;
+    std::vector<Inbox> inbox(kN);
+    std::vector<tier::core::PeerId> uid(kN);
+    for (std::size_t i = 0; i < kN; ++i) {
+      nodes.push_back(std::make_unique<tier::net::Node>(
+          tier::crypto::NodeIdentity::generate(), tier::core::kAllRoles,
+          "127.0.0.1", 0));
+    }
+    std::vector<tier::net::Node*> mesh;
+    for (std::size_t i = 0; i < kN; ++i) {
+      mesh.push_back(nodes[i].get());
+      inbox[i].attach(*nodes[i]);
+      uid[i] = nodes[i]->add_user(tier::crypto::NodeIdentity::generate());
+    }
+    // Full mesh: connect every pair so each node learns every other.
+    for (std::size_t i = 0; i < kN; ++i) {
+      for (std::size_t j = i + 1; j < kN; ++j) {
+        nodes[i]->connect("127.0.0.1", nodes[j]->local_port());
+      }
+    }
+    auto all_meshed = [&] {
+      for (std::size_t i = 0; i < kN; ++i) {
+        for (std::size_t j = 0; j < kN; ++j) {
+          if (i != j && !nodes[i]->has_encryption_keys(nodes[j]->peer_id())) {
+            return false;
+          }
+        }
+      }
+      return true;
+    };
+    for (int i = 0; i < 12000 && !all_meshed(); ++i) {
+      pump(mesh, 1);
+    }
+    check(all_meshed(), "all-role nodes formed a full mesh");
+    pump(mesh, 400);  // let every user enroll on its responsible communicators
+
+    // Every ordered (sender user -> recipient user) pair, distinct hosts.
+    struct Pair { std::size_t from; std::size_t to; std::vector<Byte> pt; };
+    std::vector<Pair> pairs;
+    for (std::size_t a = 0; a < kN; ++a) {
+      for (std::size_t b = 0; b < kN; ++b) {
+        if (a == b) {
+          continue;
+        }
+        pairs.push_back({a, b,
+                         bytes("u" + std::to_string(a) + "->u" +
+                               std::to_string(b))});
+      }
+    }
+    for (const auto& p : pairs) {
+      check(nodes[p.from]->send_as_user(
+                uid[p.from], uid[p.to], Suite::hybrid,
+                std::span<const Byte>(p.pt.data(), p.pt.size())) ==
+                tier::net::Node::SendResult::queued,
+            "all-role pair send_as_user queued");
+    }
+    auto all_delivered = [&] {
+      for (const auto& p : pairs) {
+        bool got = false;
+        for (const auto& m : inbox[p.to].msgs) {
+          if (m.plaintext == p.pt && m.sender_user && *m.sender_user == uid[p.from] &&
+              m.recipient_user && *m.recipient_user == uid[p.to]) {
+            got = true;
+            break;
+          }
+        }
+        if (!got) {
+          return false;
+        }
+      }
+      return true;
+    };
+    for (int i = 0; i < 20000 && !all_delivered(); ++i) {
+      pump(mesh, 1);
+    }
+    check(all_delivered(),
+          "every ordered user pair delivered across the all-role mesh");
+  }
 
   if (g_failures == 0) {
     std::puts("multi-identity e2e: all checks passed");

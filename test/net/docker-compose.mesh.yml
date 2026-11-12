@@ -1,0 +1,62 @@
+# A PRODUCTION-SHAPED INTERNAL dual-stack mesh for the cross-node delivery +
+# receipt gate (see docs/multi-identity.md, docs/app-protocol.md). Unlike the
+# star topologies of the other compose files (dedicated communicators + edge
+# clients), every node here holds ALL roles - exactly like the deployed
+# tier-0x.geek.foundation nodes - so each node is simultaneously a communicator,
+# an infrastructure peer that meshes, AND a user host. The harness adds one user
+# per node at runtime (distinct seeds) and sends across every ordered node pair,
+# so the gate exercises the self-enroll / self-consult path and the rendezvous
+# responsibility split that the star gates never touch. This is the topology in
+# which the 01<->03 asymmetric-loss + missing-receipt bug reproduced.
+#
+# Same isolation as the other compose files: internal network (no route off the
+# bridge), private TIER_NETWORK, so no prod contamination.
+
+name: tier-localnet-mesh
+
+networks:
+  tiernet:
+    driver: bridge
+    internal: true
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: 10.80.0.0/24
+        - subnet: fd00:7180::/64
+
+# Every node holds all five roles, matching the deployed all-role nodes. Each
+# seeds the other two, so the backbone forms a full mesh (role-aware autodial
+# meshes infrastructure peers; see docs/topology.md).
+x-allroles: &allroles "client|validator|keeper|transmitter|communicator"
+
+services:
+  node1:
+    image: tier-localnet:latest
+    container_name: tier-mesh-node1
+    environment:
+      TIER_ROLES: *allroles
+      TIER_SEEDS: "[fd00:7180::21]:7777 10.80.0.21:7777 [fd00:7180::31]:7777 10.80.0.31:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.80.0.11
+        ipv6_address: fd00:7180::11
+  node2:
+    image: tier-localnet:latest
+    container_name: tier-mesh-node2
+    environment:
+      TIER_ROLES: *allroles
+      TIER_SEEDS: "[fd00:7180::11]:7777 10.80.0.11:7777 [fd00:7180::31]:7777 10.80.0.31:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.80.0.21
+        ipv6_address: fd00:7180::21
+  node3:
+    image: tier-localnet:latest
+    container_name: tier-mesh-node3
+    environment:
+      TIER_ROLES: *allroles
+      TIER_SEEDS: "[fd00:7180::11]:7777 10.80.0.11:7777 [fd00:7180::21]:7777 10.80.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.80.0.31
+        ipv6_address: fd00:7180::31

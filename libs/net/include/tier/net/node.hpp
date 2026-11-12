@@ -299,6 +299,12 @@ class Node {
   // to each returned device.
   void handle_user_result(std::span<const tier::crypto::Byte> payload,
                           std::chrono::steady_clock::time_point now);
+  // Fan the queued message(s) for `user` out to each of `devices` (skipping the
+  // local device and any already delivered to). Shared by handle_user_result
+  // (devices from a communicator's reply) and the local-directory fast path in
+  // service_user_sends used when this node is itself a responsible communicator.
+  void deliver_resolved_user(const tier::core::PeerId& user,
+                             const std::vector<tier::core::PeerId>& devices);
   // If a user identity is attached, (re)publish this device's enrollment to the
   // communicators responsible for the user id.
   void register_user(std::chrono::steady_clock::time_point now,
@@ -383,6 +389,11 @@ class Node {
       lookup_sent_;
   // When this (edge client) node may next publish its presence record.
   std::chrono::steady_clock::time_point next_presence_register_{};
+  // Communicators this node last published its presence to. The responsible set
+  // depends on the live communicator set, so it shifts as membership converges
+  // or a communicator joins/leaves; a change must trigger an immediate re-publish
+  // rather than waiting for the refresh timer.
+  std::vector<tier::core::PeerId> presence_published_to_{};
   // --- multi-identity state (see docs/multi-identity.md) -------------------
   // User identities hosted on this device, keyed by user id. Each carries its
   // own self-issued device credential (this device signed by the user key) and
@@ -392,6 +403,12 @@ class Node {
     tier::crypto::NodeIdentity identity;
     std::vector<tier::crypto::Byte> device_credential;
     std::chrono::steady_clock::time_point next_register{};
+    // The responsible-communicator set this user was last enrolled against. When
+    // it changes (membership converged, a communicator joined or left, so the
+    // rendezvous shifted) we must re-enroll at once rather than wait out the
+    // refresh interval - otherwise the entry sits on the wrong nodes and lookups
+    // (which use the current set) miss it.
+    std::vector<tier::core::PeerId> enrolled_to{};
   };
   std::map<tier::core::PeerId, LocalUser> users_;
   // Communicator role only: user id -> enrolled device ids.

@@ -109,6 +109,12 @@ jobs:
           TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
         run: ./test/net/e2e-multi.sh
 
+      - name: E2E all-role mesh delivery + receipt gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+        run: ./test/net/e2e-mesh.sh
+
   fuzz:
     # libFuzzer targets for the untrusted-input decoders: membership, SWIM
     # control + admin, version, wire frame, and the sealed-message / enc_keys

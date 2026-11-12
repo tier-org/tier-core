@@ -55,6 +55,13 @@ constexpr auto kLookupRetryInterval = std::chrono::seconds(2);
 // restart); the directory enrollment is short like presence so it ages out.
 constexpr std::uint64_t kUserEnrollTtlSeconds = 300;
 constexpr auto kUserRegisterInterval = std::chrono::seconds(120);
+// When some responsible communicator could not be reached this round (e.g. its
+// connection is still forming, or it only just became responsible after a
+// membership change), retry the enrollment/presence publish on this short
+// cadence instead of waiting the full refresh interval - otherwise a freshly
+// added user or node stays unreachable for up to the refresh interval. Shared
+// by register_user and register_presence.
+constexpr auto kRegisterRetry = std::chrono::seconds(2);
 constexpr std::uint64_t kDeviceCredentialTtlSeconds = 365ULL * 24 * 3600;
 
 // Application-message kind, the first byte of the sealed transport plaintext.
@@ -909,9 +916,6 @@ void Node::register_presence(std::chrono::steady_clock::time_point now,
   if (tier::core::is_infrastructure(roles_)) {
     return;
   }
-  if (now < next_presence_register_) {
-    return;
-  }
 
   const auto comms = live_communicators();
   if (comms.empty()) {
@@ -922,21 +926,38 @@ void Node::register_presence(std::chrono::steady_clock::time_point now,
     return;  // no reachable address to advertise yet
   }
 
+  // The responsible set is recomputed every tick: it depends on the live
+  // communicator set, which grows as membership converges and shifts when a
+  // communicator joins or leaves, so we must re-publish immediately on a change
+  // rather than only on the refresh timer (mirrors register_user).
+  const auto responsible =
+      responsible_communicators(self_id_, comms, kPresenceReplicas);
+  const bool set_changed = responsible != presence_published_to_;
+  if (!set_changed && now < next_presence_register_) {
+    return;
+  }
+
   const std::vector<tier::crypto::Byte> frame = tier::msg::make_presence_register(
       identity_, network_, roles_, self->addresses, now_unix,
       now_unix + kPresenceTtlSeconds);
 
-  const auto responsible =
-      responsible_communicators(self_id_, comms, kPresenceReplicas);
+  bool reached_all = true;
   for (const auto& c : responsible) {
     const auto conn = conn_by_peer_.find(c);
     if (conn != conn_by_peer_.end()) {
       endpoint_.send(conn->second, frame);
-    } else if (const auto info = membership_.find(c); info) {
-      dial_addresses(info->addresses, now);  // connect so we can register next tick
+    } else {
+      // Not connected yet: dial now and retry publication soon rather than
+      // leaving this replica unwritten for a full refresh interval.
+      reached_all = false;
+      if (const auto info = membership_.find(c); info) {
+        dial_addresses(info->addresses, now);
+      }
     }
   }
-  next_presence_register_ = now + kPresenceRegisterInterval;
+  presence_published_to_ = responsible;
+  next_presence_register_ =
+      now + (reached_all ? kPresenceRegisterInterval : kRegisterRetry);
 }
 
 void Node::service_pending_sends(std::chrono::steady_clock::time_point now) {
@@ -1168,7 +1189,12 @@ void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
   if (!matched || devices.empty()) {
     return;  // keep the queued message pending (retry/time out) if no devices yet
   }
+  deliver_resolved_user(user, devices);
+}
 
+void Node::deliver_resolved_user(
+    const tier::core::PeerId& user,
+    const std::vector<tier::core::PeerId>& devices) {
   const auto it = pending_user_sends_.find(user);
   if (it == pending_user_sends_.end()) {
     return;
@@ -1219,9 +1245,16 @@ void Node::register_user(std::chrono::steady_clock::time_point now,
   if (comms.empty()) {
     return;
   }
-  // Enroll each hosted user with the communicators responsible for its id.
+  // Enroll each hosted user with the communicators responsible for its id. The
+  // responsible set is recomputed every tick: it depends on the live
+  // communicator set, which grows as membership converges and shifts when a
+  // communicator joins or leaves, so we must react to a change immediately
+  // rather than only on the refresh timer.
   for (auto& [uid, lu] : users_) {
-    if (now < lu.next_register) {
+    const auto responsible =
+        responsible_communicators(uid, comms, kPresenceReplicas);
+    const bool set_changed = responsible != lu.enrolled_to;
+    if (!set_changed && now < lu.next_register) {
       continue;
     }
     const std::vector<tier::crypto::Byte> frame = tier::msg::make_user_register(
@@ -1229,17 +1262,33 @@ void Node::register_user(std::chrono::steady_clock::time_point now,
         tier::crypto::ByteSpan(lu.device_credential.data(),
                                lu.device_credential.size()),
         now_unix, now_unix + kUserEnrollTtlSeconds);
-    const auto responsible =
-        responsible_communicators(uid, comms, kPresenceReplicas);
+    bool reached_all = true;
     for (const auto& c : responsible) {
+      if (c == self_id_) {
+        // This node is itself a responsible communicator for its own hosted
+        // user. We never open a connection to ourselves, so storing the entry
+        // locally (as handle_user_register does for a wire enrollment) is the
+        // only way this replica exists - otherwise a remote node whose lookup
+        // lands on us would get "not found" and could never reach the user.
+        (void)user_directory_.enroll(uid, self_id_, now_unix,
+                                     now_unix + kUserEnrollTtlSeconds, now_unix);
+        continue;
+      }
       const auto conn = conn_by_peer_.find(c);
       if (conn != conn_by_peer_.end()) {
         endpoint_.send(conn->second, frame);
-      } else if (const auto info = membership_.find(c); info) {
-        dial_addresses(info->addresses, now);
+      } else {
+        // Not connected yet: dial now and retry enrollment soon rather than
+        // leaving this replica unwritten for a full refresh interval.
+        reached_all = false;
+        if (const auto info = membership_.find(c); info) {
+          dial_addresses(info->addresses, now);
+        }
       }
     }
-    lu.next_register = now + kUserRegisterInterval;
+    lu.enrolled_to = responsible;
+    lu.next_register =
+        now + (reached_all ? kUserRegisterInterval : kRegisterRetry);
   }
 }
 
@@ -1259,14 +1308,29 @@ void Node::service_user_sends(std::chrono::steady_clock::time_point now) {
       continue;
     }
 
+    const auto comms = live_communicators();
+
+    // Fast path: this node may itself be a responsible communicator for `user`.
+    // A lookup is never sent to ourselves, so without this a locally-held
+    // directory entry would be invisible to our own sends. Consult it every
+    // tick (cheap) and fan out directly on a hit.
+    if (is_responsible_for(self_id_, user, comms, kPresenceReplicas)) {
+      const auto devices = user_directory_.lookup(user, unix_now());
+      if (!devices.empty()) {
+        deliver_resolved_user(user, devices);
+      }
+    }
+
     const auto last = user_lookup_sent_.find(user);
     if (last == user_lookup_sent_.end() ||
         now - last->second >= kLookupRetryInterval) {
-      const auto comms = live_communicators();
       const auto responsible =
           responsible_communicators(user, comms, kPresenceReplicas);
       bool asked = false;
       for (const auto& c : responsible) {
+        if (c == self_id_) {
+          continue;  // answered locally above; never a wire self-lookup
+        }
         const auto conn = conn_by_peer_.find(c);
         if (conn != conn_by_peer_.end()) {
           endpoint_.send(conn->second, tier::msg::make_user_lookup(user));

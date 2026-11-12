@@ -273,20 +273,35 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
   int pw_cursor = 0;
   int active_tab = 0;  // 0 draft, 1 command/prompt, 2 password
 
+  // Stock InputOption::Default() forces the text color to white, which is
+  // invisible on a light-background terminal (the reported "pale grey text").
+  // Keep the terminal's default foreground so typed text and commands stay
+  // readable on any theme; the blinking bar cursor shows the caret, so we also
+  // drop the focused-line inversion.
+  const auto input_style = [](InputState state) {
+    if (state.is_placeholder) {
+      state.element |= dim;
+    }
+    return state.element;
+  };
+
   InputOption draft_opt;
   draft_opt.multiline = false;
   draft_opt.cursor_position = &draft_cursor;
+  draft_opt.transform = input_style;
   auto in_draft = Input(&draft, "", draft_opt);
 
   InputOption cmd_opt;
   cmd_opt.multiline = false;
   cmd_opt.cursor_position = &cmd_cursor;
+  cmd_opt.transform = input_style;
   auto in_cmd = Input(&cmdline, "", cmd_opt);
 
   InputOption pw_opt;
   pw_opt.multiline = false;
   pw_opt.password = true;
   pw_opt.cursor_position = &pw_cursor;
+  pw_opt.transform = input_style;
   auto in_pw = Input(&pwbuf, "", pw_opt);
 
   auto inputs = Container::Tab({in_draft, in_cmd, in_pw}, &active_tab);
@@ -739,7 +754,8 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
                          flex});
     } else {
       bottom = hbox({text(" NORMAL ") | bold | inverted,
-                     text(" " + status) | dim});
+                     text("  j/k move  i write  : command  ? help  q quit") |
+                         dim});
     }
 
     auto body = hbox({
@@ -758,7 +774,12 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             border,
     });
 
-    return vbox({header, body | flex, bottom});
+    // A persistent status line below the input bar. It also keeps the active
+    // input off the terminal's very last row: ScreenInteractive cannot place
+    // the hardware cursor there and would draw it one row too high, over the
+    // panel border (the reported "cursor floats above the text").
+    auto statusbar = text(" " + status) | dim;
+    return vbox({header, body | flex, bottom, statusbar});
   });
 
   // --- event routing / modal state machine ------------------------------

@@ -38,6 +38,20 @@ configures this automatically for CI.)
 
 Or call the scripts directly in `test/net/` (`./localnet.sh up`, `./e2e.sh`).
 
+### Gates (run in CI)
+
+- `e2e.sh` - four-node mesh discovery + dual-stack.
+- `e2e-roles.sh` - client-to-client discovery through a communicator (star:
+  two communicators + two edge clients).
+- `e2e-multi.sh` - multi-identity: one user on two devices, a separate sender,
+  delivery to every live subscriber + receipts back (star topology).
+- `e2e-mesh.sh` - **production-shaped**: three all-role nodes in a full mesh,
+  each hosting its own user. Sends across every ordered pair and asserts
+  delivery in both directions AND a receipt back to each sender. This is the
+  topology in which the cross-node one-way-loss + missing-receipt bug
+  reproduced; the star gates above cannot exercise the self-enroll / self-consult
+  and rendezvous-responsibility paths it covers.
+
 By default the binaries are built as a static Release into `build-localnet/`.
 To reuse binaries built elsewhere, set `TIERD_BIN` and `TIERCTL_BIN`:
 
