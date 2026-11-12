@@ -109,7 +109,11 @@ int main() {
     check(!tier::app::decode_app_frame(bytes).has_value(), "bad version rejected");
   }
 
-  // --- text handler: delivers + emits a receipt when wanted ---------------
+  // --- text handler: delivers, and never acks on the node's behalf ---------
+  // The delivery receipt is end-to-end, originated by the recipient's own client
+  // once it holds the message - not by the node. So the text handler must only
+  // deliver and must emit nothing back, regardless of the wants_receipt flag (a
+  // buffered socket write is not proof the client read it).
   {
     tier::app::AppDispatcher d;
     d.register_handler(tier::app::make_text_handler());
@@ -131,21 +135,10 @@ int main() {
           "delivered to the recipient user");
     check(!ctx.messages.empty() && ctx.messages[0].sender_user == alice,
           "delivery carries the sender user");
-    check(ctx.sent.size() == 1, "a receipt was emitted");
-    check(!ctx.sent.empty() && ctx.sent[0].from_user == bob &&
-              ctx.sent[0].to_user == alice,
-          "receipt goes from bob back to alice");
-    check(!ctx.sent.empty() && ctx.sent[0].frame.type == AppType::delivery_receipt,
-          "receipt is a delivery_receipt frame");
-    check(!ctx.sent.empty() &&
-              ctx.sent[0].frame.payload ==
-                  std::vector<std::uint8_t>(text.msg_id.begin(), text.msg_id.end()),
-          "receipt payload is the original msg_id");
-    check(!ctx.sent.empty() && !ctx.sent[0].frame.wants_receipt(),
-          "receipt does not itself request a receipt");
+    check(ctx.sent.empty(), "node emits no receipt (acks are client-originated)");
   }
 
-  // --- no live subscriber: dropped, no receipt ----------------------------
+  // --- no live subscriber: dropped, nothing emitted -----------------------
   {
     tier::app::AppDispatcher d;
     d.register_handler(tier::app::make_text_handler());
@@ -157,20 +150,7 @@ int main() {
     d.enqueue(raw(alice, bob, text));
     d.drain(ctx);
     check(ctx.messages.size() == 1, "delivery attempted once");
-    check(ctx.sent.empty(), "no receipt when no live subscriber");
-  }
-
-  // --- text without wants_receipt: delivered, no receipt ------------------
-  {
-    tier::app::AppDispatcher d;
-    d.register_handler(tier::app::make_text_handler());
-    AppFrame text;
-    text.type = AppType::text;  // flags = 0
-    FakeContext ctx;
-    d.enqueue(raw(alice, bob, text));
-    d.drain(ctx);
-    check(ctx.messages.size() == 1, "delivered");
-    check(ctx.sent.empty(), "no receipt requested, none sent");
+    check(ctx.sent.empty(), "nothing emitted when no live subscriber");
   }
 
   // --- receipt handler: notifies the subscriber --------------------------

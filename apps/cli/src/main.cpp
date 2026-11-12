@@ -480,6 +480,31 @@ int cmd_status(const std::string& path, std::string_view user_hex) {
   return 0;
 }
 
+// End-to-end acknowledgment from `tierctl stream`: having received a text
+// message, send a delivery_receipt for it from the local user `me` back to its
+// sender, so the sender's checkmark reflects a real client receipt. The node no
+// longer acks on a subscriber's behalf (a buffered socket write is not proof the
+// client read it), so an observing subscriber must ack what it actually got.
+// Best-effort; a failure just means no checkmark upstream, never a lost message.
+void stream_ack(const std::string& path, const tier::core::PeerId& me,
+                const tier::core::PeerId& sender, std::uint8_t suite,
+                const std::array<std::uint8_t, tier::app::kMsgIdLen>& msg_id) {
+  tier::app::AppFrame frame;
+  frame.type = tier::app::AppType::delivery_receipt;
+  frame.flags = 0;  // a receipt is never itself receipted (no loop)
+  frame.msg_id = msg_id;
+  frame.payload.assign(msg_id.begin(), msg_id.end());
+  const auto framed = tier::app::encode_app_frame(frame);
+  if (framed.size() > tier::core::kMaxAdminMessageBytes) {
+    return;
+  }
+  const auto req = tier::core::encode_admin_send_as(
+      me, sender, suite,
+      std::span<const std::uint8_t>(framed.data(), framed.size()));
+  std::vector<std::uint8_t> reply;
+  (void)query_bytes(path, req, reply);
+}
+
 int cmd_stream(const std::string& path, std::string_view user_hex) {
   const auto user = parse_peer_id(user_hex);
   if (!user) {
@@ -554,6 +579,12 @@ int cmd_stream(const std::string& path, std::string_view user_hex) {
                       short_id(ev->message.sender_user).c_str(), me.c_str(),
                       suite_name(ev->message.suite), ev->message.type,
                       ev->message.payload.size(), text.c_str());
+          // Acknowledge chat text end to end (receipts are not themselves acked).
+          if (ev->message.type ==
+              static_cast<std::uint16_t>(tier::app::AppType::text)) {
+            stream_ack(path, *user, ev->message.sender_user, ev->message.suite,
+                       ev->message.msg_id);
+          }
         } else {
           std::printf("receipt %s\n", short_hex(ev->receipt.msg_id).c_str());
         }

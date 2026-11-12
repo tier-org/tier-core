@@ -27,6 +27,7 @@
 #include "ftxui/dom/elements.hpp"
 #include "node_client.hpp"
 #include "store.hpp"
+#include "tier/app/registry.hpp"
 #include "util.hpp"
 
 namespace tier::messenger {
@@ -40,6 +41,25 @@ std::string clock_hhmm(std::int64_t ts) {
   localtime_r(&t, &tm);
   char buf[6];
   std::snprintf(buf, sizeof(buf), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  return buf;
+}
+
+// A local calendar-day key (YYYYMMDD in local time). Comparing two keys tells
+// whether two timestamps fall on different days, across month and year bounds.
+std::int64_t local_day_key(std::int64_t ts) {
+  const std::time_t t = static_cast<std::time_t>(ts);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  return (tm.tm_year + 1900) * 10000 + (tm.tm_mon + 1) * 100 + tm.tm_mday;
+}
+
+// Human day label with weekday, e.g. "Thu, 12 Nov 2026".
+std::string day_label(std::int64_t ts) {
+  const std::time_t t = static_cast<std::time_t>(ts);
+  std::tm tm{};
+  localtime_r(&t, &tm);
+  char buf[32];
+  std::strftime(buf, sizeof(buf), "%a, %d %b %Y", &tm);
   return buf;
 }
 
@@ -390,6 +410,15 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         m.body.assign(ev.message.payload.begin(), ev.message.payload.end());
         m.ts = static_cast<std::int64_t>(std::time(nullptr));
         store.add_message(m);
+        // End-to-end acknowledgment: now that we actually hold the message, send
+        // a delivery receipt back to its sender so their checkmark reflects a
+        // real client receipt (the node does not ack on anyone's behalf). Only
+        // chat text is acked; receipts are never themselves acked (no loop).
+        if (ev.message.type ==
+            static_cast<std::uint16_t>(tier::app::AppType::text)) {
+          client.send_receipt(account, ev.message.sender_user, ev.message.suite,
+                              ev.message.msg_id);
+        }
         changed = true;
       } else {
         store.mark_delivered(account_hex, ev.receipt.msg_id);
@@ -902,24 +931,55 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         (pane == Pane::Messages && !hist.empty())
             ? std::clamp(msg_selected, 0, static_cast<int>(hist.size()) - 1)
             : -1;
+    // An outgoing message with no receipt after this many seconds is shown as
+    // failed (✗): with online-only delivery and a client-originated receipt, a
+    // missing ack within the window means it did not reach the recipient. A late
+    // ack still flips it back to ✓ on the next render.
+    constexpr std::int64_t kReceiptTimeoutSecs = 10;
+    const std::int64_t now_s = static_cast<std::int64_t>(std::time(nullptr));
+
     Elements tr;
+    int sel_row = -1;  // index in `tr` of the selected message row, if any
     {
+      std::int64_t prev_day = 0;
+      bool first = true;
       int idx = 0;
       for (const auto& m : hist) {
+        // A day changes: lay down a full-width rule with the weekday and date on
+        // its right end, separating this day's messages from the previous one.
+        const std::int64_t day = local_day_key(m.ts);
+        if (first || day != prev_day) {
+          tr.push_back(hbox({
+              vbox({separator()}) | flex,  // horizontal rule filling the width
+              text(" " + day_label(m.ts)) | dim,
+          }));
+        }
+        first = false;
+        prev_day = day;
+
         const bool out = m.direction == Direction::outgoing;
         const std::string who = out ? "me" : "<<";
-        std::string tick;
+        // Outgoing delivery state: ✓ acknowledged by the recipient's client, ✗
+        // no ack within the timeout (treated as not delivered), · still pending.
+        Element tick_el = text("");
         if (out) {
-          tick = m.delivered ? " ✓" : " ·";  // check vs middle dot
+          if (m.delivered) {
+            tick_el = text(" ✓") | color(Color::GrayDark);
+          } else if (now_s - m.ts > kReceiptTimeoutSecs) {
+            tick_el = text(" ✗") | color(Color::Red);
+          } else {
+            tick_el = text(" ·") | color(Color::GrayDark);
+          }
         }
         Element row = hbox({
             text(clock_hhmm(m.ts) + " ") | dim,
             text(who + " ") | (out ? color(Color::Green) : color(Color::Cyan)),
             paragraph(m.body) | flex,
-            text(tick) | color(Color::GrayDark),
+            tick_el,
         });
         if (idx == msg_sel) {
           row = row | inverted;
+          sel_row = static_cast<int>(tr.size());
         }
         tr.push_back(std::move(row));
         ++idx;
@@ -927,9 +987,9 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
     }
     if (tr.empty()) {
       tr.push_back(text("(no messages yet)") | dim);
-    } else if (msg_sel >= 0) {
-      tr[static_cast<std::size_t>(msg_sel)] =
-          tr[static_cast<std::size_t>(msg_sel)] | focus;  // scroll to selection
+    } else if (sel_row >= 0) {
+      tr[static_cast<std::size_t>(sel_row)] =
+          tr[static_cast<std::size_t>(sel_row)] | focus;  // scroll to selection
     } else {
       tr.back() = tr.back() | focus;  // keep the newest line in view
     }

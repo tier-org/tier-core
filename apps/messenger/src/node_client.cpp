@@ -171,6 +171,29 @@ NodeClient::SendTextResult NodeClient::send_text(const tier::core::PeerId& from,
   return {SendOutcome::accepted, id};
 }
 
+bool NodeClient::send_receipt(const tier::core::PeerId& from,
+                              const tier::core::PeerId& to, std::uint8_t suite,
+                              const MsgId& msg_id) {
+  tier::app::AppFrame frame;
+  frame.type = tier::app::AppType::delivery_receipt;
+  frame.flags = 0;  // a receipt is never itself receipted (no loop)
+  frame.msg_id = msg_id;  // correlation only; the ack rides in the payload
+  frame.payload.assign(msg_id.begin(), msg_id.end());
+  const auto framed = tier::app::encode_app_frame(frame);
+  if (framed.size() > tier::core::kMaxAdminMessageBytes) {
+    return false;
+  }
+  const auto req = tier::core::encode_admin_send_as(
+      from, to, suite, std::span<const std::uint8_t>(framed.data(), framed.size()));
+  const auto reply = query(req);
+  if (!reply) {
+    return false;
+  }
+  const auto status = tier::core::decode_admin_send_as_reply(
+      std::span<const std::uint8_t>(reply->data(), reply->size()));
+  return status.has_value() && *status == tier::core::SendStatus::accepted;
+}
+
 tier::core::UserPresence NodeClient::user_status(const tier::core::PeerId& user) {
   const auto req = tier::core::encode_admin_user_status(user);
   const auto reply = query(req);

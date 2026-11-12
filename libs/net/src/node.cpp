@@ -65,8 +65,12 @@ constexpr auto kRegisterRetry = std::chrono::seconds(2);
 // Presence cache (sender side, for query_user_presence). A reading older than
 // kPresenceTtl ages back to unknown; while the app keeps asking, a fresh lookup
 // is issued no more often than kPresenceRefresh; a user the app has not asked
-// about for kPresenceWatchIdle is dropped from the watch set.
-constexpr auto kPresenceTtl = std::chrono::seconds(15);
+// about for kPresenceWatchIdle is dropped from the watch set. The TTL is kept
+// short so a recipient that went offline stops showing as online quickly (it
+// bounds how long a stale "online" reading, or a stale "offline" veto in
+// send_as_user, survives); kPresenceRefresh still rate-limits the actual
+// lookups, so a short TTL does not mean lookup spam.
+constexpr auto kPresenceTtl = std::chrono::seconds(6);
 constexpr auto kPresenceRefresh = std::chrono::seconds(2);
 constexpr auto kPresenceWatchIdle = std::chrono::seconds(30);
 constexpr std::uint64_t kDeviceCredentialTtlSeconds = 365ULL * 24 * 3600;
