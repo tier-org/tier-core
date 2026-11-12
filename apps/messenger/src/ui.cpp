@@ -90,18 +90,27 @@ std::string trim(std::string s) {
   return s;
 }
 
-// Group a 64-hex id into 8-char blocks, four per line, so two people can read
-// it out and compare it character by character.
-std::string grouped_id(const std::string& hex) {
-  std::string out;
+// Group a 64-hex id into rows of four 8-char blocks, single-spaced, so two
+// people can read it out and compare it block by block. Returned as one string
+// per row (rendered as its own text() line - a paragraph() would reflow by
+// spaces and break the fixed grid). 64 hex -> two rows of four blocks.
+std::vector<std::string> grouped_id_lines(const std::string& hex) {
+  std::vector<std::string> rows;
+  std::string row;
   for (std::size_t i = 0; i < hex.size(); i += 8) {
-    out += hex.substr(i, 8);
-    const std::size_t group = (i / 8) + 1;
-    if (i + 8 < hex.size()) {
-      out += (group % 4 == 0) ? '\n' : ' ';
+    if (!row.empty()) {
+      row += ' ';
+    }
+    row += hex.substr(i, 8);
+    if (((i / 8) + 1) % 4 == 0) {  // four blocks per row
+      rows.push_back(row);
+      row.clear();
     }
   }
-  return out;
+  if (!row.empty()) {
+    rows.push_back(row);
+  }
+  return rows;
 }
 
 // Background reader of one account's event stream. It decodes events off the
@@ -798,6 +807,10 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             text("  :q                       quit"),
         };
       } else if (overlay == Overlay::Profile) {
+        Elements id_rows;
+        for (const auto& r : grouped_id_lines(account_hex)) {
+          id_rows.push_back(text(r) | color(Color::Cyan));
+        }
         lines = {
             text("Your profile") | bold,
             separator(),
@@ -807,7 +820,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
                 dim,
             text("to you, and verify theirs the same way:") | dim,
             text(""),
-            paragraph(grouped_id(account_hex)) | color(Color::Cyan),
+            vbox(std::move(id_rows)),
             text(""),
             hbox({text("default suite: "),
                   text(suite_name(store.default_suite()))}),
