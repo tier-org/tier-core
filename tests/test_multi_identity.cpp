@@ -301,6 +301,46 @@ int main() {
     check(b_to_a, "B->A delivered (self directory replica is consulted)");
   }
 
+  // --- cross-node presence: a watcher must see a host's user go offline once
+  // the host de-enrolls it, i.e. the remote directory replica is cleared (not
+  // just the host's local present flag). Regression for a badge that stuck on
+  // "online" after the client closed. ----
+  {
+    tier::net::Node na(tier::crypto::NodeIdentity::generate(),
+                       tier::core::kAllRoles, "127.0.0.1", 0);
+    tier::net::Node nb(tier::crypto::NodeIdentity::generate(),
+                       tier::core::kAllRoles, "127.0.0.1", 0);
+    const auto ua = na.add_user(tier::crypto::NodeIdentity::generate());
+    na.set_user_presence(ua, true);
+    na.connect("127.0.0.1", nb.local_port());
+    std::vector<tier::net::Node*> both{&na, &nb};
+    for (int i = 0; i < 8000 && !(na.has_encryption_keys(nb.peer_id()) &&
+                                  nb.has_encryption_keys(na.peer_id()));
+         ++i) {
+      pump(both, 1);
+    }
+    pump(both, 500);  // let ua's enrollment reach nb's directory
+    // nb watches ua and must resolve it online.
+    auto seen = nb.query_user_presence(ua);
+    for (int i = 0; i < 500 && seen != tier::net::Node::Presence::online; ++i) {
+      pump(both, 1);
+      seen = nb.query_user_presence(ua);
+    }
+    check(seen == tier::net::Node::Presence::online,
+          "watcher resolves a remote host's user as online");
+    // ua goes offline on its host; the de-enroll must clear nb's replica.
+    na.set_user_presence(ua, false);
+    bool offline = false;
+    for (int i = 0; i < 2000; ++i) {
+      pump(both, 1);
+      if (nb.query_user_presence(ua) == tier::net::Node::Presence::offline) {
+        offline = true;
+        break;
+      }
+    }
+    check(offline, "watcher sees the user offline after the host de-enrolls it");
+  }
+
   // --- production-shaped topology: N all-role nodes meshed, each hosting a
   // user, every ordered pair must deliver. This is what the deployed network
   // actually looks like (every node holds every role and hosts users), and the

@@ -52,9 +52,20 @@ constexpr auto kLookupRetryInterval = std::chrono::seconds(2);
 // User-directory enrollment lifetime and republish cadence, and how long a
 // self-issued device credential is valid. The credential is long-lived (the
 // device holds the user key in the single-process case and re-issues on
-// restart); the directory enrollment is short like presence so it ages out.
-constexpr std::uint64_t kUserEnrollTtlSeconds = 300;
-constexpr auto kUserRegisterInterval = std::chrono::seconds(120);
+// restart); the directory enrollment is a short presence LEASE.
+//
+// The lease is the correctness floor for "online": a host refreshes it every
+// kUserRegisterInterval while the user has a live subscriber, and simply stops
+// when it goes offline. A watcher therefore sees the user drop offline within at
+// most kUserEnrollTtlSeconds even when the explicit de-enroll never lands - an
+// old communicator that ignores user_deregister, a dropped frame, or the host
+// node itself dying (a dead node sends no deregister). The de-enroll stays as a
+// fast path that makes a clean close near-instant; the short TTL guarantees the
+// slow path self-heals in seconds, not the 5 minutes a long registration took.
+// The refresh is well under half the TTL so a single missed republish does not
+// expire a still-online user.
+constexpr std::uint64_t kUserEnrollTtlSeconds = 20;
+constexpr auto kUserRegisterInterval = std::chrono::seconds(7);
 // When some responsible communicator could not be reached this round (e.g. its
 // connection is still forming, or it only just became responsible after a
 // membership change), retry the enrollment/presence publish on this short
@@ -1165,6 +1176,10 @@ void Node::service_presence(std::chrono::steady_clock::time_point now) {
 
 void Node::set_simulated_restricted_nat(bool on) {
   endpoint_.set_simulated_restricted_nat(on);
+}
+
+void Node::set_link_loss(double prob, std::uint64_t seed) {
+  endpoint_.set_link_loss(prob, seed);
 }
 
 std::vector<std::string> Node::self_candidates() const {

@@ -157,6 +157,12 @@ class Node {
   // without a real NAT. Never call on a live node.
   void set_simulated_restricted_nat(bool on);
 
+  // Test-only: simulate a lossy link in front of this node (see
+  // Endpoint::set_link_loss). Each datagram is dropped with probability `prob`
+  // (1 = full partition), seeded by `seed`. Lets presence, resolution, and
+  // delivery be tested under loss and partition. Never call on a live node.
+  void set_link_loss(double prob, std::uint64_t seed);
+
   // Send an encrypted message from a local user (`from_user`, which must be
   // hosted here) to `to_user` (all of whose currently-online devices receive
   // it). Resolves the recipient's devices through a communicator and fans the

@@ -17,6 +17,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <random>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -304,6 +305,23 @@ struct Endpoint::Impl {
   // dropped; sent_to accumulates every destination we transmit to.
   bool restricted_nat = false;
   std::set<std::string> sent_to;
+
+  // Test-only lossy-link simulation (see Endpoint::set_link_loss). Each datagram
+  // this endpoint would send or receive is dropped independently with probability
+  // link_loss (both directions, so one degraded endpoint models a bad last mile;
+  // 1.0 is a full partition). Seeded for reproducibility. QUIC's own loss
+  // recovery then has to carry delivery, exactly as on a real lossy network.
+  double link_loss = 0.0;
+  std::mt19937_64 link_rng{0};
+  bool drop_datagram() {
+    if (link_loss <= 0.0) {
+      return false;
+    }
+    if (link_loss >= 1.0) {
+      return true;
+    }
+    return std::uniform_real_distribution<double>(0.0, 1.0)(link_rng) < link_loss;
+  }
 
   SSL_CTX* server_ctx = nullptr;
   SSL_CTX* client_ctx = nullptr;
@@ -828,6 +846,9 @@ void Endpoint::Impl::drain_reads() {
     if (restricted_nat && sent_to.count(format_remote(ra)) == 0) {
       continue;  // simulated NAT: no mapping for a source we have not contacted
     }
+    if (drop_datagram()) {
+      continue;  // simulated lossy link: inbound datagram lost
+    }
     route_packet(buf.data(), static_cast<std::size_t>(nread), ra, ral);
   }
 }
@@ -886,6 +907,9 @@ void Endpoint::Impl::flush_writes() {
       ngtcp2_conn_update_pkt_tx_time(c->conn, timestamp());
       if (restricted_nat) {
         sent_to.insert(format_remote(c->remote));  // NAT mapping opens on egress
+      }
+      if (drop_datagram()) {
+        continue;  // simulated lossy link: outbound datagram lost (ngtcp2 retransmits)
       }
       ::sendto(udp_fd, buf.data(), static_cast<std::size_t>(nwrite), 0,
                reinterpret_cast<sockaddr*>(&c->remote), c->remotelen);
@@ -1162,6 +1186,11 @@ void Endpoint::broadcast(std::span<const tier::crypto::Byte> payload) {
 
 void Endpoint::set_simulated_restricted_nat(bool on) {
   impl_->restricted_nat = on;
+}
+
+void Endpoint::set_link_loss(double prob, std::uint64_t seed) {
+  impl_->link_loss = prob;
+  impl_->link_rng.seed(seed);
 }
 
 }  // namespace tier::net
