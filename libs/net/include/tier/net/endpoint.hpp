@@ -97,6 +97,14 @@ class Endpoint {
   // real NAT. Off in production; never set on a live node.
   void set_simulated_restricted_nat(bool on);
 
+  // Test-only: simulate a lossy link on this endpoint. Each datagram it would
+  // send or receive is independently dropped with probability `prob` (0 = clean,
+  // 1 = full partition), using a PRNG seeded with `seed` for reproducibility.
+  // QUIC's loss recovery then has to carry delivery, so presence, resolution, and
+  // message delivery can be tested under packet loss and partition without a real
+  // degraded network. Off in production; never set on a live node.
+  void set_link_loss(double prob, std::uint64_t seed);
+
  private:
   struct Impl;
   std::unique_ptr<Impl> impl_;

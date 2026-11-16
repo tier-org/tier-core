@@ -6,7 +6,8 @@ add_library(tier_msg STATIC
   src/sealed.cpp
   src/presence.cpp
   src/user.cpp
-  src/holepunch.cpp)
+  src/holepunch.cpp
+  src/relay.cpp)
 add_library(tier::msg ALIAS tier_msg)
 
 target_include_directories(tier_msg PUBLIC include)

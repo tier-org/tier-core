@@ -28,6 +28,11 @@ target_link_libraries(test_multi_identity PRIVATE tier::net tier::msg tier::core
 add_test(NAME multi_identity COMMAND test_multi_identity)
 set_tests_properties(multi_identity PROPERTIES TIMEOUT 90)
 
+add_executable(test_fault_injection test_fault_injection.cpp)
+target_link_libraries(test_fault_injection PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME fault_injection COMMAND test_fault_injection)
+set_tests_properties(fault_injection PROPERTIES TIMEOUT 120)
+
 add_executable(test_user_directory test_user_directory.cpp)
 target_link_libraries(test_user_directory PRIVATE tier::net tier::core tier::options)
 add_test(NAME user_directory COMMAND test_user_directory)
@@ -36,6 +41,11 @@ add_executable(test_holepunch test_holepunch.cpp)
 target_link_libraries(test_holepunch PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
 add_test(NAME holepunch COMMAND test_holepunch)
 set_tests_properties(holepunch PROPERTIES TIMEOUT 120)
+
+add_executable(test_relay test_relay.cpp)
+target_link_libraries(test_relay PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME relay COMMAND test_relay)
+set_tests_properties(relay PROPERTIES TIMEOUT 90)
 
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
