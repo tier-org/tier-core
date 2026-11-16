@@ -42,6 +42,11 @@ target_link_libraries(test_holepunch PRIVATE tier::net tier::msg tier::core tier
 add_test(NAME holepunch COMMAND test_holepunch)
 set_tests_properties(holepunch PROPERTIES TIMEOUT 120)
 
+add_executable(test_relay test_relay.cpp)
+target_link_libraries(test_relay PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME relay COMMAND test_relay)
+set_tests_properties(relay PROPERTIES TIMEOUT 90)
+
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)

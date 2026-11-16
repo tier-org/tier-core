@@ -21,6 +21,7 @@
 #include "tier/crypto/ed25519.hpp"
 #include "tier/crypto/hash.hpp"
 #include "tier/msg/presence.hpp"
+#include "tier/msg/relay.hpp"
 #include "tier/net/rendezvous.hpp"
 
 namespace tier::net {
@@ -98,6 +99,14 @@ constexpr tier::crypto::Byte kAppKindUser = 0x01;
 // stays unconnected (see docs/communicator.md, M-NAT).
 constexpr auto kPunchGrace = std::chrono::seconds(3);
 constexpr auto kPunchRetryInterval = std::chrono::seconds(3);
+
+// Relay fallback: how long to keep trying a hole punch before routing a queued
+// message through a communicator instead (see docs/communicator.md, M-NAT). The
+// grace runs from the first punch attempt, so it covers a few punch retries -
+// enough for an ordinary punch to land - before conceding that p2p is blocked
+// (symmetric NAT / CGNAT) and relaying. The punch keeps retrying in parallel so
+// a later success upgrades subsequent sends back to the direct path.
+constexpr auto kRelayFallbackGrace = std::chrono::seconds(9);
 
 // Minimum gap between dial attempts to the same address.
 constexpr auto kDialRetry = std::chrono::seconds(2);
@@ -303,6 +312,10 @@ Node::Node(tier::crypto::NodeIdentity identity, tier::core::RoleSet roles,
     }
     if (ctype == tier::core::ControlType::hole_punch_signal) {
       handle_hole_punch_signal(conn, payload, std::chrono::steady_clock::now());
+      return;
+    }
+    if (ctype == tier::core::ControlType::relay_data) {
+      handle_relay_data(from, payload);
       return;
     }
     if (fd_.handle(std::chrono::steady_clock::now(), from, payload)) {
@@ -1010,9 +1023,12 @@ void Node::service_pending_sends(std::chrono::steady_clock::time_point now) {
 
     if (queue.empty()) {
       lookup_sent_.erase(to);
-      resolved_addrs_.erase(to);
       punch_grace_.erase(to);
       punch_sent_.erase(to);
+      // resolved_addrs_ and relay_after_ are kept (cached like peer_enc_keys_):
+      // a peer reachable only through the relay has no persistent connection, so
+      // a later send must be able to re-dial and re-relay promptly instead of
+      // re-running the whole resolve-and-punch grace from scratch.
       it = pending_sends_.erase(it);
       continue;
     }
@@ -1029,6 +1045,29 @@ void Node::service_pending_sends(std::chrono::steady_clock::time_point now) {
         const auto last = punch_sent_.find(to);
         if (last == punch_sent_.end() || now - last->second >= kPunchRetryInterval) {
           initiate_hole_punch(to, now);
+        }
+        // Start the relay-fallback clock from the first punch attempt.
+        relay_after_.try_emplace(to, now + kRelayFallbackGrace);
+      }
+      // If neither the direct dial nor the punch has connected us within the
+      // fallback window, concede that p2p is blocked (symmetric NAT / CGNAT) and
+      // route the queued messages through a communicator. Best-effort: a cleared
+      // queue means "handed to a relay", not "acknowledged" - the client-level
+      // receipt confirms end-to-end delivery (or shows a cross on timeout). The
+      // punch keeps retrying, so a later direct connection upgrades future sends.
+      if (const auto ra = relay_after_.find(to);
+          ra != relay_after_.end() && now >= ra->second &&
+          peer_enc_keys_.count(to) != 0) {
+        bool relayed_any = false;
+        for (const auto& m : queue) {
+          if (relay_sealed(to, m.suite,
+                           tier::crypto::ByteSpan(m.plaintext.data(),
+                                                  m.plaintext.size()))) {
+            relayed_any = true;
+          }
+        }
+        if (relayed_any) {
+          queue.clear();
         }
       }
     } else if (peer_enc_keys_.count(to) == 0) {
@@ -1178,15 +1217,35 @@ void Node::set_simulated_restricted_nat(bool on) {
   endpoint_.set_simulated_restricted_nat(on);
 }
 
+void Node::set_simulated_symmetric_nat(bool on) {
+  simulated_symmetric_nat_ = on;
+  // A symmetric NAT drops any unsolicited inbound, like a restricted one; what
+  // additionally breaks p2p is that the advertised candidate is unreachable
+  // (mangled in self_candidates), so a punch to it never lands.
+  endpoint_.set_simulated_restricted_nat(on);
+}
+
 void Node::set_link_loss(double prob, std::uint64_t seed) {
   endpoint_.set_link_loss(prob, seed);
 }
 
 std::vector<std::string> Node::self_candidates() const {
+  std::vector<std::string> addrs;
   if (const auto self = membership_.find(self_id_); self) {
-    return self->addresses;
+    addrs = self->addresses;
   }
-  return {};
+  // Test-only symmetric-NAT model: advertise an unreachable port so every direct
+  // dial and hole punch to us fails, forcing the relay fallback (the real socket
+  // and its outbound link to a communicator are untouched).
+  if (simulated_symmetric_nat_) {
+    for (auto& a : addrs) {
+      const auto colon = a.rfind(':');
+      if (colon != std::string::npos) {
+        a.replace(colon + 1, std::string::npos, "1");  // port 1: nothing listens
+      }
+    }
+  }
+  return addrs;
 }
 
 void Node::handle_hole_punch_request(ConnId conn, const tier::core::PeerId& from,
@@ -1247,6 +1306,68 @@ void Node::initiate_hole_punch(const tier::core::PeerId& target,
     }
   }
   punch_sent_[target] = now;
+}
+
+void Node::handle_relay_data(const tier::core::PeerId& from,
+                             std::span<const tier::crypto::Byte> payload) {
+  const auto frame = tier::msg::open_relay_frame(payload);
+  if (!frame) {
+    return;  // malformed
+  }
+  // Addressed to us: open the carried sealed message exactly as if it had
+  // arrived over a direct connection. The sender key travels in the frame
+  // because our QUIC peer here is the relaying communicator, not the sender; the
+  // inner signature still authenticates the sender end-to-end (open() checks the
+  // claimed sender id hashes to this key and the signature verifies under it).
+  if (frame->dst == self_id_) {
+    handle_sealed(frame->src_key, frame->sealed);
+    return;
+  }
+  // Otherwise forward it, but only a communicator relays, and only to a target
+  // already connected here. We re-send the frame verbatim (dst and src_key are
+  // unchanged); the ciphertext stays opaque to us throughout.
+  (void)from;  // the originator, authenticated by QUIC; unused in v1 (no limit)
+  if (!tier::core::has_role(roles_, tier::core::Role::communicator)) {
+    return;
+  }
+  const auto conn = conn_by_peer_.find(frame->dst);
+  if (conn == conn_by_peer_.end()) {
+    return;  // target not reachable through us: drop (the send will time out)
+  }
+  endpoint_.send(conn->second, payload);
+}
+
+bool Node::relay_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
+                        std::span<const tier::crypto::Byte> plaintext) {
+  const auto keys = peer_enc_keys_.find(to);
+  if (keys == peer_enc_keys_.end()) {
+    return false;  // no encryption keys: cannot seal (should not happen here)
+  }
+  tier::msg::Recipient recipient;
+  recipient.id = to;
+  recipient.keys = keys->second;
+  const std::vector<tier::crypto::Byte> sealed =
+      tier::msg::seal(identity_, network_, suite, recipient, plaintext);
+  const auto frame = tier::msg::make_relay_frame(
+      to, identity_.public_key(),
+      tier::crypto::ByteSpan(sealed.data(), sealed.size()));
+  // Hand the frame to a single communicator responsible for `to` - the same
+  // rendezvous set the target registers its presence with, so it holds a
+  // connection to the target. Exactly one, not all replicas: a data relay is not
+  // idempotent (the recipient has no msg-id dedup yet), so fanning out to both
+  // replicas would deliver the message twice. Either replica is equivalent since
+  // the target registers with all of them.
+  const auto responsible =
+      responsible_communicators(to, live_communicators(), kPresenceReplicas);
+  for (const auto& c : responsible) {
+    const auto conn = conn_by_peer_.find(c);
+    if (conn != conn_by_peer_.end()) {
+      endpoint_.send(conn->second,
+                     std::span<const tier::crypto::Byte>(frame.data(), frame.size()));
+      return true;
+    }
+  }
+  return false;
 }
 
 void Node::handle_user_register(const tier::core::PeerId& from_device,

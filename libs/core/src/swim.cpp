@@ -277,6 +277,7 @@ bool FailureDetector::handle(Clock::time_point now, const PeerId& from,
     case ControlType::user_result:
     case ControlType::hole_punch_request:
     case ControlType::hole_punch_signal:
+    case ControlType::relay_data:
       return false;  // not ours; the caller handles these
   }
   return false;

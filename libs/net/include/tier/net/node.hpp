@@ -157,6 +157,15 @@ class Node {
   // without a real NAT. Never call on a live node.
   void set_simulated_restricted_nat(bool on);
 
+  // Test-only: simulate a symmetric NAT / CGNAT where peer-to-peer is impossible
+  // but the node's own outbound connection to infrastructure still works. A
+  // single in-process socket cannot do real per-destination port remapping, so
+  // we model its observable consequence: the node advertises an unreachable
+  // candidate (every direct dial and hole punch to it fails) while its outbound
+  // link to a communicator stays up - which is what forces the relay fallback.
+  // Never call on a live node.
+  void set_simulated_symmetric_nat(bool on);
+
   // Test-only: simulate a lossy link in front of this node (see
   // Endpoint::set_link_loss). Each datagram is dropped with probability `prob`
   // (1 = full partition), seeded by `seed`. Lets presence, resolution, and
@@ -360,6 +369,17 @@ class Node {
   // Ask the communicator responsible for `target` to coordinate a punch to it.
   void initiate_hole_punch(const tier::core::PeerId& target,
                            std::chrono::steady_clock::time_point now);
+  // Relay fallback (see docs/communicator.md, M-NAT). Forward a relay frame to
+  // its target when we are a communicator, or, when the frame is addressed to
+  // us, open the carried sealed message as if it had arrived directly. One
+  // handler serves both the forwarding hop and the terminal delivery.
+  void handle_relay_data(const tier::core::PeerId& from,
+                         std::span<const tier::crypto::Byte> payload);
+  // Seal `plaintext` to `to` and send it through a responsible communicator as a
+  // relay frame, used when a direct connection and a hole punch both failed.
+  // Best-effort: returns whether a relay frame was handed to a communicator.
+  bool relay_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
+                    std::span<const tier::crypto::Byte> plaintext);
   // Dial known peers we have learned of but are not yet connected to, forming a
   // mesh out of transitive discovery.
   void autodial(std::chrono::steady_clock::time_point now);
@@ -496,6 +516,13 @@ class Node {
   // punch request for it (rate-limit).
   std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> punch_grace_;
   std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> punch_sent_;
+  // Target id -> earliest time to fall back to a relay through a communicator
+  // when neither the direct dial nor the hole punch has connected (set when we
+  // first initiate a punch). The floor under symmetric NAT / CGNAT.
+  std::map<tier::core::PeerId, std::chrono::steady_clock::time_point> relay_after_;
+  // Test-only: advertise an unreachable candidate so every punch to us fails
+  // (see set_simulated_symmetric_nat).
+  bool simulated_symmetric_nat_ = false;
   // Decrypted messages received and not yet drained by take_inbox().
   std::vector<ReceivedMessage> inbox_;
   std::function<void(const ReceivedMessage&)> on_message_received_;

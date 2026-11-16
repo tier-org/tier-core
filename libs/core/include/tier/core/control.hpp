@@ -64,6 +64,13 @@ enum class ControlType : std::uint8_t {
   // away, so the user is no longer online). Same body and credential check as
   // user_register; the communicator drops the (user, device) directory entry.
   user_deregister = 16,
+  // relay_data - fallback when a direct connection and a hole punch both fail
+  // (symmetric NAT / CGNAT): the sender wraps an already-sealed application
+  // message and sends it to a responsible communicator, which forwards it to the
+  // target. The communicator sees only ciphertext and cannot forge the sender
+  // (authenticity is the inner end-to-end signature). Payload codec in tier::msg,
+  // tag here. See docs/communicator.md, M-NAT.
+  relay_data = 17,
 };
 
 // Peek the control type of a received message without decoding it. Returns

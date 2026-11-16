@@ -374,6 +374,8 @@ std::optional<ControlType> peek_control_type(std::span<const std::uint8_t> in) {
       return ControlType::hole_punch_request;
     case static_cast<std::uint8_t>(ControlType::hole_punch_signal):
       return ControlType::hole_punch_signal;
+    case static_cast<std::uint8_t>(ControlType::relay_data):
+      return ControlType::relay_data;
     default:
       return std::nullopt;
   }
