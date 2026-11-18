@@ -131,4 +131,21 @@ std::vector<PeerInfo> Membership::snapshot() const {
   return out;
 }
 
+std::optional<RoleSet> preset_roles(std::string_view name) noexcept {
+  if (name == "client") {
+    return role_bit(Role::client);
+  }
+  if (name == "validator") {
+    return static_cast<RoleSet>(
+        role_bit(Role::client) | role_bit(Role::validator) |
+        role_bit(Role::transmitter) | role_bit(Role::communicator));
+  }
+  if (name == "ganesha") {
+    return kAllRoles;  // every role; grows with the Role enum
+  }
+  return std::nullopt;
+}
+
+std::string_view preset_names() noexcept { return "client|validator|ganesha"; }
+
 }  // namespace tier::core

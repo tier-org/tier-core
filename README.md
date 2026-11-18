@@ -4,8 +4,10 @@ Core node for Tier, a decentralized network for encrypted messaging and payments
 
 **Status:** early scaffold. The QUIC transport (ngtcp2 + OpenSSL) with mutual
 TLS 1.3 authentication and certificate-bound node identity handshakes, and the
-gossip/membership layer (SWIM) runs on top of it. NAT traversal (hole punching)
-and the relay node role are not implemented yet.
+gossip/membership layer (SWIM) runs on top of it. NAT traversal is implemented:
+hole punching for client-to-client connections, with a sealed relay fallback
+through a communicator for symmetric-NAT pairs a punch cannot connect. The
+transmitter (block relay) and validator roles are not implemented yet.
 
 ## Layout
 
@@ -81,8 +83,12 @@ addresses and encryption keys - to the communicator(s) responsible for its id
 then connects directly and the sealed message flows. `send_message` returns
 `sent` when the peer was already connected, or `queued` when it is being
 resolved and connected on demand (delivered, or dropped after a timeout). This
-is direct, relay-free delivery between clients; data never passes through the
-communicator, only the small presence lookup does.
+is direct, relay-free delivery between clients by default; normally only the
+small presence lookup touches the communicator, not the data. When a direct
+connection is impossible - a symmetric NAT on both ends, which a hole punch
+cannot open - the sender falls back to routing the message through a responsible
+communicator. It stays sealed end to end, so the communicator relays ciphertext
+it can neither read nor forge (see docs/communicator.md).
 
 ### User identity over device identity
 
@@ -464,8 +470,25 @@ Where these come from:
 The keeper (paid encrypted storage) and transmitter (relay) roles will get their
 own profiles - storage-heavy and bandwidth-heavy respectively - when they land.
 The **communicator** role is reachable backbone that additionally serves the
-client-to-client presence registry (and, later, hole-punch signaling); set it
-with `TIER_ROLES=communicator`. See docs/communicator.md.
+client-to-client presence registry, hole-punch signaling and the sealed relay
+fallback; set it with `TIER_ROLES=communicator`. See docs/communicator.md.
+
+### Role presets
+
+Rather than list roles by hand, a node can opt into a **preset** - a named,
+code-controlled role set - with `preset = "<name>"` in `/etc/tier/tierd.toml`
+(or `TIER_PRESET`). When a role is later added to a preset (in the software,
+under governance), nodes on that preset pick it up on their next update with no
+config edit, so operators who never touch their config still track the intended
+set. Presets today: `client` (the default - a plain edge node),
+`validator` (client + validator + transmitter + communicator), and `ganesha`
+(experimental - every role at once, operated by us to exercise new roles in
+mainnet). A preset is local configuration that resolves to roles before anything
+is gossiped; it is never sent on the wire. `preset` and `roles` express the same
+setting - if both are given the preset wins and `roles` is ignored (logged), so
+set one. The preset -> roles table lives next to the `Role` enum in
+`tier::core`; adding or changing a preset is a code change (later, a governance
+vote), never a wire change.
 
 ## License
 

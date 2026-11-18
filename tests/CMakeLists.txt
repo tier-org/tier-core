@@ -97,6 +97,14 @@ target_include_directories(test_config PRIVATE
   "${CMAKE_SOURCE_DIR}/apps/node/src")
 add_test(NAME config COMMAND test_config)
 
+# The preset -> roles table (tier::core) and the preset/roles precedence policy
+# (apps/node/src/roles.hpp), unit tested without building the daemon.
+add_executable(test_presets test_presets.cpp)
+target_link_libraries(test_presets PRIVATE tier::core tier::options)
+target_include_directories(test_presets PRIVATE
+  "${CMAKE_SOURCE_DIR}/apps/node/src")
+add_test(NAME presets COMMAND test_presets)
+
 add_executable(test_net_backend test_net_backend.cpp)
 target_link_libraries(test_net_backend PRIVATE tier::net tier::options)
 add_test(NAME net_backend COMMAND test_net_backend)

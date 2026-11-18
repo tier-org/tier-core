@@ -1,0 +1,19 @@
+# Example configuration: a plain CLIENT (edge) node.
+#
+# This is a REFERENCE COPY in /usr/share/doc/tierd/. It is overwritten on every
+# package upgrade and is NOT read by the daemon. The live config the daemon reads
+# is /etc/tier/tierd.toml - copy the settings you want from here into that file.
+#
+# A client is an edge node: it dials out to infrastructure and is never dialed,
+# works behind NAT, and needs no public address or open inbound port. "client" is
+# also the default when nothing is set, so a client node can equally leave
+# /etc/tier/tierd.toml untouched.
+
+# Role source: a preset is a named, code-controlled role set. Opting into it
+# means roles added to the preset later (under governance) reach this node on its
+# next update with no edit here. The "client" preset resolves to just {client}.
+preset = "client"
+
+# Network (cluster) to join; unset means mainnet (production). Set only for a
+# test or private cluster. Nodes on different networks cannot even handshake.
+#network = "testnet"
