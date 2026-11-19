@@ -51,6 +51,10 @@ add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)
 
+add_executable(test_address test_address.cpp)
+target_link_libraries(test_address PRIVATE tier::core tier::options)
+add_test(NAME address COMMAND test_address)
+
 add_executable(test_presence test_presence.cpp)
 target_link_libraries(test_presence PRIVATE tier::msg tier::crypto tier::core tier::options)
 add_test(NAME presence COMMAND test_presence)

@@ -28,6 +28,7 @@
 #include "node_client.hpp"
 #include "store.hpp"
 #include "tier/app/registry.hpp"
+#include "tier/core/address.hpp"
 #include "util.hpp"
 
 namespace tier::messenger {
@@ -791,7 +792,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             text("INSERT: type, Enter sends, Esc back to NORMAL."),
             separator(),
             text("Commands:"),
-            text("  :profile                 show your id (share to verify)"),
+            text("  :profile                 show your id + address (share to verify)"),
             text("  :profile/name [name]     set your display name"),
             text("  :contacts                address book"),
             text("  :contacts/add            add a contact (prompts id, name)"),
@@ -811,6 +812,7 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
         for (const auto& r : grouped_id_lines(account_hex)) {
           id_rows.push_back(text(r) | color(Color::Cyan));
         }
+        const std::string addr = tier::core::address_from_id(account);
         lines = {
             text("Your profile") | bold,
             separator(),
@@ -821,6 +823,11 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
             text("to you, and verify theirs the same way:") | dim,
             text(""),
             vbox(std::move(id_rows)),
+            text(""),
+            hbox({text("address: "), text(addr) | color(Color::Green)}),
+            text("the same id in tier's typo-safe bech32m form - share "
+                 "either one") |
+                dim,
             text(""),
             hbox({text("default suite: "),
                   text(suite_name(store.default_suite()))}),

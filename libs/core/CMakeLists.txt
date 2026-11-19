@@ -35,6 +35,7 @@ add_library(tier_core STATIC
   src/semver.cpp
   src/version_range.cpp
   src/membership.cpp
+  src/address.cpp
   src/control.cpp
   src/admin.cpp
   src/swim.cpp)
