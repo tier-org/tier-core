@@ -51,6 +51,10 @@ add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)
 
+add_executable(test_address test_address.cpp)
+target_link_libraries(test_address PRIVATE tier::core tier::options)
+add_test(NAME address COMMAND test_address)
+
 add_executable(test_presence test_presence.cpp)
 target_link_libraries(test_presence PRIVATE tier::msg tier::crypto tier::core tier::options)
 add_test(NAME presence COMMAND test_presence)
@@ -96,6 +100,14 @@ target_link_libraries(test_config PRIVATE tier::options)
 target_include_directories(test_config PRIVATE
   "${CMAKE_SOURCE_DIR}/apps/node/src")
 add_test(NAME config COMMAND test_config)
+
+# The preset -> roles table (tier::core) and the preset/roles precedence policy
+# (apps/node/src/roles.hpp), unit tested without building the daemon.
+add_executable(test_presets test_presets.cpp)
+target_link_libraries(test_presets PRIVATE tier::core tier::options)
+target_include_directories(test_presets PRIVATE
+  "${CMAKE_SOURCE_DIR}/apps/node/src")
+add_test(NAME presets COMMAND test_presets)
 
 add_executable(test_net_backend test_net_backend.cpp)
 target_link_libraries(test_net_backend PRIVATE tier::net tier::options)

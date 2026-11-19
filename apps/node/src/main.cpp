@@ -38,6 +38,7 @@
 #include "tier/net/subscriber_hub.hpp"
 
 #include "config.hpp"
+#include "roles.hpp"
 
 namespace {
 
@@ -52,85 +53,8 @@ std::string join_addresses(const std::vector<std::string>& addresses) {
   return out;
 }
 
-const char* role_name(tier::core::Role role) {
-  switch (role) {
-    case tier::core::Role::client:
-      return "client";
-    case tier::core::Role::validator:
-      return "validator";
-    case tier::core::Role::keeper:
-      return "keeper";
-    case tier::core::Role::transmitter:
-      return "transmitter";
-    case tier::core::Role::communicator:
-      return "communicator";
-  }
-  return "?";
-}
-
-// Render a role set as "client|validator|..." (just "-" if empty).
-std::string format_roles(tier::core::RoleSet roles) {
-  std::string out;
-  for (const tier::core::Role r :
-       {tier::core::Role::client, tier::core::Role::validator,
-        tier::core::Role::keeper, tier::core::Role::transmitter,
-        tier::core::Role::communicator}) {
-    if (tier::core::has_role(roles, r)) {
-      if (!out.empty()) {
-        out += '|';
-      }
-      out += role_name(r);
-    }
-  }
-  return out.empty() ? "-" : out;
-}
-
-// Parse the roles this node holds from TIER_ROLES: role names separated by
-// '|', ',' or whitespace, e.g. "transmitter" or "validator|keeper". An unset or
-// empty value yields the plain client role, so the default node is an edge node
-// (dial-out only) - see docs/topology.md. Returns std::nullopt on an unknown
-// name so the caller can fail closed with a diagnostic.
-std::optional<tier::core::RoleSet> parse_roles(const char* spec) {
-  if (spec == nullptr) {
-    return tier::core::role_bit(tier::core::Role::client);
-  }
-  tier::core::RoleSet roles = 0;
-  std::string token;
-  const auto flush = [&]() -> bool {
-    if (token.empty()) {
-      return true;
-    }
-    bool matched = false;
-    for (const tier::core::Role r :
-         {tier::core::Role::client, tier::core::Role::validator,
-          tier::core::Role::keeper, tier::core::Role::transmitter,
-          tier::core::Role::communicator}) {
-      if (token == role_name(r)) {
-        roles |= tier::core::role_bit(r);
-        matched = true;
-        break;
-      }
-    }
-    token.clear();
-    return matched;
-  };
-  for (const char c : std::string_view(spec)) {
-    if (c == '|' || c == ',' || c == ' ' || c == '\t') {
-      if (!flush()) {
-        return std::nullopt;
-      }
-    } else {
-      token.push_back(c);
-    }
-  }
-  if (!flush()) {
-    return std::nullopt;
-  }
-  if (roles == 0) {
-    roles = tier::core::role_bit(tier::core::Role::client);
-  }
-  return roles;
-}
+// role_name, format_roles, parse_roles and the preset/roles precedence live in
+// roles.hpp (free of I/O, unit-tested); used here as tier::node::...
 
 // Where the node's long-term Ed25519 seed lives. Override with TIER_ID_FILE
 // (e.g. /etc/tier-network/id or /var/lib/tier/id for a system daemon);
@@ -645,35 +569,35 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
                 tier::core::to_string(version_range).c_str());
   }
 
-  // Roles this node holds (config `roles`, overridable by TIER_ROLES; default
-  // plain client). A client is an edge node - dial-out only; any other role
-  // makes it reachable infrastructure (docs/topology.md). Fail fast on an
-  // unknown name rather than start with a silently wrong role set.
-  std::string roles_spec;
-  bool roles_set = false;
-  if (config->roles) {
-    roles_spec = join(*config->roles, '|');
-    roles_set = true;
-  }
-  if (const char* const env = std::getenv("TIER_ROLES");
-      env != nullptr && *env != '\0') {
-    roles_spec = env;
-    roles_set = true;
-  }
-  const auto roles = parse_roles(roles_set ? roles_spec.c_str() : nullptr);
-  if (!roles) {
-    std::fprintf(stderr,
-                 "invalid roles '%s' (expected names from "
-                 "client|validator|keeper|transmitter|communicator, e.g. "
-                 "\"transmitter\" or \"validator|keeper\")\n",
-                 roles_spec.c_str());
+  // Roles this node holds, from a preset (config `preset` / TIER_PRESET) or an
+  // explicit list (config `roles` / TIER_ROLES). A preset is a code-controlled
+  // role set the operator opts into once; it wins over an explicit roles list in
+  // the same layer, env wins over file, and nothing set means the default
+  // "client" preset - an edge node (dial-out only; any other role makes it
+  // reachable infrastructure, docs/topology.md). Fail fast on an unknown preset
+  // or role name rather than start with a silently wrong role set.
+  const tier::node::RoleResolution role_res = tier::node::resolve_role_set(
+      std::getenv("TIER_PRESET"), std::getenv("TIER_ROLES"), config->preset,
+      config->roles);
+  if (!role_res.ok) {
+    std::fprintf(stderr, "%s\n", role_res.error.c_str());
     return 2;
   }
-  std::printf("roles: %s\n", format_roles(*roles).c_str());
+  if (role_res.roles_ignored) {
+    std::fprintf(stderr,
+                 "warning: both 'preset' and 'roles' are set; using preset "
+                 "'%s' and ignoring 'roles'\n",
+                 role_res.preset.c_str());
+  }
+  const tier::core::RoleSet roles = role_res.roles;
+  if (!role_res.preset.empty()) {
+    std::printf("preset: %s\n", role_res.preset.c_str());
+  }
+  std::printf("roles: %s\n", tier::node::format_roles(roles).c_str());
 
   // Bind the IPv6 wildcard: the endpoint's socket is dual-stack, so "::" serves
   // both IPv6 and IPv4 (v4-mapped) peers. "0.0.0.0" would bind the v4 side only.
-  tier::net::Node node(identity, *roles, "::", port, {}, network,
+  tier::net::Node node(identity, roles, "::", port, {}, network,
                        version_range);
 
   // User identities are hosted at runtime via tierctl (user add / ls / rm), not
@@ -721,7 +645,8 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
     for (const auto b : peer.id) {
       std::printf("%02x", static_cast<unsigned>(b));
     }
-    std::printf(" roles=%s addr=%s\n", format_roles(peer.roles).c_str(),
+    std::printf(" roles=%s addr=%s\n",
+                tier::node::format_roles(peer.roles).c_str(),
                 join_addresses(peer.addresses).c_str());
     std::fflush(stdout);
   });

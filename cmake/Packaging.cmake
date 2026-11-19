@@ -22,6 +22,15 @@ install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.env"
 install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.toml"
         DESTINATION "/etc/tier")
 
+# Ready-made example configs (client, validator), both preset-based. These go to
+# the package doc dir - NOT /etc, so they are plain reference files overwritten
+# on upgrade (not conffiles) and never read by the daemon. Operators copy what
+# they need into /etc/tier/tierd.toml. "ganesha" is intentionally not shipped as
+# an example (experimental, operated by us).
+install(FILES "${CMAKE_SOURCE_DIR}/packaging/tierd.client.toml"
+              "${CMAKE_SOURCE_DIR}/packaging/tierd.validator.toml"
+        DESTINATION "share/doc/tierd")
+
 # Package version: PROJECT_VERSION by default, overridden from the git tag in CI
 # via -DTIER_VERSION=<x.y.z>.
 set(TIER_VERSION "${PROJECT_VERSION}" CACHE STRING "Debian package version")

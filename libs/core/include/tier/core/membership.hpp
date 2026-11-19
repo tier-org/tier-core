@@ -5,6 +5,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace tier::core {
@@ -60,6 +61,25 @@ inline constexpr RoleSet kInfrastructureRoles =
 [[nodiscard]] constexpr bool is_infrastructure(RoleSet set) noexcept {
   return (set & kInfrastructureRoles) != 0;
 }
+
+// A preset is a named, code-controlled role set an operator selects instead of
+// listing roles by hand. Adding a role to a preset (here, or later by
+// governance) reaches every node on its next software update with no config
+// edit - so operators who never touch their config still track the intended
+// role set. A preset is purely local operator configuration: it resolves to a
+// RoleSet before anything is gossiped and is never sent on the wire.
+//
+//   client    -> {client}                            (default; edge node)
+//   validator -> {client, validator, transmitter, communicator}
+//   ganesha   -> kAllRoles  (experimental: every role, auto-growing with the
+//                Role enum; our own nodes use it to exercise new roles in
+//                mainnet without pinning a preset for each)
+//
+// Returns std::nullopt for an unknown name so the caller can fail fast.
+[[nodiscard]] std::optional<RoleSet> preset_roles(std::string_view name) noexcept;
+
+// The valid preset names, '|'-separated, for diagnostics.
+[[nodiscard]] std::string_view preset_names() noexcept;
 
 // SWIM liveness. Order matters for the merge: alive < suspect < dead, so at an
 // equal incarnation a worse report wins.

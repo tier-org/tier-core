@@ -14,9 +14,13 @@
 //
 //   # a comment (also allowed after a value)
 //   network = "testnet"            # quoted or bare scalar string
+//   preset = "validator"           # named role set (see tier::core preset_roles)
 //   version_range = "1.4.0,1.5.0"
 //   roles = ["validator", "keeper"]  # inline array of strings
 //   seeds = ["[fd00::2]:7777", "10.0.0.2:7777"]
+//
+// `preset` and `roles` are two ways to express the same setting; if both are
+// given the preset wins (see tier::node::resolve_role_set).
 //
 // Every field is optional: an absent key leaves that knob to its other source.
 // The daemon layers sources as CLI > environment > this file > baked default,
@@ -29,6 +33,7 @@ namespace tier::node {
 
 struct Config {
   std::optional<std::string> network;
+  std::optional<std::string> preset;
   std::optional<std::vector<std::string>> roles;
   std::optional<std::vector<std::string>> seeds;
   std::optional<std::string> version_range;
@@ -204,6 +209,8 @@ inline std::optional<Config> parse_config(std::string_view text,
     std::optional<Config> err;
     if (key == "network") {
       err = want_scalar(cfg.network);
+    } else if (key == "preset") {
+      err = want_scalar(cfg.preset);
     } else if (key == "version_range") {
       err = want_scalar(cfg.version_range);
     } else if (key == "roles") {

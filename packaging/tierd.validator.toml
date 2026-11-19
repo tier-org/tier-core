@@ -1,0 +1,25 @@
+# Example configuration: a VALIDATOR node.
+#
+# This is a REFERENCE COPY in /usr/share/doc/tierd/. It is overwritten on every
+# package upgrade and is NOT read by the daemon. The live config the daemon reads
+# is /etc/tier/tierd.toml - copy the settings you want from here into that file.
+#
+# A validator is reachable infrastructure (backbone). Unlike a client it MUST be
+# reachable: a routable address and an open UDP port (no NAT). The packaged
+# systemd unit sandboxes the service; keep the node always-on and low-latency.
+
+# Role source: a preset is a named, code-controlled role set. Opting into
+# "validator" means roles added to that preset later (under governance) reach
+# this node on its next package update with no edit here - so a validator that
+# never touches its config still tracks the intended set. It resolves today to:
+#   client + validator + transmitter + communicator
+# i.e. backbone that also serves client-to-client messaging (presence registry,
+# hole-punch signaling, relay fallback).
+#
+# Note: the validator ROLE marks topology only. Authority to sign payments comes
+# from a separately approved validator set, never from this file.
+preset = "validator"
+
+# Network (cluster) to join; unset means mainnet (production). Set only for a
+# test or private cluster. Nodes on different networks cannot even handshake.
+#network = "testnet"

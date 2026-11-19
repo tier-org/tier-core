@@ -10,11 +10,31 @@
 # optional; an unset key falls back to its environment variable, then the baked
 # default. Leave this file as-is for a default production client (edge) node.
 
-# Roles this node holds - decides its place in the network topology
-# (see docs/topology.md). Names from client|validator|keeper|transmitter.
+# Preset - a named, code-controlled role set, and the RECOMMENDED way to set a
+# node's roles. You opt into a preset once; when a role is later added to that
+# preset (in the software, under governance), your node picks it up on its next
+# update with NO edit to this file. Names:
+#   client     the default - a plain edge node (dial-out only)
+#   validator  client + validator + transmitter + communicator
+#   ganesha    EXPERIMENTAL - every role at once (operated by us to try new
+#              roles in mainnet); do not use for a normal node
+# A preset is local config only; it resolves to roles and is never sent on the
+# wire. If both `preset` and `roles` are set, the preset WINS and `roles` is
+# ignored (a warning is logged) - so pick one.
+#
+# This node ships as a plain client. On a backbone/validator node change this to
+# "validator". Ready-made examples live in /usr/share/doc/tierd/ (tierd.client.toml,
+# tierd.validator.toml).
+preset = "client"
+
+# Roles this node holds - the explicit, advanced alternative to `preset`. Decides
+# its place in the network topology (see docs/topology.md). Names from
+# client|validator|keeper|transmitter|communicator.
 # Unset means a plain client: an EDGE node that dials out to infrastructure and
 # is never dialed. Any other role makes the node reachable INFRASTRUCTURE
-# (backbone) that peers dial and that forms the mesh.
+# (backbone) that peers dial and that forms the mesh. A communicator serves the
+# presence registry, hole-punch signaling and the relay fallback that let
+# NAT'd clients reach each other (see docs/communicator.md).
 #
 # IMPORTANT: a seed, or any node meant to be reachable infrastructure, MUST set
 # a non-client role - otherwise role-aware autodial will not mesh it with peers
@@ -23,6 +43,7 @@
 # from a separately approved validator set); today it only marks topology.
 #roles = ["transmitter"]
 #roles = ["validator", "keeper"]
+#roles = ["communicator"]   # presence + hole-punch + relay for NAT'd clients
 
 # Network (cluster) this node joins; unset means mainnet (production). Nodes on
 # different networks cannot even complete a handshake. Name: [a-z0-9-], 1-32
