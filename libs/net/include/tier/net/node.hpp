@@ -505,6 +505,7 @@ class Node {
     std::chrono::steady_clock::time_point updated{};     // when `state` was set
     std::chrono::steady_clock::time_point last_query{};  // when the app last asked
     std::chrono::steady_clock::time_point last_lookup{}; // when we last looked up
+    std::chrono::steady_clock::time_point last_online{}; // last time any replica reported online
   };
   std::map<tier::core::PeerId, PresenceEntry> presence_;
   // Issue directory lookups for watched remote users, refresh/expire the cache,

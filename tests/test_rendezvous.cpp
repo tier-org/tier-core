@@ -107,6 +107,59 @@ int main() {
     check(bad == 0, "adding a communicator evicts at most one id per target");
   }
 
+  // --- choose_relay_communicator: cross-family relay selection ---
+  // Regression for the v6-only-communicator black hole. Two responsible
+  // communicators: comm6 is v6-only, comm46 is dual-stack. We are connected to
+  // both. A v4-only target can only be reached through the dual-stack one;
+  // picking the v6-only relay would silently drop the message.
+  {
+    using tier::net::AddrFamily;
+    using tier::net::choose_relay_communicator;
+
+    const auto comm6 = id_from(700001);   // v6-only communicator
+    const auto comm46 = id_from(700002);  // dual-stack communicator
+    const auto connected_both = [&](const tier::core::PeerId&) { return true; };
+    const auto fam = [&](const tier::core::PeerId& c) -> AddrFamily {
+      if (c == comm6) return {false, true};     // v6 only
+      if (c == comm46) return {true, true};      // v4 + v6
+      return {};
+    };
+    const AddrFamily v4_target{true, false};
+    const AddrFamily v6_target{false, true};
+    const AddrFamily unknown_target{false, false};
+
+    // v6-only communicator first in the responsible order, but the target is
+    // v4-only: must skip it and pick the dual-stack one.
+    check(choose_relay_communicator({comm6, comm46}, connected_both, fam,
+                                    v4_target) == comm46,
+          "v4 target skips v6-only relay for the dual-stack one");
+    // Order must not matter.
+    check(choose_relay_communicator({comm46, comm6}, connected_both, fam,
+                                    v4_target) == comm46,
+          "v4 target picks dual-stack regardless of order");
+    // A v6 target is reachable through either; the first connected wins.
+    check(choose_relay_communicator({comm6, comm46}, connected_both, fam,
+                                    v6_target) == comm6,
+          "v6 target accepts the first (v6-capable) relay");
+    // Unknown target family: degrade to first connected.
+    check(choose_relay_communicator({comm6, comm46}, connected_both, fam,
+                                    unknown_target) == comm6,
+          "unknown target family falls back to first connected");
+    // Only the v6-only relay is connected and the target is v4-only: no family
+    // match, but still relay through it as best effort (better than dropping).
+    const auto only6_connected = [&](const tier::core::PeerId& c) {
+      return c == comm6;
+    };
+    check(choose_relay_communicator({comm6, comm46}, only6_connected, fam,
+                                    v4_target) == comm6,
+          "best-effort fallback to the sole connected relay");
+    // Connected to none: nothing to relay through.
+    const auto none_connected = [&](const tier::core::PeerId&) { return false; };
+    check(!choose_relay_communicator({comm6, comm46}, none_connected, fam,
+                                     v4_target),
+          "no connected relay yields no choice");
+  }
+
   if (g_failures == 0) {
     std::puts("ok");
     return 0;
