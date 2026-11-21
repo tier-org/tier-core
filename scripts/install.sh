@@ -20,6 +20,15 @@
 #                     overwrites an existing config.
 #   --version=vX.Y.Z  Install this exact release tag (default: latest release).
 #   --repo=<owner/n>  Source repository (default: tier-org/tier-core).
+#   --proxy=<url>     Route the GitHub requests through a proxy (http://,
+#                     https:// or socks5h://). Needed on IPv6-only networks:
+#                     GitHub's API and release assets are IPv4-only, so point
+#                     this at a dual-stack CONNECT/SOCKS proxy and it tunnels
+#                     the TLS straight through to GitHub (integrity preserved -
+#                     the proxy never terminates the connection). curl also
+#                     honours the https_proxy/ALL_PROXY env vars, but note that
+#                     `curl | sudo bash` drops the environment, so pass the flag
+#                     (or use `sudo -E`).
 #
 # Re-running is safe: if the requested version is already installed, the install
 # step is skipped.
@@ -30,6 +39,7 @@ REPO="tier-org/tier-core"
 PACKAGE="tierd"
 PRESET="client"
 VERSION=""  # empty = latest release
+PROXY=""    # empty = direct (or whatever curl reads from the environment)
 
 # ---------------------------------------------------------------------------
 # Parse arguments
@@ -48,6 +58,9 @@ for arg in "$@"; do
             ;;
         --repo=*)
             REPO="${arg#--repo=}"
+            ;;
+        --proxy=*)
+            PROXY="${arg#--proxy=}"
             ;;
         *)
             echo "error: unknown argument: $arg" >&2
@@ -76,9 +89,12 @@ require() {
     }
 }
 
+# curl proxy args, empty unless --proxy was given (then: -x <url>).
+CURL_PROXY=()
+
 # Latest release tag via the GitHub API (no auth needed for a public repo).
 latest_tag() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    curl -fsSL "${CURL_PROXY[@]}" "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' | head -n1 \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
 }
@@ -92,6 +108,11 @@ require dpkg
 require apt-get
 
 ARCH="$(dpkg --print-architecture)"
+
+if [ -n "$PROXY" ]; then
+    CURL_PROXY=(-x "$PROXY")
+    echo "    using proxy: $PROXY"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1: resolve the release tag and the .deb asset name
@@ -122,9 +143,11 @@ else
     trap 'rm -rf "$tmp"' EXIT
 
     step "Downloading ${DEB} (${VERSION})"
-    if ! curl -fSL --proto '=https' --tlsv1.2 -o "${tmp}/${DEB}" "$URL"; then
+    if ! curl -fSL "${CURL_PROXY[@]}" --proto '=https' --tlsv1.2 -o "${tmp}/${DEB}" "$URL"; then
         echo "error: download failed: $URL" >&2
-        echo "       releases currently ship ${ARCH}; verify the tag and arch exist" >&2
+        echo "       releases currently ship ${ARCH}; verify the tag and arch exist." >&2
+        echo "       on an IPv6-only network GitHub is unreachable (its release" >&2
+        echo "       assets are IPv4-only); route through a proxy with --proxy=<url>." >&2
         exit 1
     fi
 

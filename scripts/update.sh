@@ -15,15 +15,21 @@
 #
 # Options:
 #   --repo=<owner/n>  Source repository (default: tier-org/tier-core).
+#   --proxy=<url>     Route the GitHub requests through a proxy (http://,
+#                     https:// or socks5h://). Needed on IPv6-only networks:
+#                     GitHub's API and release assets are IPv4-only, so a dual-
+#                     stack CONNECT/SOCKS proxy tunnels the TLS through to them.
 
 set -euo pipefail
 
 REPO="tier-org/tier-core"
 PACKAGE="tierd"
+PROXY=""
 
 for arg in "$@"; do
     case "$arg" in
         --repo=*) REPO="${arg#--repo=}" ;;
+        --proxy=*) PROXY="${arg#--proxy=}" ;;
         *) echo "error: unknown argument: $arg" >&2; exit 1 ;;
     esac
 done
@@ -44,8 +50,10 @@ require() {
     }
 }
 
+CURL_PROXY=()
+
 latest_tag() {
-    curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+    curl -fsSL "${CURL_PROXY[@]}" "https://api.github.com/repos/${REPO}/releases/latest" \
         | grep '"tag_name"' | head -n1 \
         | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/'
 }
@@ -56,6 +64,11 @@ require dpkg
 require apt-get
 
 ARCH="$(dpkg --print-architecture)"
+
+if [ -n "$PROXY" ]; then
+    CURL_PROXY=(-x "$PROXY")
+    echo "    using proxy: $PROXY"
+fi
 
 installed="$(dpkg-query -W -f='${Version}' "$PACKAGE" 2>/dev/null || true)"
 if [ -z "$installed" ]; then
@@ -93,8 +106,10 @@ tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
 step "Downloading ${DEB}"
-if ! curl -fSL --proto '=https' --tlsv1.2 -o "${tmp}/${DEB}" "$URL"; then
+if ! curl -fSL "${CURL_PROXY[@]}" --proto '=https' --tlsv1.2 -o "${tmp}/${DEB}" "$URL"; then
     echo "error: download failed: $URL" >&2
+    echo "       on an IPv6-only network GitHub is unreachable (release assets" >&2
+    echo "       are IPv4-only); route through a proxy with --proxy=<url>." >&2
     exit 1
 fi
 
