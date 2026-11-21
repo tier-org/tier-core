@@ -1351,23 +1351,58 @@ bool Node::relay_sealed(const tier::core::PeerId& to, tier::msg::Suite suite,
   const auto frame = tier::msg::make_relay_frame(
       to, identity_.public_key(),
       tier::crypto::ByteSpan(sealed.data(), sealed.size()));
-  // Hand the frame to a single communicator responsible for `to` - the same
-  // rendezvous set the target registers its presence with, so it holds a
-  // connection to the target. Exactly one, not all replicas: a data relay is not
-  // idempotent (the recipient has no msg-id dedup yet), so fanning out to both
-  // replicas would deliver the message twice. Either replica is equivalent since
-  // the target registers with all of them.
+  // Hand the frame to one communicator responsible for `to` that the target can
+  // also reach. The target enrolls its presence only with the responsible
+  // communicators it can connect to, so a communicator reachable only over an
+  // address family the target lacks (e.g. a v6-only communicator for a v4-only
+  // peer) holds no connection to it and would silently drop the frame. So prefer
+  // a responsible communicator whose advertised addresses share a family with
+  // the target's resolved addresses; fall back to any connected one when we
+  // cannot tell. Still exactly one send, not all replicas: a data relay is not
+  // idempotent (the recipient has no msg-id dedup yet), so fanning out would
+  // deliver twice.
   const auto responsible =
       responsible_communicators(to, live_communicators(), kPresenceReplicas);
-  for (const auto& c : responsible) {
-    const auto conn = conn_by_peer_.find(c);
-    if (conn != conn_by_peer_.end()) {
-      endpoint_.send(conn->second,
-                     std::span<const tier::crypto::Byte>(frame.data(), frame.size()));
-      return true;
+
+  // The address families the target is reachable over, from its resolved
+  // presence record (may be unknown -> both false, in which case the choice
+  // degrades to "first connected responsible").
+  const auto families_of = [&](const std::vector<std::string>& addrs) {
+    AddrFamily f;
+    for (const auto& a : addrs) {
+      if (is_ipv6(a)) {
+        f.v6 = true;
+      } else {
+        f.v4 = true;
+      }
     }
+    return f;
+  };
+  AddrFamily target_family;
+  if (const auto ra = resolved_addrs_.find(to); ra != resolved_addrs_.end()) {
+    target_family = families_of(ra->second);
   }
-  return false;
+
+  const auto chosen = choose_relay_communicator(
+      responsible,
+      [&](const tier::core::PeerId& c) { return conn_by_peer_.count(c) != 0; },
+      [&](const tier::core::PeerId& c) -> AddrFamily {
+        if (const auto info = membership_.find(c); info) {
+          return families_of(info->addresses);
+        }
+        return {};
+      },
+      target_family);
+  if (!chosen) {
+    return false;
+  }
+  const auto conn = conn_by_peer_.find(*chosen);
+  if (conn == conn_by_peer_.end()) {
+    return false;  // raced away since the choice; nothing to send on
+  }
+  endpoint_.send(conn->second,
+                 std::span<const tier::crypto::Byte>(frame.data(), frame.size()));
+  return true;
 }
 
 void Node::handle_user_register(const tier::core::PeerId& from_device,
@@ -1457,14 +1492,25 @@ void Node::handle_user_result(std::span<const tier::crypto::Byte> payload,
   if (!matched) {
     return;
   }
-  // Update the presence cache: a non-empty device set means online, an empty one
-  // offline. In steady state both responsible replicas agree (a user enrolls
-  // with, and de-enrolls from, all of them), so the last answer in a round is
-  // authoritative; any flicker is confined to the brief enroll/de-enroll window
-  // where the state is genuinely changing anyway.
+  // Update the presence cache. A non-empty device set means online. An empty set
+  // means offline ONLY if no responsible replica has reported this user online
+  // within kPresenceTtl: the replicas do NOT always agree. A user enrolls only
+  // with the responsible communicators it can actually reach, so a communicator
+  // reachable only over an address family the user lacks (e.g. a v6-only
+  // communicator for a v4-only peer) holds no record and answers empty. That
+  // empty must not clobber a peer replica that does hold the record, or the user
+  // reads as stuck-offline. "Online" from any replica wins and is re-asserted
+  // every refresh round; a genuine offline (every replica empty) then settles
+  // once the last online reading ages past the hold.
   if (const auto pit = presence_.find(user); pit != presence_.end()) {
-    pit->second.state = devices.empty() ? Presence::offline : Presence::online;
-    pit->second.updated = now;
+    if (!devices.empty()) {
+      pit->second.state = Presence::online;
+      pit->second.last_online = now;
+      pit->second.updated = now;
+    } else if (now - pit->second.last_online > kPresenceTtl) {
+      pit->second.state = Presence::offline;
+      pit->second.updated = now;
+    }
   }
   if (!devices.empty()) {
     deliver_resolved_user(user, devices);

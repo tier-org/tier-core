@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <functional>
+#include <optional>
 
 #include "tier/crypto/hash.hpp"
 #include "tier/crypto/primitives.hpp"
@@ -70,6 +72,32 @@ bool is_responsible_for(const tier::core::PeerId& self,
                         std::size_t k) {
   const auto top = responsible_communicators(target, communicators, k);
   return std::find(top.begin(), top.end(), self) != top.end();
+}
+
+std::optional<tier::core::PeerId> choose_relay_communicator(
+    const std::vector<tier::core::PeerId>& responsible,
+    const std::function<bool(const tier::core::PeerId&)>& connected,
+    const std::function<AddrFamily(const tier::core::PeerId&)>& family_of,
+    AddrFamily target) {
+  const bool target_known = target.v4 || target.v6;
+  std::optional<tier::core::PeerId> fallback;
+  for (const auto& c : responsible) {
+    if (!connected(c)) {
+      continue;  // we hold no connection to this communicator
+    }
+    bool compatible = true;
+    if (target_known) {
+      const AddrFamily cf = family_of(c);
+      compatible = (target.v4 && cf.v4) || (target.v6 && cf.v6);
+    }
+    if (compatible) {
+      return c;
+    }
+    if (!fallback) {
+      fallback = c;  // best effort if nothing family-compatible turns up
+    }
+  }
+  return fallback;
 }
 
 }  // namespace tier::net

@@ -47,6 +47,11 @@ target_link_libraries(test_relay PRIVATE tier::net tier::msg tier::core tier::cr
 add_test(NAME relay COMMAND test_relay)
 set_tests_properties(relay PROPERTIES TIMEOUT 90)
 
+add_executable(test_cross_family test_cross_family.cpp)
+target_link_libraries(test_cross_family PRIVATE tier::net tier::msg tier::core tier::crypto tier::options)
+add_test(NAME cross_family COMMAND test_cross_family)
+set_tests_properties(cross_family PROPERTIES TIMEOUT 90)
+
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)

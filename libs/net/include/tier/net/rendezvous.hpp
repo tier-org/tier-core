@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <functional>
+#include <optional>
 #include <vector>
 
 #include "tier/core/membership.hpp"
@@ -33,5 +35,28 @@ inline constexpr std::size_t kPresenceReplicas = 2;
 [[nodiscard]] bool is_responsible_for(
     const tier::core::PeerId& self, const tier::core::PeerId& target,
     const std::vector<tier::core::PeerId>& communicators, std::size_t k);
+
+// Address families a node advertises / reaches over.
+struct AddrFamily {
+  bool v4 = false;
+  bool v6 = false;
+};
+
+// Choose which responsible communicator to relay a message to `target` through.
+//
+// A relay only works if the chosen communicator holds a connection to the
+// target, and the target enrolls its presence only with the responsible
+// communicators it can reach. So a communicator reachable only over an address
+// family the target lacks (e.g. a v6-only communicator for a v4-only target)
+// would silently drop the frame. Among the `responsible` set, this prefers the
+// first communicator we are `connected` to whose advertised families (`family_of`)
+// intersect the target's (`target`); if none is family-compatible (or the target
+// family is unknown, i.e. both false), it falls back to the first connected one.
+// Returns nullopt only when we are connected to none of them.
+[[nodiscard]] std::optional<tier::core::PeerId> choose_relay_communicator(
+    const std::vector<tier::core::PeerId>& responsible,
+    const std::function<bool(const tier::core::PeerId&)>& connected,
+    const std::function<AddrFamily(const tier::core::PeerId&)>& family_of,
+    AddrFamily target);
 
 }  // namespace tier::net
