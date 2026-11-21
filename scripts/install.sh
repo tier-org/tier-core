@@ -151,6 +151,13 @@ else
         exit 1
     fi
 
+    # mktemp -d is 0700/root, so apt's sandbox user (_apt) cannot read the local
+    # file and apt falls back to an unsandboxed root fetch with a noisy warning.
+    # Make the dir and file readable so the sandbox stays intact (the .deb is a
+    # public release artifact anyway).
+    chmod 0755 "$tmp"
+    chmod 0644 "${tmp}/${DEB}"
+
     step "Installing ${DEB}"
     # apt-get on a local path resolves dependencies (plain dpkg -i would not).
     apt-get install -y "${tmp}/${DEB}"

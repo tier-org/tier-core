@@ -114,6 +114,12 @@ if ! curl -fSL "${CURL_PROXY[@]}" --proto '=https' --tlsv1.2 -o "${tmp}/${DEB}" 
 fi
 
 step "Upgrading ${installed} -> ${PKGVER}"
+# mktemp -d is 0700/root, so apt's sandbox user (_apt) cannot read the local
+# file and apt falls back to an unsandboxed root fetch with a noisy warning.
+# Make the dir and file readable so the sandbox stays intact (the .deb is a
+# public release artifact anyway).
+chmod 0755 "$tmp"
+chmod 0644 "${tmp}/${DEB}"
 # Conffiles (/etc/tier/tierd.toml, tierd.env) are preserved by dpkg on upgrade.
 apt-get install -y "${tmp}/${DEB}"
 
