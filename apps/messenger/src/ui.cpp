@@ -610,12 +610,18 @@ int run_ui(NodeClient& client, Store& store, const tier::core::PeerId& account) 
       return;
     }
     if (verb == "contacts/add") {
-      start_prompt("contact id (64 hex):", false, [&](const std::string& idv) {
-        const std::string id = trim(idv);
-        if (!from_hex(id)) {
-          status = "invalid id: need 64 hex chars";
+      start_prompt("contact id (64 hex) or tier address:", false,
+                   [&](const std::string& idv) {
+        const std::string in = trim(idv);
+        // Accept either a 64-hex id or a tier bech32m address (elided or
+        // tier1-prefixed), then store the canonical lowercase hex id.
+        std::optional<tier::core::PeerId> pid = from_hex(in);
+        if (!pid) pid = tier::core::id_from_address(in);
+        if (!pid) {
+          status = "invalid: need a 64-hex id or a tier address";
           return;
         }
+        const std::string id = to_hex(*pid);
         start_prompt("name (optional):", false,
                      [&, id](const std::string& namev) {
                        store.upsert_contact(id, trim(namev));
