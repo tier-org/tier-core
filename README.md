@@ -230,6 +230,11 @@ the package and attaches the `.deb` to a GitHub Release. To install and run:
     sudoedit /etc/tier/tierd.env      # set TIER_ARGS: listen port, optional seed
     sudo systemctl start tierd
 
+For a guided client install (and updates) straight from the release `.deb` -
+with config presets and a one-liner installer - see [INSTALL.md](INSTALL.md).
+For managed, automatic updates through apt, use the Geek Foundation PPA
+([tier-ppa](https://github.com/GeekFoundation/tier-ppa)).
+
 The node stores its Ed25519 identity under `/var/lib/tier` (systemd
 StateDirectory). It joins through the preconfigured seeds below, so no seed
 argument is required; an explicit `<seed_ip> <seed_port>` in `TIER_ARGS` is
