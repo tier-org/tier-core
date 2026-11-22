@@ -1,0 +1,13 @@
+# tier-agent in the COLLECTOR role: subscribe, store received samples durably,
+# and expose a local read socket. Pairs with tier-agent@collector.service.
+# Copy to /etc/tier/collector.toml. Read it back with:
+#   tier-agent query /run/tier-agent/agent-query.sock
+role = "collector"
+admin_socket = "/run/tierd/tierd.sock"          # tierd's local admin socket
+seed_file = "/var/lib/tier-agent/agent-collector.seed"
+
+[collector]
+store = "/var/lib/tier-agent/agent-store.log"
+query_socket = "/run/tier-agent/agent-query.sock"
+persistence = "local"                 # local | keeper (keeper = opt-in HA, later)
+# accept_from = ["tier1<agentA>", "tier1<agentB>"]   # allowlist; omit = accept any

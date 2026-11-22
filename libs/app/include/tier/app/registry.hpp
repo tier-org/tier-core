@@ -17,6 +17,7 @@ namespace tier::app {
 enum class AppType : std::uint16_t {
   text = 0x0001,              // chat text; payload is UTF-8; wants_receipt
   delivery_receipt = 0x0002,  // system; payload is the acked msg_id; no receipt
+  telemetry = 0x0003,         // tier-agent metrics; payload is an agent envelope
 };
 
 // Application-frame version, independent of the transport and envelope versions.

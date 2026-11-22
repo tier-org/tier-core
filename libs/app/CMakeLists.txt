@@ -6,7 +6,8 @@ add_library(tier_app STATIC
   src/frame.cpp
   src/dispatcher.cpp
   src/handlers/text.cpp
-  src/handlers/receipt.cpp)
+  src/handlers/receipt.cpp
+  src/handlers/telemetry.cpp)
 add_library(tier::app ALIAS tier_app)
 
 target_include_directories(tier_app PUBLIC include)

@@ -1,0 +1,29 @@
+# tier-agent example config. One binary; `role` selects behaviour.
+# The actor drives a locally running tierd over its admin socket.
+
+role = "agent"                       # agent | collector | both
+admin_socket = "/run/tierd/tierd.sock"   # tierd's local admin socket
+seed_file = "/var/lib/tier-agent/agent.seed"   # this actor's stable identity
+
+# --- agent role: ship local metrics to a collector ---
+# Samples are line-protocol: "<gauge|event> <key> <value...>"
+#   gauge <key> <value>   rewritable, last-value-wins (cpu.load, mem.used, ...)
+#   event <key> <value>   append-only history (unit.sshd activating->active)
+# Source is stdin by default; set `exec` to run a command each interval instead.
+[agent]
+collector = "tier1qh9x9j807gxfdfjtxurzqqyqdlage5rtrpte3kujkd0alazaj38snd9pcx"
+interval = 10                        # seconds between batched flushes
+max_batch = 256                      # flush early once this many samples buffer
+# exec = "/usr/libexec/tier/host-metrics.sh"       # serf-like periodic source
+
+# --- collector role: receive, store, expose ---
+[collector]
+store = "/var/lib/tier-agent/agent-store.log"   # durable append log (read path)
+persistence = "local"                      # local | keeper  (keeper = opt-in HA)
+# query_socket = "/run/tier-agent/agent-query.sock"  # local read socket (below)
+# accept_from = ["tier1<agentA>", "tier1<agentB>"]   # allowlist; omit = accept any
+
+# Read a collector's current state (one-shot), optionally filtered by a substring
+# of the "sender/key" label:
+#   tier-agent query /run/tier-agent/agent-query.sock
+#   tier-agent query /run/tier-agent/agent-query.sock cpu

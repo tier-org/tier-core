@@ -153,6 +153,54 @@ int main() {
     check(ctx.sent.empty(), "nothing emitted when no live subscriber");
   }
 
+  // --- telemetry handler: delivers to the subscriber, never acks ----------
+  // tier-agent telemetry is forwarded to a subscribed collector exactly like
+  // text, carrying its type and payload, and (being fire-and-forget) emits no
+  // receipt even if the wants-receipt flag is set. Without this handler the
+  // dispatcher would count the frame as an unknown type and drop it.
+  {
+    tier::app::AppDispatcher d;
+    d.register_handler(tier::app::make_telemetry_handler());
+
+    AppFrame tm;
+    tm.type = AppType::telemetry;
+    tm.flags = tier::app::kFlagWantsReceipt;  // must still be ignored
+    tm.msg_id[0] = 0x77;
+    const std::string body = "TM...batch...";
+    tm.payload.assign(body.begin(), body.end());
+
+    FakeContext ctx;
+    d.enqueue(raw(alice, bob, tm));  // alice -> bob, bob is local
+    d.drain(ctx);
+
+    check(ctx.messages.size() == 1, "telemetry delivered to subscriber once");
+    check(!ctx.messages.empty() && ctx.messages[0].local_user == bob,
+          "telemetry delivered to the recipient user");
+    check(!ctx.messages.empty() && ctx.messages[0].sender_user == alice,
+          "telemetry delivery carries the sender user");
+    check(!ctx.messages.empty() && ctx.messages[0].type == AppType::telemetry,
+          "telemetry type preserved on delivery");
+    check(!ctx.messages.empty() &&
+              ctx.messages[0].payload ==
+                  std::vector<std::uint8_t>(body.begin(), body.end()),
+          "telemetry payload preserved on delivery");
+    check(ctx.sent.empty(), "telemetry emits no receipt (fire-and-forget)");
+  }
+
+  // --- telemetry with no live subscriber: dropped, nothing emitted --------
+  {
+    tier::app::AppDispatcher d;
+    d.register_handler(tier::app::make_telemetry_handler());
+    AppFrame tm;
+    tm.type = AppType::telemetry;
+    FakeContext ctx;
+    ctx.subscriber_present = false;
+    d.enqueue(raw(alice, bob, tm));
+    d.drain(ctx);
+    check(ctx.messages.size() == 1, "telemetry delivery attempted once");
+    check(ctx.sent.empty(), "nothing emitted when no collector is subscribed");
+  }
+
   // --- receipt handler: notifies the subscriber --------------------------
   {
     tier::app::AppDispatcher d;

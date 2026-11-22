@@ -615,6 +615,7 @@ int run_node(const tier::crypto::NodeIdentity& identity, std::uint16_t port,
   tier::app::AppDispatcher dispatcher;
   dispatcher.register_handler(tier::app::make_text_handler());
   dispatcher.register_handler(tier::app::make_receipt_handler());
+  dispatcher.register_handler(tier::app::make_telemetry_handler());
   DaemonAppContext app_ctx(node, hub);
   // A user message is not buffered on the node; it arrives here and is enqueued
   // for the dispatcher, which delivers it to the recipient user's subscribers or

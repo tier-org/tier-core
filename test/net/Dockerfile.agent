@@ -1,0 +1,22 @@
+# Runtime image for the tier-agent e2e gate. Same thin base and env as the
+# localnet image, plus the tier-agent binary. tierd, tierctl and tier-agent are
+# staged into ./bin by e2e-agent.sh before the build.
+#
+# NOTE: this gate's compose is IPv4-only (no daemon IPv6 setup needed to run it);
+# dual-stack is covered by the other gates (e2e.sh). The telemetry path it
+# exercises - edge agent -> communicator relay -> edge collector - is unaffected.
+FROM ubuntu:22.04
+
+LABEL tier.harness=localnet
+
+COPY bin/tierd bin/tierctl bin/tier-agent /usr/local/bin/
+
+ENV TIER_ADMIN_SOCK=/run/tierd/tierd.sock \
+    TIER_ID_FILE=/var/lib/tier/node_key \
+    TIER_NETWORK=localnet \
+    TIER_ROLES=transmitter
+
+RUN mkdir -p /run/tierd /var/lib/tier
+
+ENTRYPOINT ["/usr/local/bin/tierd"]
+CMD ["run", "7777"]

@@ -52,6 +52,14 @@ target_link_libraries(test_cross_family PRIVATE tier::net tier::msg tier::core t
 add_test(NAME cross_family COMMAND test_cross_family)
 set_tests_properties(cross_family PROPERTIES TIMEOUT 90)
 
+add_executable(test_agent_envelope test_agent_envelope.cpp)
+target_link_libraries(test_agent_envelope PRIVATE tier::agent_core tier::options)
+add_test(NAME agent_envelope COMMAND test_agent_envelope)
+
+add_executable(test_agent_core test_agent_core.cpp)
+target_link_libraries(test_agent_core PRIVATE tier::agent_core tier::core tier::options)
+add_test(NAME agent_core COMMAND test_agent_core)
+
 add_executable(test_membership test_membership.cpp)
 target_link_libraries(test_membership PRIVATE tier::core tier::options)
 add_test(NAME membership COMMAND test_membership)

@@ -52,6 +52,7 @@ add_subdirectory(libs/net)
 add_subdirectory(apps/node)
 add_subdirectory(apps/cli)
 add_subdirectory(apps/vanity)
+add_subdirectory(apps/agent)
 
 # tier-messenger: an interactive TUI client (FTXUI) with a local SQLite store.
 # Built and packaged by default, like tierd and tierctl; it needs the vendored
