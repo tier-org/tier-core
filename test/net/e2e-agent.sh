@@ -11,6 +11,11 @@
 # in exec mode (re-ships every interval), so a dropped cold-start first message
 # (best-effort online-only delivery) is retried rather than lost.
 #
+# It then bounces tierd on the collector side in place (clientb runs tierd under
+# a respawn supervisor) and asserts a NEW gauge still arrives: the collector must
+# reconnect its dropped subscribe stream on its own and resume - the agent must
+# survive a tierd restart.
+#
 # Env:
 #   CONVERGE_TIMEOUT        seconds to wait for the clients to attach (default 40)
 #   DELIVER_TIMEOUT         seconds to wait for delivery (default 60)
@@ -159,6 +164,60 @@ if [ "$got_gauge" = 1 ]; then echo "gauge delivered"; else
   echo "FAIL: gauge not delivered"; failures=$((failures + 1)); fi
 if [ "$got_event" = 1 ]; then echo "event delivered"; else
   echo "FAIL: event not delivered"; failures=$((failures + 1)); fi
+
+# --- restart resilience: bounce tierd on the collector side -----------------
+# The real invariant: a client must ride through a tierd restart. We restart ONLY
+# the tierd process on clientb (its supervisor respawns it); the collector
+# tier-agent process keeps running and must reconnect its dropped subscribe
+# stream by itself, re-enroll its presence, and resume storing telemetry. We
+# prove it with a NEW gauge the agent only starts emitting now, so a pre-restart
+# cached value cannot pass the check. Only run once baseline delivery worked.
+if [ "$failures" -eq 0 ]; then
+  echo "== restart resilience: bouncing tierd on clientb (collector side) =="
+  stamp2="$stamp-r"
+  compose exec -T clienta sh -c 'cat > /var/lib/tier/emit.sh' <<EOF
+#!/bin/sh
+echo "gauge e2e.metric $stamp"
+echo "event e2e.boot started-$stamp"
+echo "gauge e2e.after $stamp2"
+EOF
+  compose exec -T clienta sh -c 'chmod +x /var/lib/tier/emit.sh'
+  # Kill just the tierd child; the PID-1 supervisor restarts it in place. The
+  # collector process is NOT touched - its subscribe stream must self-heal.
+  compose exec -T clientb sh -c 'kill "$(cat /run/tierd/tierd.pid)" 2>/dev/null || true'
+
+  echo "   waiting up to ${converge_timeout}s for clientb's tierd to re-attach"
+  rstart=$(date +%s)
+  while :; do
+    cb="$(connected_count clientb)"
+    if [ "${cb:-0}" -ge 1 ]; then
+      echo "   clientb re-attached in $(( $(date +%s) - rstart ))s"; break
+    fi
+    if [ "$(( $(date +%s) - rstart ))" -ge "$converge_timeout" ]; then
+      echo "   clientb did NOT re-attach after restart"; break
+    fi
+    sleep 1
+  done
+  sleep 3  # let the collector re-subscribe and re-register presence
+
+  echo "   waiting up to ${deliver_timeout}s for post-restart telemetry =="
+  rdeadline=$(( $(date +%s) + deliver_timeout ))
+  got_after=0
+  while :; do
+    snap="$(compose exec -T clientb tier-agent query \
+      /run/tierd/agent-query.sock e2e.after 2>/dev/null || true)"
+    printf '%s\n' "$snap" | grep -q "e2e.after $stamp2" && got_after=1
+    [ "$got_after" = 1 ] && break
+    [ "$(date +%s)" -ge "$rdeadline" ] && break
+    sleep 2
+  done
+  if [ "$got_after" = 1 ]; then
+    echo "post-restart telemetry delivered (collector re-subscribed on its own)"
+  else
+    echo "FAIL: no telemetry after tierd restart (collector did not recover)"
+    failures=$((failures + 1))
+  fi
+fi
 
 if [ "$failures" -ne 0 ]; then
   echo "---- agent.log ----";     compose exec -T clienta cat /var/lib/tier/agent.log 2>/dev/null || true
