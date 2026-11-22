@@ -199,6 +199,19 @@ sent under, and whether you have marked them verified. SQLite is vendored as the
 public-domain amalgamation under `vendor/sqlite`; FTXUI (MIT) is the
 `vendor/ftxui` submodule.
 
+### tier-agent (telemetry over the network)
+
+A monitoring/telemetry actor that uses the network as a secure transport for
+infrastructure metrics (the serf-like use case). One binary, role by config
+(`agent` ships samples, `collector` receives/stores/serves, `both`); a thin
+client over the tierd admin socket that changes nothing in the core. Agents emit
+gauges (rewritable) and events (append-only), batched; a collector stores them
+durably and serves a local read socket (`tier-agent query`). Delivery is
+best-effort online-only (correct for metrics); guaranteed delivery is a future
+keeper-backed layer. Built with the tree (`apps/agent`), not installed by default
+yet. See [docs/agent.md](docs/agent.md); integrations and systemd units are under
+`apps/agent/integrations/`.
+
 ### Release (static) binary
 
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIER_SANITIZE=OFF \

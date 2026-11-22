@@ -51,6 +51,13 @@ Or call the scripts directly in `test/net/` (`./localnet.sh up`, `./e2e.sh`).
   topology in which the cross-node one-way-loss + missing-receipt bug
   reproduced; the star gates above cannot exercise the self-enroll / self-consult
   and rendezvous-responsibility paths it covers.
+- `e2e-agent.sh` - **tier-agent telemetry**: two communicators + two edge
+  clients, a `tier-agent` collector on one client and an agent on the other.
+  Asserts a gauge and an event shipped by the agent arrive in the collector's
+  store, read back through its query socket - the real relayed telemetry path
+  (presence lookup + communicator relay). IPv4-only, so it runs without the
+  daemon IPv6 setup the other gates need (dual-stack is already covered by
+  `e2e.sh`). See docs/agent.md.
 
 By default the binaries are built as a static Release into `build-localnet/`.
 To reuse binaries built elsewhere, set `TIERD_BIN` and `TIERCTL_BIN`:

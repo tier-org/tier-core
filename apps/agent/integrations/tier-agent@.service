@@ -1,0 +1,37 @@
+# Templated systemd unit for tier-agent. REFERENCE - shipped under
+# /usr/share/doc/tierd/agent; copy to /etc/systemd/system to use. The instance
+# name selects the config:
+#   systemctl enable --now tier-agent@collector   -> /etc/tier/collector.toml
+#   systemctl enable --now tier-agent@agent        -> /etc/tier/agent.toml
+#
+# Requires a local tierd running: the agent drives its admin socket at
+# /run/tierd/tierd.sock. tierd runs under systemd DynamicUser with a 0660 socket,
+# so this unit runs as root - the simplest setup that can reach that socket. A
+# hardened dedicated-user variant (agent as an unprivileged account in a static
+# group that owns the admin socket) is a planned follow-up; it needs a matching
+# change to tierd.service and is intentionally not wired here yet.
+#
+# The agent role must set `exec` in its config (a systemd service has no stdin).
+[Unit]
+Description=tier-agent (%i): telemetry over the tier network
+After=network-online.target tierd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/tier-agent --config /etc/tier/%i.toml
+Restart=on-failure
+RestartSec=5
+# The agent's own runtime dir (/run/tier-agent, for the collector query socket)
+# and persistent state (/var/lib/tier-agent, for its seed and store). Kept
+# separate from tierd's own /run/tierd and /var/lib/tier so neither clobbers the
+# other's directory ownership.
+RuntimeDirectory=tier-agent
+StateDirectory=tier-agent
+# Light hardening that does not block reaching tierd's admin socket.
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

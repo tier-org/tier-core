@@ -1,0 +1,57 @@
+# Topology for the tier-agent e2e gate: two communicators (backbone) and two
+# edge clients, exactly like docker-compose.roles.yml, but IPv4-only so the gate
+# runs without daemon-wide IPv6 setup. clienta hosts the tier-agent in the AGENT
+# role; clientb hosts it in the COLLECTOR role. The two clients share no direct
+# connection and never gossip each other - telemetry must travel agent -> a
+# responsible communicator -> collector, proving the real relayed path.
+#
+# Same isolation as the other harness composes: internal network (no route off
+# the bridge) and a private TIER_NETWORK, so no production contamination.
+
+name: tier-localnet-agent
+
+networks:
+  tiernet:
+    driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: 10.79.0.0/24
+
+services:
+  comm1:
+    image: tier-agent-localnet:latest
+    container_name: tier-agent-comm1
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "10.79.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.11
+  comm2:
+    image: tier-agent-localnet:latest
+    container_name: tier-agent-comm2
+    environment:
+      TIER_ROLES: communicator
+      TIER_SEEDS: "10.79.0.11:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.21
+  clienta:
+    image: tier-agent-localnet:latest
+    container_name: tier-agent-clienta
+    environment:
+      TIER_ROLES: client
+      TIER_SEEDS: "10.79.0.11:7777 10.79.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.31
+  clientb:
+    image: tier-agent-localnet:latest
+    container_name: tier-agent-clientb
+    environment:
+      TIER_ROLES: client
+      TIER_SEEDS: "10.79.0.11:7777 10.79.0.21:7777"
+    networks:
+      tiernet:
+        ipv4_address: 10.79.0.41

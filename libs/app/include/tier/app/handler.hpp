@@ -58,5 +58,6 @@ class AppMessageHandler {
 // Built-in handler factories (one translation unit each).
 std::unique_ptr<AppMessageHandler> make_text_handler();
 std::unique_ptr<AppMessageHandler> make_receipt_handler();
+std::unique_ptr<AppMessageHandler> make_telemetry_handler();
 
 }  // namespace tier::app

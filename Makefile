@@ -1,12 +1,17 @@
 # Convenience wrappers around the Docker mesh harness in test/net. The project
 # itself is built with CMake (see README.md "Build"); these targets only drive
 # the local network and the e2e gate so they come up in one command.
-.PHONY: e2e localnet-up localnet-status localnet-down
+.PHONY: e2e e2e-agent localnet-up localnet-status localnet-down
 
 # Build, converge, assert full discovery + dual-stack, tear down. Non-zero exit
 # on failure - run this before cutting a release.
 e2e:
 	./test/net/e2e.sh
+
+# tier-agent telemetry gate: agent -> communicator relay -> collector, read back
+# through the collector query socket (IPv4-only, no daemon IPv6 setup needed).
+e2e-agent:
+	./test/net/e2e-agent.sh
 
 # A local, isolated four-node mesh for manual inspection.
 localnet-up:
