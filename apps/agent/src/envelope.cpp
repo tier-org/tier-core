@@ -11,7 +11,7 @@ constexpr std::uint8_t kVersion = 1;
 // the sender (transport), but still must never trust sizes in the payload.
 constexpr std::size_t kMaxSamples = 4096;
 constexpr std::size_t kMaxKeyLen = 256;
-constexpr std::size_t kMaxValueLen = 64 * 1024;
+constexpr std::size_t kMaxValueLen = std::size_t{64} * 1024;
 
 void put_u16(std::vector<std::uint8_t>& out, std::uint16_t v) {
   out.push_back(static_cast<std::uint8_t>(v >> 8));

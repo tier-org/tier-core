@@ -10,7 +10,7 @@
 
 namespace tier::agent {
 
-enum class Role { agent, collector, both };
+enum class Role : std::uint8_t { agent, collector, both };
 
 struct Config {
   Role role = Role::agent;

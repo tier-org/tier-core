@@ -35,6 +35,7 @@
 #include <fstream>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -290,40 +291,52 @@ void run_collector(tier::agent::AdminClient& client,
                           std::ref(store), std::ref(store_mu));
   }
 
-  const int fd = client.open_stream(self);
-  if (fd < 0) {
-    std::fprintf(stderr, "error: cannot subscribe to the collector stream\n");
-    g_stop.store(true);
-    if (qthread.joinable()) qthread.join();
-    return;
-  }
-  tier::agent::StreamParser parser;
+  // Subscribe to our own user's stream and keep it alive across tierd restarts:
+  // on any drop, re-subscribe on a backoff so telemetry resumes (and our
+  // presence enrollment is re-established) once tierd is back. Only a real stop
+  // (signal) ends the loop; a stream error must not kill the collector.
   std::array<std::uint8_t, 4096> buf{};
+  std::uint32_t backoff = 0;
   while (!g_stop.load()) {
-    const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-    if (n <= 0) break;
-    parser.feed(buf.data(), static_cast<std::size_t>(n));
-    for (auto ev = parser.next(); ev; ev = parser.next()) {
-      if (ev->kind != tier::core::AdminStreamKind::message) continue;
-      const auto& m = ev->message;
-      if (m.type != static_cast<std::uint16_t>(tier::app::AppType::telemetry)) {
-        continue;
-      }
-      if (!cfg.accept_from.empty()) {
-        bool allowed = false;
-        for (const auto& a : cfg.accept_from) {
-          if (a == m.sender_user) { allowed = true; break; }
-        }
-        if (!allowed) continue;  // not on the allowlist
-      }
-      std::lock_guard<std::mutex> lk(store_mu);
-      if (!store.first_seen(m.msg_id)) continue;  // duplicate
-      const auto env = tier::agent::decode(m.payload.data(), m.payload.size());
-      if (!env) continue;  // not a telemetry envelope
-      store.apply(to_hex(m.sender_user), *env);
+    const int fd = client.open_stream(self);
+    if (fd < 0) {
+      backoff = backoff ? (backoff < 4 ? backoff * 2 : 4) : 1;
+      interruptible_sleep(backoff);  // tierd unreachable: wait and retry
+      continue;
     }
+    backoff = 0;  // reset after a good subscribe
+    tier::agent::StreamParser parser;
+    while (!g_stop.load()) {
+      const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+      if (n <= 0) break;  // stream dropped -> reconnect
+      parser.feed(buf.data(), static_cast<std::size_t>(n));
+      for (;;) {
+        auto ev = parser.next();
+        if (!ev) break;
+        if (ev->kind != tier::core::AdminStreamKind::message) continue;
+        const auto& m = ev->message;
+        if (m.type != static_cast<std::uint16_t>(tier::app::AppType::telemetry)) {
+          continue;
+        }
+        if (!cfg.accept_from.empty()) {
+          bool allowed = false;
+          for (const auto& a : cfg.accept_from) {
+            if (a == m.sender_user) { allowed = true; break; }
+          }
+          if (!allowed) continue;  // not on the allowlist
+        }
+        std::lock_guard<std::mutex> lk(store_mu);
+        if (!store.first_seen(m.msg_id)) continue;  // duplicate
+        const auto env = tier::agent::decode(m.payload.data(), m.payload.size());
+        if (!env) continue;  // not a telemetry envelope
+        store.apply(to_hex(m.sender_user), *env);
+      }
+    }
+    ::close(fd);
+    if (g_stop.load()) break;
+    backoff = backoff ? (backoff < 4 ? backoff * 2 : 4) : 1;
+    interruptible_sleep(backoff);  // tierd restart/blip: back off, re-subscribe
   }
-  ::close(fd);
   g_stop.store(true);
   if (qthread.joinable()) qthread.join();
 }
@@ -414,32 +427,46 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  std::array<std::uint8_t, 32> seed{};
-  if (!load_or_create_seed(cfg->seed_file, seed)) return 1;
+  const tier::agent::Config& conf = *cfg;
 
-  tier::agent::AdminClient client(cfg->admin_socket);
-  const auto self = client.add_user(seed);
-  if (!self) {
-    std::fprintf(stderr,
-                 "error: add_user failed; is tierd running at %s?\n",
-                 cfg->admin_socket.c_str());
-    return 1;
-  }
-  std::fprintf(stderr, "tier-agent: user %s\n  address: %s\n",
-               to_hex(*self).c_str(),
-               tier::core::address_from_id(*self).c_str());
+  std::array<std::uint8_t, 32> seed{};
+  if (!load_or_create_seed(conf.seed_file, seed)) return 1;
+
+  tier::agent::AdminClient client(conf.admin_socket);
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
-  if (cfg->role == tier::agent::Role::collector) {
-    run_collector(client, *self, *cfg);
-  } else if (cfg->role == tier::agent::Role::agent) {
-    run_agent(client, *self, *cfg);
+  // Enroll this actor's identity. add_user is idempotent - tierd persists the
+  // user seed and re-hosts it on restart - so retry on a backoff rather than
+  // exiting when tierd is not up yet or is restarting: the agent must ride
+  // through that transparently.
+  tier::core::PeerId self{};
+  bool have_user = false;
+  for (std::uint32_t backoff = 0; !g_stop.load();) {
+    if (const auto u = client.add_user(seed)) {
+      self = *u;
+      have_user = true;
+      break;
+    }
+    backoff = backoff ? (backoff < 4 ? backoff * 2 : 4) : 1;
+    std::fprintf(stderr, "tier-agent: tierd unreachable at %s; retry in %us\n",
+                 conf.admin_socket.c_str(), backoff);
+    interruptible_sleep(backoff);
+  }
+  if (!have_user) return 0;  // asked to stop before tierd became reachable
+  std::fprintf(stderr, "tier-agent: user %s\n  address: %s\n",
+               to_hex(self).c_str(),
+               tier::core::address_from_id(self).c_str());
+
+  if (conf.role == tier::agent::Role::collector) {
+    run_collector(client, self, conf);
+  } else if (conf.role == tier::agent::Role::agent) {
+    run_agent(client, self, conf);
   } else {  // both
-    std::thread collector(run_collector, std::ref(client), std::cref(*self),
-                          std::cref(*cfg));
-    run_agent(client, *self, *cfg);
+    std::thread collector(run_collector, std::ref(client), std::cref(self),
+                          std::cref(conf));
+    run_agent(client, self, conf);
     g_stop.store(true);
     collector.join();
   }

@@ -55,3 +55,10 @@ services:
     networks:
       tiernet:
         ipv4_address: 10.79.0.41
+    # tierd runs under a tiny respawn supervisor (PID 1) so the gate can bounce
+    # it in place - killing just the tierd child via the pid file, which the
+    # supervisor then restarts - to prove the collector re-subscribes on its own
+    # (the node seed and users/ live under /var/lib/tier, so identity survives).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - 'while :; do /usr/local/bin/tierd run 7777 & echo $$! > /run/tierd/tierd.pid; wait $$!; sleep 0.3; done'

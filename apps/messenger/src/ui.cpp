@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -117,6 +118,11 @@ std::vector<std::string> grouped_id_lines(const std::string& hex) {
 // Background reader of one account's event stream. It decodes events off the
 // socket and hands them to the UI thread through a locked queue, waking the
 // screen after each. All store access stays on the UI thread.
+//
+// The stream is self-healing: tierd can restart (or the socket blip) and the
+// reader re-subscribes on a backoff until it reconnects, so the account's
+// presence enrollment is re-established rather than left stuck offline. The
+// `connected()` flag tracks the live state for the UI indicator.
 class StreamReader {
  public:
   StreamReader(NodeClient& client, ScreenInteractive& screen)
@@ -130,23 +136,24 @@ class StreamReader {
 
   void start(const tier::core::PeerId& account) {
     stop();
-    fd_ = client_.open_stream(account);
-    connected_ = fd_ >= 0;
-    if (fd_ < 0) {
-      return;
-    }
+    account_ = account;
     stop_ = false;
     thread_ = std::thread([this] { run(); });
   }
 
   void stop() {
     stop_ = true;
-    if (fd_ >= 0) {
-      ::shutdown(fd_, SHUT_RDWR);  // unblock a pending recv
+    {
+      std::lock_guard<std::mutex> lk(fd_mu_);
+      if (fd_ >= 0) {
+        ::shutdown(fd_, SHUT_RDWR);  // unblock a pending recv
+      }
     }
+    cv_.notify_all();  // unblock a pending backoff wait
     if (thread_.joinable()) {
       thread_.join();
     }
+    std::lock_guard<std::mutex> lk(fd_mu_);
     if (fd_ >= 0) {
       ::close(fd_);
       fd_ = -1;
@@ -163,28 +170,76 @@ class StreamReader {
   }
 
  private:
+  // Sleep for `d`, returning early (false) if stop() was called meanwhile.
+  bool wait_backoff(std::chrono::milliseconds d) {
+    std::unique_lock<std::mutex> lk(cv_mu_);
+    cv_.wait_for(lk, d, [this] { return stop_.load(); });
+    return !stop_;
+  }
+
   void run() {
-    StreamParser parser;
+    using namespace std::chrono_literals;
+    constexpr auto kMinBackoff = 250ms;
+    constexpr auto kMaxBackoff = 2000ms;
+    auto backoff = kMinBackoff;
     std::array<std::uint8_t, 4096> buf{};
     while (!stop_) {
-      const ssize_t n = ::recv(fd_, buf.data(), buf.size(), 0);
-      if (n <= 0) {
-        break;  // closed or error
+      // (Re)subscribe. A failure here means tierd is unreachable (down or
+      // restarting): announce the drop and retry on the backoff.
+      const int fd = client_.open_stream(account_);
+      if (fd < 0) {
+        connected_ = false;
+        screen_.PostEvent(Event::Custom);
+        if (!wait_backoff(backoff)) break;
+        backoff = std::min(backoff * 2, kMaxBackoff);
+        continue;
       }
-      parser.feed(buf.data(), static_cast<std::size_t>(n));
-      bool any = false;
-      for (;;) {
-        auto ev = parser.next();
-        if (!ev.has_value()) {
+      {
+        std::lock_guard<std::mutex> lk(fd_mu_);
+        if (stop_) {
+          ::close(fd);
           break;
         }
-        std::lock_guard<std::mutex> lock(mu_);
-        events_.push_back(*ev);
-        any = true;
+        fd_ = fd;
       }
-      if (any) {
-        screen_.PostEvent(Event::Custom);
+      connected_ = true;
+      screen_.PostEvent(Event::Custom);
+      backoff = kMinBackoff;  // reset after a good connection
+
+      StreamParser parser;
+      while (!stop_) {
+        const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
+        if (n <= 0) {
+          break;  // closed or error -> reconnect
+        }
+        parser.feed(buf.data(), static_cast<std::size_t>(n));
+        bool any = false;
+        for (;;) {
+          auto ev = parser.next();
+          if (!ev.has_value()) {
+            break;
+          }
+          std::lock_guard<std::mutex> lock(mu_);
+          events_.push_back(*ev);
+          any = true;
+        }
+        if (any) {
+          screen_.PostEvent(Event::Custom);
+        }
       }
+
+      // Stream dropped: close it, flag disconnected, and loop to re-subscribe.
+      {
+        std::lock_guard<std::mutex> lk(fd_mu_);
+        if (fd_ >= 0) {
+          ::close(fd_);
+          fd_ = -1;
+        }
+      }
+      connected_ = false;
+      screen_.PostEvent(Event::Custom);
+      if (stop_ || !wait_backoff(backoff)) break;
+      backoff = std::min(backoff * 2, kMaxBackoff);
     }
     connected_ = false;
     screen_.PostEvent(Event::Custom);
@@ -195,7 +250,11 @@ class StreamReader {
   std::thread thread_;
   std::atomic<bool> stop_{true};
   std::atomic<bool> connected_{false};
+  tier::core::PeerId account_{};
+  std::mutex fd_mu_;  // guards fd_ against a concurrent stop()
   int fd_ = -1;
+  std::condition_variable cv_;  // interrupts a backoff wait on stop()
+  std::mutex cv_mu_;
   std::mutex mu_;
   std::deque<tier::core::AdminStreamEvent> events_;
 };
