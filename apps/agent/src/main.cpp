@@ -55,6 +55,21 @@ std::atomic<bool> g_stop{false};
 
 void on_signal(int) { g_stop.store(true); }
 
+// Install SIGINT/SIGTERM via sigaction with no SA_RESTART, so that a signal
+// interrupts the blocking syscalls the roles park in (recv in the collector
+// subscribe loop, accept in the query server, read on stdin): they return EINTR
+// and the loop re-checks g_stop. std::signal() would restart them (glibc gives
+// BSD semantics with SA_RESTART set), leaving the process stuck until traffic
+// arrives, so Ctrl+C would not stop it.
+void install_signal_handlers() {
+  struct sigaction sa{};
+  sa.sa_handler = on_signal;
+  ::sigemptyset(&sa.sa_mask);
+  sa.sa_flags = 0;  // no SA_RESTART: let blocking syscalls fail with EINTR
+  ::sigaction(SIGINT, &sa, nullptr);
+  ::sigaction(SIGTERM, &sa, nullptr);
+}
+
 std::string to_hex(const tier::core::PeerId& id) {
   static const char* const kHex = "0123456789abcdef";
   std::string out;
@@ -434,8 +449,7 @@ int main(int argc, char** argv) {
 
   tier::agent::AdminClient client(conf.admin_socket);
 
-  std::signal(SIGINT, on_signal);
-  std::signal(SIGTERM, on_signal);
+  install_signal_handlers();
 
   // Enroll this actor's identity. add_user is idempotent - tierd persists the
   // user seed and re-hosts it on restart - so retry on a backoff rather than
