@@ -69,6 +69,60 @@ bool to_u32(const std::string& v, std::uint32_t& out, std::string& err) {
   return true;
 }
 
+// Split a value into its leading decimal digits and a trailing unit suffix.
+bool split_number_unit(const std::string& v, std::uint64_t& num,
+                       std::string& unit, std::string& err) {
+  std::size_t i = 0;
+  std::uint64_t acc = 0;
+  while (i < v.size() && v[i] >= '0' && v[i] <= '9') {
+    acc = acc * 10 + static_cast<std::uint64_t>(v[i] - '0');
+    ++i;
+  }
+  if (i == 0) {
+    err = "expected a number: " + v;
+    return false;
+  }
+  num = acc;
+  unit = trim(v.substr(i));
+  return true;
+}
+
+// Parse a duration like "7d", "24h", "30m", "90s"; a bare number is seconds.
+bool to_duration(const std::string& v, std::uint64_t& out, std::string& err) {
+  std::uint64_t num = 0;
+  std::string unit;
+  if (!split_number_unit(v, num, unit, err)) return false;
+  std::uint64_t mult = 1;
+  if (unit.empty() || unit == "s") mult = 1;
+  else if (unit == "m") mult = 60;
+  else if (unit == "h") mult = 3600;
+  else if (unit == "d") mult = 86400;
+  else {
+    err = "unknown duration unit (use s|m|h|d): " + v;
+    return false;
+  }
+  out = num * mult;
+  return true;
+}
+
+// Parse a byte size like "2GB", "512MB", "64KB"; a bare number is bytes.
+bool to_size(const std::string& v, std::uint64_t& out, std::string& err) {
+  std::uint64_t num = 0;
+  std::string unit;
+  if (!split_number_unit(v, num, unit, err)) return false;
+  std::uint64_t mult = 1;
+  if (unit.empty() || unit == "B") mult = 1;
+  else if (unit == "KB" || unit == "K") mult = 1024ULL;
+  else if (unit == "MB" || unit == "M") mult = 1024ULL * 1024;
+  else if (unit == "GB" || unit == "G") mult = 1024ULL * 1024 * 1024;
+  else {
+    err = "unknown size unit (use B|KB|MB|GB): " + v;
+    return false;
+  }
+  out = num * mult;
+  return true;
+}
+
 }  // namespace
 
 std::optional<Config> parse_config(const std::string& text, std::string& err) {
@@ -133,6 +187,18 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
     } else if (section == "collector") {
       if (key == "store") {
         cfg.store_path = val;
+      } else if (key == "retention") {
+        if (!to_duration(val, cfg.retention_secs, err)) return std::nullopt;
+      } else if (key == "max_bytes") {
+        if (!to_size(val, cfg.max_bytes, err)) return std::nullopt;
+      } else if (key == "snapshot_interval") {
+        std::uint64_t secs = 0;
+        if (!to_duration(val, secs, err)) return std::nullopt;
+        if (secs == 0 || secs > 0xFFFFFFFFULL) {
+          err = "snapshot_interval out of range";
+          return std::nullopt;
+        }
+        cfg.snapshot_interval_secs = static_cast<std::uint32_t>(secs);
       } else if (key == "query_socket") {
         cfg.query_socket = val;
       } else if (key == "persistence") {

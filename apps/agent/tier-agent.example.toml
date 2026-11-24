@@ -18,7 +18,10 @@ max_batch = 256                      # flush early once this many samples buffer
 
 # --- collector role: receive, store, expose ---
 [collector]
-store = "/var/lib/tier-agent/agent-store.log"   # durable append log (read path)
+store = "/var/lib/tier-agent/data"       # directory: gauge snapshot + event segments
+retention = "7d"                         # drop data older than this (s|m|h|d); 0 = keep all
+# max_bytes = "2GB"                       # optional event-log size cap; drops oldest first
+# snapshot_interval = "60s"               # gauge snapshot + retention sweep cadence
 persistence = "local"                      # local | keeper  (keeper = opt-in HA)
 # query_socket = "/run/tier-agent/agent-query.sock"  # local read socket (below)
 # accept_from = ["tier1<agentA>", "tier1<agentB>"]   # allowlist; omit = accept any

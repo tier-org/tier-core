@@ -35,7 +35,6 @@
 #include <ctime>
 #include <fstream>
 #include <iostream>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -251,8 +250,7 @@ void make_parent_dirs(const std::string& file_path) {
   }
 }
 
-void run_query_server(const std::string& path, tier::agent::Store& store,
-                      std::mutex& mu) {
+void run_query_server(const std::string& path, tier::agent::Store& store) {
   make_parent_dirs(path);
   ::unlink(path.c_str());
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -302,11 +300,7 @@ void run_query_server(const std::string& path, tier::agent::Store& store,
            (needle.back() == '\r' || needle.back() == ' ')) {
       needle.pop_back();
     }
-    std::string out;
-    {
-      std::lock_guard<std::mutex> lk(mu);
-      out = store.query(needle);
-    }
+    const std::string out = store.query(needle);  // Store locks internally
     ::send(cfd, out.data(), out.size(), MSG_NOSIGNAL);
     ::close(cfd);
   }
@@ -317,13 +311,23 @@ void run_query_server(const std::string& path, tier::agent::Store& store,
 void run_collector(tier::agent::AdminClient& client,
                    const tier::core::PeerId& self,
                    const tier::agent::Config& cfg) {
-  tier::agent::Store store(cfg.store_path);
-  std::mutex store_mu;
+  tier::agent::StoreOptions sopts;
+  sopts.retention_secs = cfg.retention_secs;
+  sopts.max_bytes = cfg.max_bytes;
+  sopts.snapshot_interval_secs = cfg.snapshot_interval_secs;
+  tier::agent::Store store(cfg.store_path, sopts);
+
+  // Fan out each de-duplicated, authorized message to every configured sink.
+  // Today that is just the local file store (which also backs the query
+  // socket); remote sinks (Prometheus remote-write, InfluxDB, ...) will be
+  // appended here behind the same Sink interface, each with its own buffering so
+  // a slow backend cannot stall receive.
+  std::vector<tier::agent::Sink*> sinks{&store};
 
   std::thread qthread;
   if (!cfg.query_socket.empty()) {
     qthread = std::thread(run_query_server, std::cref(cfg.query_socket),
-                          std::ref(store), std::ref(store_mu));
+                          std::ref(store));
   }
 
   // Subscribe to our own user's stream and keep it alive across tierd restarts:
@@ -360,11 +364,12 @@ void run_collector(tier::agent::AdminClient& client,
           }
           if (!allowed) continue;  // not on the allowlist
         }
-        std::lock_guard<std::mutex> lk(store_mu);
-        if (!store.first_seen(m.msg_id)) continue;  // duplicate
+        if (!store.first_seen(m.msg_id)) continue;  // duplicate (Store locks)
         const auto env = tier::agent::decode(m.payload.data(), m.payload.size());
         if (!env) continue;  // not a telemetry envelope
-        store.apply(to_hex(m.sender_user), *env);
+        const tier::agent::Envelope& envelope = *env;
+        const std::string sender_hex = to_hex(m.sender_user);
+        for (tier::agent::Sink* sink : sinks) sink->write(sender_hex, envelope);
       }
     }
     ::close(fd);
@@ -373,6 +378,7 @@ void run_collector(tier::agent::AdminClient& client,
     interruptible_sleep(backoff);  // tierd restart/blip: back off, re-subscribe
   }
   g_stop.store(true);
+  for (tier::agent::Sink* sink : sinks) sink->flush();  // persist on shutdown
   if (qthread.joinable()) qthread.join();
 }
 
