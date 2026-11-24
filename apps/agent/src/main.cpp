@@ -21,6 +21,7 @@
 // the keeper HA path are the next increments.
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <unistd.h>
 
@@ -232,8 +233,27 @@ void run_agent(tier::agent::AdminClient& client, const tier::core::PeerId& self,
 // Serve the store over a UNIX socket: each connection sends an optional filter
 // line and receives the (filtered) snapshot, one-shot. Access to `store` is
 // serialized with `mu` because the collector's receive loop writes concurrently.
+// Create every missing component of a directory path (mkdir -p), 0755. Best
+// effort: a failure surfaces later as the bind/open error. Used so a collector
+// run by hand still works when the query socket's parent (e.g. /run/tier-agent,
+// a tmpfs dir that systemd's RuntimeDirectory= would make under the unit) does
+// not exist yet.
+void make_parent_dirs(const std::string& file_path) {
+  const auto slash = file_path.find_last_of('/');
+  if (slash == std::string::npos || slash == 0) return;  // no dir, or root
+  const std::string dir = file_path.substr(0, slash);
+  std::string acc;
+  for (std::size_t i = 0; i < dir.size(); ++i) {
+    acc.push_back(dir[i]);
+    if (dir[i] == '/' || i + 1 == dir.size()) {
+      if (acc != "/") ::mkdir(acc.c_str(), 0755);  // ignore EEXIST and errors
+    }
+  }
+}
+
 void run_query_server(const std::string& path, tier::agent::Store& store,
                       std::mutex& mu) {
+  make_parent_dirs(path);
   ::unlink(path.c_str());
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
