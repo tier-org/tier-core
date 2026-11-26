@@ -19,14 +19,17 @@
 // design); guaranteed delivery is a future paid/keeper layer. The collector's
 // durable store plus the query socket are the read path. spool-on-offline and
 // the keeper HA path are the next increments.
+#include <grp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -37,17 +40,20 @@
 #include <iostream>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
 #include "admin_client.hpp"
 #include "batcher.hpp"
+#include "bootstrap.hpp"
 #include "config.hpp"
 #include "envelope.hpp"
+#include "files.hpp"
+#include "socket_io.hpp"
 #include "store.hpp"
 #include "tier/app/registry.hpp"
 #include "tier/core/address.hpp"
-#include "tier/crypto/identity.hpp"
 
 namespace {
 
@@ -90,32 +96,6 @@ void interruptible_sleep(std::uint32_t secs) {
   for (std::uint32_t i = 0; i < secs * 5 && !g_stop.load(); ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
-}
-
-// Load the 32-byte identity seed from `path`, creating a fresh random one (via
-// the system CSPRNG) on first run. Returns false on an I/O error.
-bool load_or_create_seed(const std::string& path,
-                         std::array<std::uint8_t, 32>& out) {
-  std::ifstream in(path, std::ios::binary);
-  if (in) {
-    std::vector<char> raw((std::istreambuf_iterator<char>(in)),
-                          std::istreambuf_iterator<char>());
-    if (raw.size() == out.size()) {
-      std::memcpy(out.data(), raw.data(), out.size());
-      return true;
-    }
-  }
-  const auto id = tier::crypto::NodeIdentity::generate();
-  const auto& seed = id.seed();
-  std::memcpy(out.data(), seed.data(), out.size());
-  std::ofstream of(path, std::ios::binary | std::ios::trunc);
-  if (!of) {
-    std::fprintf(stderr, "error: cannot write seed file: %s\n", path.c_str());
-    return false;
-  }
-  of.write(reinterpret_cast<const char*>(out.data()),
-           static_cast<std::streamsize>(out.size()));
-  return static_cast<bool>(of);
 }
 
 // --- agent side -----------------------------------------------------------
@@ -229,9 +209,6 @@ void run_agent(tier::agent::AdminClient& client, const tier::core::PeerId& self,
 
 // --- collector side -------------------------------------------------------
 
-// Serve the store over a UNIX socket: each connection sends an optional filter
-// line and receives the (filtered) snapshot, one-shot. Access to `store` is
-// serialized with `mu` because the collector's receive loop writes concurrently.
 // Create every missing component of a directory path (mkdir -p), 0755. Best
 // effort: a failure surfaces later as the bind/open error. Used so a collector
 // run by hand still works when the query socket's parent (e.g. /run/tier-agent,
@@ -250,7 +227,42 @@ void make_parent_dirs(const std::string& file_path) {
   }
 }
 
-void run_query_server(const std::string& path, tier::agent::Store& store) {
+// One request line followed by one snapshot, then EOF. The reserved command
+// selects JSON. Other requests are the human-readable query's substring filter.
+std::string query_response(int fd, const tier::agent::Store& store) {
+  std::string request;
+  std::array<char, 256> buffer{};
+  while (request.size() < buffer.size()) {
+    const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - request.size(), 0);
+    if (n < 0 && errno == EINTR && !g_stop.load()) continue;
+    if (n <= 0) break;
+    request.append(buffer.data(), static_cast<std::size_t>(n));
+    const auto newline = request.find('\n');
+    if (newline != std::string::npos) {
+      request.resize(newline);
+      break;
+    }
+  }
+  while (!request.empty() && (request.back() == '\r' || request.back() == ' ')) {
+    request.pop_back();
+  }
+
+  constexpr std::string_view command = "TIER-QUERY/1";
+  if (request == command) return store.snapshot_json();
+  constexpr std::string_view prefix = "TIER-QUERY/1 ";
+  if (request.starts_with(prefix)) {
+    const auto sender = std::string_view(request).substr(prefix.size());
+    if (sender.size() == tier::core::PeerId{}.size() * 2 &&
+        sender.find_first_not_of("0123456789abcdef") == std::string_view::npos) {
+      return store.snapshot_json(sender);
+    }
+    return "{\"version\":1,\"error\":\"invalid sender ID\"}\n";
+  }
+  return store.query(request);
+}
+
+void run_query_server(const std::string& path, tier::agent::Store& store,
+                      std::optional<gid_t> socket_group) {
   make_parent_dirs(path);
   ::unlink(path.c_str());
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
@@ -271,9 +283,18 @@ void run_query_server(const std::string& path, tier::agent::Store& store) {
     ::close(fd);
     return;
   }
+  if (socket_group &&
+      (::chown(path.c_str(), static_cast<uid_t>(-1), *socket_group) != 0 ||
+       ::chmod(path.c_str(), 0660) != 0)) {
+    std::perror("query: set socket owner or mode");
+    ::close(fd);
+    ::unlink(path.c_str());
+    return;
+  }
   if (::listen(fd, 8) != 0) {
     std::perror("query: listen");
     ::close(fd);
+    ::unlink(path.c_str());
     return;
   }
   struct pollfd pfd {};
@@ -288,20 +309,10 @@ void run_query_server(const std::string& path, tier::agent::Store& store) {
     if (r == 0) continue;
     const int cfd = ::accept(fd, nullptr, nullptr);
     if (cfd < 0) continue;
-    std::string needle;
-    char b[256];
-    const ssize_t n = ::recv(cfd, b, sizeof b, 0);
-    if (n > 0) {
-      needle.assign(b, static_cast<std::size_t>(n));
-      const auto nl = needle.find('\n');
-      if (nl != std::string::npos) needle.resize(nl);
+    constexpr timeval timeout{2, 0};
+    if (tier::agent::set_socket_timeout(cfd, timeout)) {
+      tier::agent::send_all(cfd, query_response(cfd, store));
     }
-    while (!needle.empty() &&
-           (needle.back() == '\r' || needle.back() == ' ')) {
-      needle.pop_back();
-    }
-    const std::string out = store.query(needle);  // Store locks internally
-    ::send(cfd, out.data(), out.size(), MSG_NOSIGNAL);
     ::close(cfd);
   }
   ::close(fd);
@@ -310,7 +321,8 @@ void run_query_server(const std::string& path, tier::agent::Store& store) {
 
 void run_collector(tier::agent::AdminClient& client,
                    const tier::core::PeerId& self,
-                   const tier::agent::Config& cfg) {
+                   const tier::agent::Config& cfg,
+                   std::optional<gid_t> socket_group) {
   tier::agent::StoreOptions sopts;
   sopts.retention_secs = cfg.retention_secs;
   sopts.max_bytes = cfg.max_bytes;
@@ -327,7 +339,7 @@ void run_collector(tier::agent::AdminClient& client,
   std::thread qthread;
   if (!cfg.query_socket.empty()) {
     qthread = std::thread(run_query_server, std::cref(cfg.query_socket),
-                          std::ref(store));
+                          std::ref(store), socket_group);
   }
 
   // Subscribe to our own user's stream and keep it alive across tierd restarts:
@@ -408,7 +420,11 @@ int run_query_client(const std::string& path, const std::string& needle) {
   }
   std::string req = needle;
   req.push_back('\n');
-  ::send(fd, req.data(), req.size(), MSG_NOSIGNAL);
+  if (!tier::agent::send_all(fd, req)) {
+    std::perror("query: send");
+    ::close(fd);
+    return 1;
+  }
   ::shutdown(fd, SHUT_WR);
   char b[4096];
   ssize_t n;
@@ -423,12 +439,17 @@ void usage() {
   std::fprintf(stderr,
                "usage:\n"
                "  tier-agent --config <file.toml>     run the daemon\n"
-               "  tier-agent query <socket> [needle]  read a collector store\n");
+               "  tier-agent query <socket> [needle]  read a collector store\n"
+               "  tier-agent bootstrap collector [--view]\n"
+               "  tier-agent bootstrap client --collector=<address>\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (argc >= 2 && std::strcmp(argv[1], "bootstrap") == 0) {
+    return tier::agent::run_bootstrap(argc - 2, argv + 2);
+  }
   // Read client subcommand: tier-agent query <socket> [needle]
   if (argc >= 2 && std::strcmp(argv[1], "query") == 0) {
     if (argc < 3) {
@@ -470,8 +491,19 @@ int main(int argc, char** argv) {
 
   const tier::agent::Config& conf = *cfg;
 
-  std::array<std::uint8_t, 32> seed{};
-  if (!load_or_create_seed(conf.seed_file, seed)) return 1;
+  std::optional<gid_t> socket_group;
+  if (conf.role != tier::agent::Role::agent && !conf.query_socket_group.empty()) {
+    const auto* group = ::getgrnam(conf.query_socket_group.c_str());
+    if (group == nullptr) {
+      std::fprintf(stderr, "error: cannot resolve query_socket_group: %s\n",
+                   conf.query_socket_group.c_str());
+      return 1;
+    }
+    socket_group = group->gr_gid;
+  }
+
+  tier::agent::Seed seed{};
+  if (!tier::agent::load_or_create_seed(conf.seed_file, seed)) return 1;
 
   tier::agent::AdminClient client(conf.admin_socket);
 
@@ -500,12 +532,12 @@ int main(int argc, char** argv) {
                tier::core::address_from_id(self).c_str());
 
   if (conf.role == tier::agent::Role::collector) {
-    run_collector(client, self, conf);
+    run_collector(client, self, conf, socket_group);
   } else if (conf.role == tier::agent::Role::agent) {
     run_agent(client, self, conf);
   } else {  // both
     std::thread collector(run_collector, std::ref(client), std::cref(self),
-                          std::cref(conf));
+                          std::cref(conf), socket_group);
     run_agent(client, self, conf);
     g_stop.store(true);
     collector.join();

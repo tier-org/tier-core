@@ -1,6 +1,5 @@
-# Templated systemd unit for tier-agent. REFERENCE - shipped under
-# /usr/share/doc/tierd/agent; copy to /etc/systemd/system to use. The instance
-# name selects the config:
+# Templated systemd unit for tier-agent. Bootstrap installs the instance
+# config and enables the service. The instance name selects the config:
 #   systemctl enable --now tier-agent@collector   -> /etc/tier/collector.toml
 #   systemctl enable --now tier-agent@agent        -> /etc/tier/agent.toml
 #
@@ -18,7 +17,7 @@ After=network-online.target tierd.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+Type=exec
 ExecStart=/usr/bin/tier-agent --config /etc/tier/%i.toml
 Restart=on-failure
 RestartSec=5

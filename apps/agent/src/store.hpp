@@ -6,7 +6,9 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -80,6 +82,9 @@ class Store : public Sink {
   // read interface.
   [[nodiscard]] std::string query(const std::string& needle) const;
 
+  // Versioned status snapshot, optionally scoped to a single sender.
+  [[nodiscard]] std::string snapshot_json(std::string_view sender = {}) const;
+
   [[nodiscard]] std::size_t gauge_count() const;
   [[nodiscard]] std::size_t event_count() const;
 
@@ -94,17 +99,19 @@ class Store : public Sink {
   struct Gauge {
     std::string value;
     std::uint64_t ts_unix = 0;
+    std::optional<std::uint64_t> received_unix;
   };
   struct Event {
     std::string sender;
     std::string key;
     std::string value;
     std::uint64_t ts_unix = 0;
+    std::optional<std::uint64_t> received_unix;
   };
 
   void load();  // replay snapshot + segments into memory (ctor, unlocked)
   void record(const std::string& sender_hex, const Sample& s,
-              std::uint64_t ts_unix, bool persist);
+              std::uint64_t ts_unix, std::optional<std::uint64_t> received_unix);
   void maybe_maintain_locked();
   void write_snapshot_locked();
   void sweep_retention_locked();

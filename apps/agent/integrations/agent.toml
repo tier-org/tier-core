@@ -2,11 +2,11 @@
 # collector over tier. Pairs with tier-agent@agent.service (serf-like node).
 # Copy to /etc/tier/agent.toml and set `collector` before enabling the unit.
 role = "agent"
-admin_socket = "/run/tierd/tierd.sock"          # tierd's local admin socket
+admin_socket = "/run/tierd/tierd.sock"
 seed_file = "/var/lib/tier-agent/agent-agent.seed"
 
 [agent]
-# The collector's tier address (from its "tier-agent: ... address:" startup line).
-collector = "tier1qh9x9j807gxfdfjtxurzqqyqdlage5rtrpte3kujkd0alazaj38snd9pcx"
+# Bootstrap substitutes the collector's Tier address. Set it when copying manually.
+collector = "@COLLECTOR_ADDRESS@"
 interval = 15
 exec = "/usr/libexec/tier/host-metrics.sh"

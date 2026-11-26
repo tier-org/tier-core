@@ -201,6 +201,8 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
         cfg.snapshot_interval_secs = static_cast<std::uint32_t>(secs);
       } else if (key == "query_socket") {
         cfg.query_socket = val;
+      } else if (key == "query_socket_group") {
+        cfg.query_socket_group = val;
       } else if (key == "persistence") {
         cfg.keeper_persistence = (val == "keeper");
       } else if (key == "accept_from") {
@@ -225,6 +227,10 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
 
   if (!role_set) {
     err = "missing required 'role'";
+    return std::nullopt;
+  }
+  if (!cfg.query_socket_group.empty() && cfg.query_socket.empty()) {
+    err = "[collector] query_socket_group requires query_socket";
     return std::nullopt;
   }
   if ((cfg.role == Role::agent || cfg.role == Role::both) && !cfg.has_collector) {

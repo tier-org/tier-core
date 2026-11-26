@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tier fleet</title>
+  <style>
+    :root { color-scheme: light dark; font: 16px system-ui, sans-serif; }
+    body { max-width: 78rem; margin: 2.5rem auto; padding: 0 1.25rem; }
+    h1 { margin: .3rem 0 1rem; font-size: clamp(1.75rem, 4vw, 2.4rem); }
+    h2 { margin-top: 2rem; font-size: 1.25rem; }
+    a { color: LinkText; }
+    .table { overflow-x: auto; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { padding: .7rem .8rem; border-bottom: 1px solid GrayText;
+             text-align: left; vertical-align: top; }
+    th { white-space: nowrap; }
+    td, code { overflow-wrap: anywhere; }
+    .value { white-space: pre-wrap; min-width: 9rem; }
+    .tag { display: inline-block; border: 1px solid GrayText; border-radius: .3rem;
+           padding: .05rem .3rem; margin: .2rem .2rem 0 0; font-size: .8rem; }
+    .status { font-weight: 650; white-space: nowrap; }
+    .fresh { color: light-dark(#176338, #8cdda6); }
+    .stale { color: light-dark(#9d360c, #ffb47e); }
+    .quiet { color: GrayText; }
+    #message:empty { display: none; }
+  </style>
+  <script src="/view.js" defer></script>
+</head>
+<body>
+  <main>
+    <p id="message" role="status"></p>
+    <div id="view"><h1>Tier fleet</h1></div>
+    <noscript>Enable JavaScript to view the collector snapshot.</noscript>
+  </main>
+</body>
+</html>

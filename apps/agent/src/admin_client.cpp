@@ -1,14 +1,13 @@
 #include "admin_client.hpp"
 
 #include <sys/socket.h>
-#include <sys/un.h>
 #include <unistd.h>
 
 #include <array>
-#include <cstring>
 #include <random>
 #include <span>
 
+#include "socket_io.hpp"
 #include "tier/app/frame.hpp"
 #include "tier/app/registry.hpp"
 #include "tier/msg/sealed.hpp"
@@ -16,40 +15,18 @@
 namespace tier::agent {
 namespace {
 
-int connect_unix(const std::string& path) {
-  const int fd = ::socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) return -1;
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  if (path.size() + 1 > sizeof(addr.sun_path)) {
-    ::close(fd);
-    return -1;
-  }
-  std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
-  if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-    ::close(fd);
-    return -1;
-  }
-  return fd;
-}
-
-bool send_all(int fd, const std::uint8_t* data, std::size_t len) {
-  std::size_t off = 0;
-  while (off < len) {
-    const ssize_t n = ::send(fd, data + off, len - off, MSG_NOSIGNAL);
-    if (n <= 0) return false;
-    off += static_cast<std::size_t>(n);
-  }
-  return true;
+std::string_view byte_view(const std::vector<std::uint8_t>& data) {
+  return {reinterpret_cast<const char*>(data.data()), data.size()};
 }
 
 }  // namespace
 
 std::optional<std::vector<std::uint8_t>> AdminClient::query(
-    const std::vector<std::uint8_t>& req) {
-  const int fd = connect_unix(path_);
+    const std::vector<std::uint8_t>& req, bool bounded) {
+  constexpr timeval timeout{1, 0};
+  const int fd = connect_unix(path_, bounded ? &timeout : nullptr);
   if (fd < 0) return std::nullopt;
-  if (!send_all(fd, req.data(), req.size())) {
+  if (!send_all(fd, byte_view(req))) {
     ::close(fd);
     return std::nullopt;
   }
@@ -67,6 +44,13 @@ std::optional<std::vector<std::uint8_t>> AdminClient::query(
   }
   ::close(fd);
   return out;
+}
+
+std::optional<std::vector<tier::core::PeerId>> AdminClient::local_users() {
+  const auto reply = query(tier::core::encode_admin_request(tier::core::AdminOp::user_list),
+                           /*bounded=*/true);
+  if (!reply) return std::nullopt;
+  return tier::core::decode_admin_user_list(*reply);
 }
 
 std::optional<tier::core::PeerId> AdminClient::add_user(
@@ -108,7 +92,7 @@ int AdminClient::open_stream(const tier::core::PeerId& user) {
   const int fd = connect_unix(path_);
   if (fd < 0) return -1;
   const auto req = tier::core::encode_admin_subscribe(user);
-  if (!send_all(fd, req.data(), req.size())) {
+  if (!send_all(fd, byte_view(req))) {
     ::close(fd);
     return -1;
   }

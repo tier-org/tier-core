@@ -18,23 +18,37 @@ add_library(tier::agent_core ALIAS tier_agent_core)
 find_package(Threads REQUIRED)
 add_executable(tier-agent
   src/main.cpp
-  src/admin_client.cpp)
+  src/admin_client.cpp
+  src/bootstrap.cpp
+  src/files.cpp)
 target_link_libraries(tier-agent
   PRIVATE tier::agent_core tier::core tier::app tier::msg tier::crypto
           tier::options Threads::Threads)
 
-# Packaging. The agent ships in the same .deb as tierd/tierctl/tier-messenger:
-# the binary goes to bindir and the host-metrics exec source to libexecdir, so
-# both are on standard paths. The role configs and the templated systemd unit go
-# to the package doc dir as reference material (NOT /etc conffiles, NOT an active
-# unit): an operator copies the config they need to /etc/tier/<instance>.toml and
-# the unit to /etc/systemd/system, then `systemctl enable --now tier-agent@...`.
-# Nothing here is auto-enabled - the agent is strictly opt-in per host.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+  view/index.html view/view.js)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/view/index.html" TIER_VIEW_HTML)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/view/view.js" TIER_VIEW_JS)
+configure_file(view/assets.hpp.in view_assets.hpp @ONLY)
+add_executable(tier-agent-view src/view_main.cpp)
+target_include_directories(tier-agent-view PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+target_link_libraries(tier-agent-view PRIVATE tier::options)
+
+# The role templates are used by bootstrap and support manual configuration.
+# Package installation makes the units available for explicit activation.
 include(GNUInstallDirs)
-install(TARGETS tier-agent RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(TARGETS tier-agent tier-agent-view RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 install(PROGRAMS integrations/host-metrics.sh
         DESTINATION ${CMAKE_INSTALL_LIBEXECDIR}/tier)
+install(FILES integrations/tier-agent@.service
+              integrations/tier-agent-view.service
+        DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/system")
+install(FILES integrations/agent.toml
+              integrations/collector.toml
+        DESTINATION "${CMAKE_INSTALL_DATADIR}/tier/agent")
 install(FILES integrations/agent.toml
               integrations/collector.toml
               integrations/tier-agent@.service
+              integrations/tier-agent-view.service
+              collector-view.md
         DESTINATION share/doc/tierd/agent)

@@ -105,6 +105,18 @@ int main() {
     check(bare && bare->retention_secs == 3600, "bare duration is seconds");
   }
 
+  // --- config: query socket access group ---
+  {
+    std::string err;
+    const auto config = parse_config(
+        "role = collector\n[collector]\nquery_socket = \"/run/tier-agent/agent-query.sock\"\n"
+        "query_socket_group = \"tier-monitor\"\n", err);
+    check(config && config->query_socket_group == "tier-monitor", "query socket group parses");
+    check(!parse_config("role = collector\n[collector]\nquery_socket_group = \"tier-monitor\"\n",
+                        err),
+          "query socket group requires a query socket");
+  }
+
   // --- config: error cases ---
   {
     std::string err;
@@ -308,7 +320,28 @@ int main() {
     check(r.find("S/mem 512") != std::string::npos, "reloaded gauge value");
     check(r.find("S/x hello world") != std::string::npos,
           "reloaded event value with spaces");
+    check(reloaded.snapshot_json().find("\"received_unix\":null") != std::string::npos,
+          "replayed samples have no collector receipt timestamp");
     fs::remove_all(dir);
+  }
+
+  // --- store: structured snapshot with sender filtering and display escaping ---
+  {
+    Store s("");
+    s.set_clock([] { return 123ULL; });
+    Envelope e;
+    e.ts_unix = 55;
+    e.samples = {{Kind::gauge, "state", "on\"\n"},
+                 {Kind::event, "host.boot", "готово\xff"}};
+    s.apply("A", e);
+    s.apply("B", e);
+    const auto snapshot = s.snapshot_json("A");
+    check(snapshot ==
+              "{\"version\":1,\"nodes\":[{\"sender\":\"A\",\"received_unix\":123,"
+              "\"gauges\":[{\"key\":\"state\",\"value\":\"on\\\"\\u000a\",\"ts_unix\":55}]}],"
+              "\"events\":[{\"sender\":\"A\",\"key\":\"host.boot\","
+              "\"value\":\"готово\\ufffd\",\"ts_unix\":55}]}\n",
+          "snapshot scopes to one sender and preserves valid UTF-8");
   }
 
   // --- store: gauge updates do not grow the event log (snapshot, not append) ---
