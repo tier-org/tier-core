@@ -212,6 +212,9 @@ keeper-backed layer. Built with the tree (`apps/agent`), not installed by defaul
 yet. See [docs/agent.md](docs/agent.md); integrations and systemd units are under
 `apps/agent/integrations/`.
 
+The [collector storage connector design](apps/agent/storage-connectors.md)
+covers backend selection, PostgreSQL, and how to contribute another connector.
+
 ### Release (static) binary
 
     cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DTIER_SANITIZE=OFF \

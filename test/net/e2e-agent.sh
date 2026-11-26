@@ -100,7 +100,7 @@ role = "collector"
 admin_socket = "/run/tierd/tierd.sock"
 seed_file = "/var/lib/tier/agent-collector.seed"
 [collector]
-store = "/var/lib/tier/agent-store.log"
+store = "/var/lib/tier/agent-data"
 query_socket = "/run/tierd/agent-query.sock"
 EOF
 compose exec -T -d clientb sh -c \

@@ -33,7 +33,12 @@ struct Config {
   std::string exec;
 
   // --- collector role ---
-  std::string store_path = "/var/lib/tier/agent-store.log";
+  // Local store is a directory: a gauge snapshot plus time-segmented event logs
+  // (see store.hpp). Retention bounds it - by age and/or total event-log size.
+  std::string store_path = "/var/lib/tier-agent/data";
+  std::uint64_t retention_secs = 7ULL * 24 * 3600;  // drop data older; 0=keep all
+  std::uint64_t max_bytes = 0;                    // event-log size cap; 0 = none
+  std::uint32_t snapshot_interval_secs = 60;      // snapshot + sweep cadence
   std::vector<tier::core::PeerId> accept_from;  // allowlist; empty = accept any
   bool keeper_persistence = false;              // opt-in HA (not wired yet)
   // Optional local read interface: a UNIX socket that serves a snapshot of the

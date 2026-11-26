@@ -1,6 +1,8 @@
 #include <array>
 #include <cstdint>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "batcher.hpp"
@@ -28,6 +30,7 @@ using tier::agent::parse_sample_line;
 using tier::agent::Role;
 using tier::agent::Sample;
 using tier::agent::Store;
+using tier::agent::StoreOptions;
 
 tier::core::PeerId peer(std::uint8_t fill) {
   tier::core::PeerId p{};
@@ -74,6 +77,32 @@ int main() {
                 c->accept_from[1] == peer(0x22),
             "accept_from allowlist parsed");
     }
+  }
+
+  // --- config: retention / size / snapshot units ---
+  {
+    std::string err;
+    const auto c = parse_config(
+        "role = collector\n[collector]\nstore = \"/data\"\n"
+        "retention = \"7d\"\nmax_bytes = \"2GB\"\nsnapshot_interval = \"30s\"\n",
+        err);
+    check(c.has_value(), "retention config parses");
+    if (c) {
+      check(c->retention_secs == 7ULL * 24 * 3600, "7d -> seconds");
+      check(c->max_bytes == 2ULL * 1024 * 1024 * 1024, "2GB -> bytes");
+      check(c->snapshot_interval_secs == 30, "30s snapshot interval");
+    }
+    std::uint64_t throwaway = 0;
+    (void)throwaway;
+    check(!parse_config("role = collector\n[collector]\nretention = \"5x\"\n",
+                        err),
+          "bad duration unit rejected");
+    check(!parse_config("role = collector\n[collector]\nmax_bytes = \"1TB\"\n",
+                        err),
+          "bad size unit rejected");
+    const auto bare = parse_config(
+        "role = collector\n[collector]\nretention = \"3600\"\n", err);
+    check(bare && bare->retention_secs == 3600, "bare duration is seconds");
   }
 
   // --- config: error cases ---
@@ -249,26 +278,138 @@ int main() {
           "render shows the event");
   }
 
-  // --- store: persistence round-trip ---
+  // --- store: persistence round-trip (snapshot + segment, directory layout) ---
   {
-    const std::string path = "test_agent_store_tmp.log";
-    std::remove(path.c_str());
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_tmp.d";
+    fs::remove_all(dir);
     {
-      Store s(path);
+      Store s(dir);
       Envelope e;
       e.ts_unix = 55;
       e.samples.push_back({Kind::gauge, "mem", "512"});
       e.samples.push_back({Kind::event, "x", "hello world"});
       s.apply("S", e);
+      s.flush();  // write the gauge snapshot
     }
-    Store reloaded(path);
+    // The gauge went to a snapshot, the event to a segment - not one log.
+    check(fs::exists(fs::path(dir) / "gauges.snap"), "gauge snapshot written");
+    std::size_t segments = 0;
+    for (const auto& de : fs::directory_iterator(dir)) {
+      const auto name = de.path().filename().string();
+      if (name.rfind("events-", 0) == 0) ++segments;
+    }
+    check(segments == 1, "one event segment written");
+
+    Store reloaded(dir);
     check(reloaded.gauge_count() == 1 && reloaded.event_count() == 1,
-          "store reloads gauges and events from the log");
+          "store reloads gauges (snapshot) and events (segments)");
     const auto r = reloaded.render();
     check(r.find("S/mem 512") != std::string::npos, "reloaded gauge value");
     check(r.find("S/x hello world") != std::string::npos,
           "reloaded event value with spaces");
-    std::remove(path.c_str());
+    fs::remove_all(dir);
+  }
+
+  // --- store: gauge updates do not grow the event log (snapshot, not append) ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_gauge.d";
+    fs::remove_all(dir);
+    {
+      Store s(dir);
+      for (int i = 0; i < 100; ++i) {
+        Envelope e;
+        e.ts_unix = 1000 + static_cast<std::uint64_t>(i);
+        e.samples.push_back({Kind::gauge, "cpu", std::to_string(i)});
+        s.apply("S", e);
+      }
+      s.flush();
+    }
+    // 100 gauge updates collapse to one snapshot line and zero event segments.
+    std::uintmax_t snap_lines = 0;
+    {
+      std::ifstream in(fs::path(dir) / "gauges.snap");
+      std::string line;
+      while (std::getline(in, line)) ++snap_lines;
+    }
+    check(snap_lines == 1, "100 gauge updates -> single snapshot line");
+    bool any_segment = false;
+    for (const auto& de : fs::directory_iterator(dir)) {
+      if (de.path().filename().string().rfind("events-", 0) == 0) {
+        any_segment = true;
+      }
+    }
+    check(!any_segment, "gauge-only writes create no event segment");
+    Store reloaded(dir);
+    check(reloaded.gauge_count() == 1, "reloaded single gauge");
+    check(reloaded.render().find("S/cpu 99") != std::string::npos,
+          "gauge holds the last value after reload");
+    fs::remove_all(dir);
+  }
+
+  // --- store: time-based retention drops old event segments ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_ret.d";
+    fs::remove_all(dir);
+    std::uint64_t fake_now = 1'000'000;
+    StoreOptions opts;
+    opts.retention_secs = 3600;    // keep 1h
+    opts.segment_secs = 3600;      // 1h segments
+    opts.snapshot_interval_secs = 1;
+    Store s(dir, opts);
+    s.set_clock([&fake_now] { return fake_now; });
+
+    Envelope e1;
+    e1.ts_unix = fake_now;
+    e1.samples.push_back({Kind::event, "boot", "old"});
+    s.apply("S", e1);  // lands in the segment for the current hour
+
+    // Jump 3 hours ahead and write again: old segment is now outside retention.
+    fake_now += 3 * 3600;
+    Envelope e2;
+    e2.ts_unix = fake_now;
+    e2.samples.push_back({Kind::event, "boot", "new"});
+    s.apply("S", e2);  // maybe_maintain sweeps the stale segment
+
+    std::size_t segments = 0;
+    for (const auto& de : fs::directory_iterator(dir)) {
+      if (de.path().filename().string().rfind("events-", 0) == 0) ++segments;
+    }
+    check(segments == 1, "retention dropped the stale segment, kept the fresh");
+    fs::remove_all(dir);
+  }
+
+  // --- store: size-based retention keeps the active segment ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_size.d";
+    fs::remove_all(dir);
+    std::uint64_t fake_now = 2'000'000;
+    StoreOptions opts;
+    opts.retention_secs = 0;       // time retention off; test size only
+    opts.max_bytes = 1;            // tiny cap forces dropping all but active
+    opts.segment_secs = 3600;
+    opts.snapshot_interval_secs = 1;
+    Store s(dir, opts);
+    s.set_clock([&fake_now] { return fake_now; });
+
+    for (int h = 0; h < 3; ++h) {
+      Envelope e;
+      e.ts_unix = fake_now;
+      e.samples.push_back({Kind::event, "e", "payload-data"});
+      s.apply("S", e);
+      fake_now += 3600;  // next hour -> new segment
+    }
+    s.flush();  // final sweep under the 1-byte cap
+
+    std::size_t segments = 0;
+    for (const auto& de : fs::directory_iterator(dir)) {
+      if (de.path().filename().string().rfind("events-", 0) == 0) ++segments;
+    }
+    check(segments == 1, "size cap drops oldest, never the active segment");
+    fs::remove_all(dir);
   }
 
   if (g_failures == 0) {
