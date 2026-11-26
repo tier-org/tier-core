@@ -1,0 +1,20 @@
+# Enable with tier-agent bootstrap collector --view. Manual setup requires
+# query_socket_group = "tier-monitor" in the collector's configuration.
+[Unit]
+Description=Tier fleet dashboard
+Wants=tier-agent@collector.service
+After=tier-agent@collector.service
+
+[Service]
+Type=notify
+ExecStart=/usr/bin/tier-agent-view
+TimeoutStartSec=10s
+DynamicUser=yes
+SupplementaryGroups=tier-monitor
+ProtectHome=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

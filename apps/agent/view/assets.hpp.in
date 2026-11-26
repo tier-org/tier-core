@@ -1,0 +1,10 @@
+#pragma once
+
+#include <string_view>
+
+namespace tier::agent::view {
+
+inline constexpr std::string_view kPage = R"tier(@TIER_VIEW_HTML@)tier";
+inline constexpr std::string_view kScript = R"tier(@TIER_VIEW_JS@)tier";
+
+}  // namespace tier::agent::view

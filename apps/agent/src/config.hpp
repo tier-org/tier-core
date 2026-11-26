@@ -44,6 +44,8 @@ struct Config {
   // Optional local read interface: a UNIX socket that serves a snapshot of the
   // store (optionally filtered by a request line). Empty = no read socket.
   std::string query_socket;
+  // When set, grant this group access to the socket with mode 0660.
+  std::string query_socket_group;
 };
 
 // Parse the TOML-subset config text. On error returns nullopt and sets `err`.

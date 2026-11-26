@@ -23,6 +23,9 @@ class AdminClient {
   [[nodiscard]] std::optional<tier::core::PeerId> add_user(
       const std::array<std::uint8_t, 32>& seed);
 
+  // Read identities hosted by the local daemon, with a bounded query timeout.
+  [[nodiscard]] std::optional<std::vector<tier::core::PeerId>> local_users();
+
   // Ship an agent envelope (already encoded) from `from_user` to `to_user` as a
   // telemetry app message. Returns the daemon's send status.
   [[nodiscard]] tier::core::SendStatus send_telemetry(
@@ -35,7 +38,7 @@ class AdminClient {
 
  private:
   std::optional<std::vector<std::uint8_t>> query(
-      const std::vector<std::uint8_t>& req);
+      const std::vector<std::uint8_t>& req, bool bounded = false);
   std::string path_;
 };
 

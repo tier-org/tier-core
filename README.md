@@ -208,9 +208,9 @@ client over the tierd admin socket that changes nothing in the core. Agents emit
 gauges (rewritable) and events (append-only), batched; a collector stores them
 durably and serves a local read socket (`tier-agent query`). Delivery is
 best-effort online-only (correct for metrics); guaranteed delivery is a future
-keeper-backed layer. Built with the tree (`apps/agent`), not installed by default
-yet. See [docs/agent.md](docs/agent.md); integrations and systemd units are under
-`apps/agent/integrations/`.
+keeper-backed layer. The Tier `.deb` includes the agents and systemd units.
+Use [the fleet quick start](apps/agent/collector-view.md#start-monitoring-a-fleet)
+to bootstrap a collector, agents, and the optional web viewer.
 
 The [collector storage connector design](apps/agent/storage-connectors.md)
 covers backend selection, PostgreSQL, and how to contribute another connector.

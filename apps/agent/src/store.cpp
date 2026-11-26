@@ -17,11 +17,52 @@ namespace fs = std::filesystem;
 
 constexpr char kSep = '\x1f';          // unit separator between sender and key
 constexpr std::size_t kMaxEvents = 10000;
+constexpr std::size_t kSnapshotEvents = 50;
 constexpr std::size_t kMaxSeen = 20000;
 constexpr const char* kSnapshot = "gauges.snap";
 constexpr const char* kSnapshotTmp = "gauges.snap.tmp";
 constexpr const char* kSegPrefix = "events-";
 constexpr const char* kSegSuffix = ".log";
+
+// Validate one UTF-8 sequence before including it in a JSON string.
+std::size_t utf8_length(std::string_view text) {
+  const auto lead = static_cast<unsigned char>(text.front());
+  if (lead < 0xc2 || lead > 0xf4) return 0;
+  const std::size_t length = lead < 0xe0 ? 2U : (lead < 0xf0 ? 3U : 4U);
+  if (text.size() < length) return 0;
+  const auto second = static_cast<unsigned char>(text[1]);
+  if ((lead == 0xe0 && second < 0xa0) || (lead == 0xed && second >= 0xa0) ||
+      (lead == 0xf0 && second < 0x90) || (lead == 0xf4 && second >= 0x90)) {
+    return 0;
+  }
+  for (std::size_t i = 1; i < length; ++i) {
+    if ((static_cast<unsigned char>(text[i]) & 0xc0U) != 0x80U) return 0;
+  }
+  return length;
+}
+
+void json_string(std::ostream& out, std::string_view text) {
+  constexpr std::string_view hex = "0123456789abcdef";
+  out << '"';
+  while (!text.empty()) {
+    const auto c = static_cast<unsigned char>(text.front());
+    std::size_t length = 1;
+    if (c == '"' || c == '\\') {
+      out << '\\' << text.front();
+    } else if (c < 0x20) {
+      out << "\\u00" << hex[c >> 4] << hex[c & 0x0f];
+    } else if (c < 0x80) {
+      out << text.front();
+    } else if (const std::size_t valid = utf8_length(text); valid != 0) {
+      out << text.substr(0, valid);
+      length = valid;
+    } else {
+      out << "\\ufffd";
+    }
+    text.remove_prefix(length);
+  }
+  out << '"';
+}
 
 // Persist/replay line: "<ts> <sender_hex> <kind> <key> <value...>". Key is
 // assumed free of spaces (metric names are); value is the remainder of the line.
@@ -113,7 +154,7 @@ void Store::load() {
       Sample s;
       std::uint64_t ts = 0;
       if (decode_line(line, sender, s, ts)) {
-        record(sender, s, ts, /*persist=*/false);
+        record(sender, s, ts, std::nullopt);
       }
     }
   };
@@ -148,16 +189,17 @@ std::string Store::segment_path(std::uint64_t win_start) const {
 }
 
 void Store::record(const std::string& sender_hex, const Sample& s,
-                   std::uint64_t ts_unix, bool persist) {
+                   std::uint64_t ts_unix,
+                   std::optional<std::uint64_t> received_unix) {
   if (s.kind == Kind::gauge) {
-    gauges_[sender_hex + kSep + s.key] = Gauge{s.value, ts_unix};
-    if (persist) gauges_dirty_ = true;  // snapshotted later, not appended
+    gauges_[sender_hex + kSep + s.key] = Gauge{s.value, ts_unix, received_unix};
+    if (received_unix) gauges_dirty_ = true;
     return;
   }
-  events_.push_back(Event{sender_hex, s.key, s.value, ts_unix});
+  events_.push_back(Event{sender_hex, s.key, s.value, ts_unix, received_unix});
   if (events_.size() > kMaxEvents) events_.pop_front();
-  if (persist && !dir_.empty()) {
-    const std::uint64_t t = now_locked();
+  if (received_unix && !dir_.empty()) {
+    const auto t = *received_unix;
     const std::uint64_t seg =
         opts_.segment_secs == 0 ? 0 : t - (t % opts_.segment_secs);
     std::ofstream out(segment_path(seg), std::ios::app);
@@ -169,8 +211,9 @@ void Store::record(const std::string& sender_hex, const Sample& s,
 
 void Store::apply(const std::string& sender_hex, const Envelope& env) {
   std::lock_guard<std::mutex> lk(mu_);
+  const std::uint64_t received_unix = now_locked();
   for (const Sample& s : env.samples) {
-    record(sender_hex, s, env.ts_unix, /*persist=*/true);
+    record(sender_hex, s, env.ts_unix, received_unix);
   }
   maybe_maintain_locked();
 }
@@ -255,6 +298,68 @@ void Store::sweep_retention_locked() {
 std::string Store::query(const std::string& needle) const {
   std::lock_guard<std::mutex> lk(mu_);
   return query_locked(needle);
+}
+
+std::string Store::snapshot_json(std::string_view sender) const {
+  std::lock_guard<std::mutex> lk(mu_);
+  struct Node {
+    std::optional<std::uint64_t> received_unix;
+    std::vector<std::pair<std::string_view, const Gauge*>> gauges;
+  };
+  std::map<std::string_view, Node> nodes;
+  for (const auto& [label, gauge] : gauges_) {
+    const std::string_view name(label);
+    const auto sep = name.find(kSep);
+    const auto id = name.substr(0, sep);
+    if (!sender.empty() && id != sender) continue;
+    auto& node = nodes[id];
+    node.received_unix = std::max(node.received_unix, gauge.received_unix);
+    node.gauges.emplace_back(name.substr(sep + 1), &gauge);
+  }
+  std::vector<const Event*> events;
+  for (auto it = events_.rbegin(); it != events_.rend(); ++it) {
+    if (!sender.empty() && it->sender != sender) continue;
+    auto& node = nodes[it->sender];
+    node.received_unix = std::max(node.received_unix, it->received_unix);
+    if (events.size() < kSnapshotEvents) events.push_back(&*it);
+  }
+
+  std::ostringstream out;
+  out << "{\"version\":1,\"nodes\":[";
+  const char* separator = "";
+  for (const auto& [id, node] : nodes) {
+    out << std::exchange(separator, ",") << "{\"sender\":";
+    json_string(out, id);
+    out << ",\"received_unix\":";
+    if (node.received_unix) {
+      out << *node.received_unix;
+    } else {
+      out << "null";
+    }
+    out << ",\"gauges\":[";
+    const char* gauge_separator = "";
+    for (const auto& [key, gauge] : node.gauges) {
+      out << std::exchange(gauge_separator, ",") << "{\"key\":";
+      json_string(out, key);
+      out << ",\"value\":";
+      json_string(out, gauge->value);
+      out << ",\"ts_unix\":" << gauge->ts_unix << '}';
+    }
+    out << "]}";
+  }
+  out << "],\"events\":[";
+  separator = "";
+  for (const Event* event : events) {
+    out << std::exchange(separator, ",") << "{\"sender\":";
+    json_string(out, event->sender);
+    out << ",\"key\":";
+    json_string(out, event->key);
+    out << ",\"value\":";
+    json_string(out, event->value);
+    out << ",\"ts_unix\":" << event->ts_unix << '}';
+  }
+  out << "]}\n";
+  return out.str();
 }
 
 std::string Store::query_locked(const std::string& needle) const {

@@ -3,14 +3,17 @@
 # Copy to /etc/tier/collector.toml. Read it back with:
 #   tier-agent query /run/tier-agent/agent-query.sock
 role = "collector"
-admin_socket = "/run/tierd/tierd.sock"          # tierd's local admin socket
+admin_socket = "/run/tierd/tierd.sock"
 seed_file = "/var/lib/tier-agent/agent-collector.seed"
 
 [collector]
-store = "/var/lib/tier-agent/data"    # directory: gauge snapshot + event segments
-retention = "7d"                      # drop data older than this (s|m|h|d); 0 = keep all
+# Directory with the gauge snapshot and event segments.
+store = "/var/lib/tier-agent/data"
+# Event retention by age. Units are s, m, h, or d. Use 0 to keep all events.
+retention = "7d"
 # max_bytes = "2GB"                   # optional cap on the event log; drops oldest first
 # snapshot_interval = "60s"           # gauge snapshot + retention sweep cadence
 query_socket = "/run/tier-agent/agent-query.sock"
-persistence = "local"                 # local | keeper (keeper = opt-in HA, later)
+# query_socket_group = "tier-monitor"   # grant the viewer group access
+persistence = "local"
 # accept_from = ["tier1<agentA>", "tier1<agentB>"]   # allowlist; omit = accept any
