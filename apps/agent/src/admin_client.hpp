@@ -23,7 +23,7 @@ class AdminClient {
   [[nodiscard]] std::optional<tier::core::PeerId> add_user(
       const std::array<std::uint8_t, 32>& seed);
 
-  // Read identities hosted by the local daemon, with a bounded query timeout.
+  // Read identities hosted by the local daemon. Every admin query is bounded.
   [[nodiscard]] std::optional<std::vector<tier::core::PeerId>> local_users();
 
   // Ship an agent envelope (already encoded) from `from_user` to `to_user` as a
@@ -38,7 +38,7 @@ class AdminClient {
 
  private:
   std::optional<std::vector<std::uint8_t>> query(
-      const std::vector<std::uint8_t>& req, bool bounded = false);
+      const std::vector<std::uint8_t>& req);
   std::string path_;
 };
 

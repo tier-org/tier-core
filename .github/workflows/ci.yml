@@ -115,6 +115,13 @@ jobs:
           TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
         run: ./test/net/e2e-mesh.sh
 
+      - name: E2E tier-agent telemetry gate
+        env:
+          TIERD_BIN: ${{ github.workspace }}/build/apps/node/tierd
+          TIERCTL_BIN: ${{ github.workspace }}/build/apps/cli/tierctl
+          TIER_AGENT_BIN: ${{ github.workspace }}/build/apps/agent/tier-agent
+        run: ./test/net/e2e-agent.sh
+
   fuzz:
     # libFuzzer targets for the untrusted-input decoders: membership, SWIM
     # control + admin, version, wire frame, and the sealed-message / enc_keys

@@ -2,10 +2,10 @@
 # per-node actor whose role is set by config (agent ships metrics, collector
 # receives/stores, both does both) - the serf/consul "agent" model. A separate
 # product on top of the network; it changes nothing in the core. Built with the
-# tree; not installed by default yet (MVP). The reusable core (envelope codec,
-# config, store) is a static library so tests and a future keeper can link it
-# without the binary. Shipped with the node package (see the install() rules at
-# the end of this file), like tierctl and tier-messenger.
+# The reusable core (envelope codec, config, store) is a static library so tests
+# and a future keeper can link it without the binary. Shipped with the node
+# package (see the install() rules at the end of this file), like tierctl and
+# tier-messenger.
 add_library(tier_agent_core STATIC
   src/envelope.cpp
   src/config.cpp

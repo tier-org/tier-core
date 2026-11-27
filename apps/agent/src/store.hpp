@@ -71,8 +71,12 @@ class Store : public Sink {
   }
 
   // Sink: persist the gauge snapshot (if dirty) and run a retention sweep now.
-  // Called on an interval and at shutdown.
+  // Called at shutdown.
   void flush() override;
+
+  // Periodic idle maintenance: same work, but only once per configured
+  // snapshot_interval. Safe to call on every quiet poll tick.
+  void maintain();
 
   // Human-readable snapshot: current gauges then recent events.
   [[nodiscard]] std::string render() const { return query(std::string{}); }

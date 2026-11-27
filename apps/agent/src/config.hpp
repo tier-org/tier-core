@@ -15,10 +15,10 @@ enum class Role : std::uint8_t { agent, collector, both };
 struct Config {
   Role role = Role::agent;
   // Path to tierd's admin UNIX socket (the node this agent drives).
-  std::string admin_socket = "/run/tier/tierd.sock";
+  std::string admin_socket = "/run/tierd/tierd.sock";
   // Where this actor's 32-byte Ed25519 identity seed is stored (created on first
   // run). Its user id/address is stable across restarts so peers can target it.
-  std::string seed_file = "/var/lib/tier/agent.seed";
+  std::string seed_file = "/var/lib/tier-agent/agent.seed";
 
   // --- agent role ---
   tier::core::PeerId collector{};  // resolved from the collector's tier address

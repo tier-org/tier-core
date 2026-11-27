@@ -129,6 +129,44 @@ int main() {
           "bad collector address rejected");
     check(!parse_config("role = agent\nnope = 1\n", err),
           "unknown key rejected");
+    check(!parse_config("role = agent\nrole = collector\n", err),
+          "duplicate key rejected");
+    check(!parse_config("role = collector\n[collector]\npersistence = \"bogus\"\n",
+                        err),
+          "bad persistence rejected");
+    check(!parse_config("role = collector\n[collector]\nmax_bytes = \"999999999999999999999GB\"\n",
+                        err),
+          "overflowing size rejected");
+    check(!parse_config("role = collector\n[collector]\nretention = \"999999999999999999999d\"\n",
+                        err),
+          "overflowing duration rejected");
+    check(!parse_config("role = agent\n[agent]\ncollector = \"" + caddr +
+                            "\"\nmax_batch = 99999\n",
+                        err),
+          "max_batch above wire cap rejected");
+  }
+
+  // --- config: inline comments and '#' inside quoted values ---
+  {
+    std::string err;
+    const auto c = parse_config("role = agent  # pick a role\n"
+                                "admin_socket = \"/run/tierd/tierd.sock\" # local\n"
+                                "[agent]\n"
+                                "collector = \"" + caddr + "\" # peer\n"
+                                "interval = 5\n",
+                                err);
+    check(c.has_value(), "inline comments parse");
+    if (c) {
+      check(c->role == Role::agent && c->interval_secs == 5 &&
+                c->admin_socket == "/run/tierd/tierd.sock",
+            "inline comments do not eat values");
+      check(c->exec.empty(), "exec stays empty");
+    }
+    const auto hashed = parse_config("role = collector\n[collector]\n"
+                                     "query_socket = \"/run/a#b.sock\"\n",
+                                     err);
+    check(hashed && hashed->query_socket == "/run/a#b.sock",
+          "'#' inside quotes is data");
   }
 
   // --- config: batching + exec + query_socket keys ---
@@ -261,6 +299,10 @@ int main() {
     check(!parse_sample_line("# comment"), "comment ignored");
     check(!parse_sample_line("gauge onlykey"), "missing value rejected");
     check(!parse_sample_line("bogus k v"), "unknown kind rejected");
+    check(!parse_sample_line("gauge " + std::string(257, 'k') + " v"),
+          "oversize key rejected at ingest");
+    check(!parse_sample_line("event k " + std::string(65537, 'v')),
+          "oversize value rejected at ingest");
   }
 
   // --- store: gauge overwrite, event append, dedup ---
@@ -322,6 +364,73 @@ int main() {
           "reloaded event value with spaces");
     check(reloaded.snapshot_json().find("\"received_unix\":null") != std::string::npos,
           "replayed samples have no collector receipt timestamp");
+    fs::remove_all(dir);
+  }
+
+  // --- store: idle maintenance honors snapshot_interval ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_maintain.d";
+    fs::remove_all(dir);
+    StoreOptions opts;
+    opts.snapshot_interval_secs = 100;
+    std::uint64_t now = 1000;
+    Store s(dir, opts);
+    s.set_clock([&] { return now; });
+    Envelope e;
+    e.samples.push_back({Kind::gauge, "k", "v"});
+    s.apply("S", e);  // first maintenance at t=1000 writes the snapshot
+    const auto snap = fs::path(dir) / "gauges.snap";
+    check(fs::exists(snap), "initial snapshot written");
+    fs::remove(snap);
+    now = 1050;
+    s.apply("S", e);  // new data; maintenance is not due yet
+    s.maintain();
+    check(!fs::exists(snap), "idle maintenance before interval does not write");
+    now = 1100;
+    s.maintain();
+    check(fs::exists(snap), "idle maintenance on interval writes");
+    fs::remove_all(dir);
+  }
+
+  // --- store: fields with spaces/newlines/backslashes survive disk replay ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_escape.d";
+    fs::remove_all(dir);
+    Envelope e;
+    e.ts_unix = 55;
+    e.samples.push_back({Kind::event, "key with space", "line1\nline2\\tail end"});
+    e.samples.push_back({Kind::gauge, "g", "a\\b c"});
+    {
+      Store s(dir);
+      s.apply("S", e);
+      s.flush();
+    }
+    Store reloaded(dir);
+    check(reloaded.event_count() == 1 && reloaded.gauge_count() == 1,
+          "escaped fields reload into one event and one gauge");
+    check(reloaded.render().find("line1\nline2\\tail end") != std::string::npos,
+          "replayed event keeps newlines and backslashes");
+    check(reloaded.render().find("a\\b c") != std::string::npos,
+          "replayed gauge keeps backslash and space");
+    fs::remove_all(dir);
+  }
+
+  // --- store: legacy unescaped event lines are still readable ---
+  {
+    namespace fs = std::filesystem;
+    const std::string dir = "test_agent_store_legacy.d";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    {
+      std::ofstream out(fs::path(dir) / "events-0.log");
+      out << "55 S event boot up and running\n";
+    }
+    Store s(dir);
+    check(s.event_count() == 1, "legacy segment replayed");
+    check(s.render().find("S/boot up and running") != std::string::npos,
+          "legacy unescaped value kept");
     fs::remove_all(dir);
   }
 

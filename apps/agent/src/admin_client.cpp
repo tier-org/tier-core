@@ -22,9 +22,11 @@ std::string_view byte_view(const std::vector<std::uint8_t>& data) {
 }  // namespace
 
 std::optional<std::vector<std::uint8_t>> AdminClient::query(
-    const std::vector<std::uint8_t>& req, bool bounded) {
-  constexpr timeval timeout{1, 0};
-  const int fd = connect_unix(path_, bounded ? &timeout : nullptr);
+    const std::vector<std::uint8_t>& req) {
+  // A stalled daemon must not hang the agent: add_user, send_telemetry and the
+  // one-shot queries all go through here.
+  constexpr timeval timeout{2, 0};
+  const int fd = connect_unix(path_, &timeout);
   if (fd < 0) return std::nullopt;
   if (!send_all(fd, byte_view(req))) {
     ::close(fd);
@@ -47,8 +49,8 @@ std::optional<std::vector<std::uint8_t>> AdminClient::query(
 }
 
 std::optional<std::vector<tier::core::PeerId>> AdminClient::local_users() {
-  const auto reply = query(tier::core::encode_admin_request(tier::core::AdminOp::user_list),
-                           /*bounded=*/true);
+  const auto reply =
+      query(tier::core::encode_admin_request(tier::core::AdminOp::user_list));
   if (!reply) return std::nullopt;
   return tier::core::decode_admin_user_list(*reply);
 }
@@ -91,6 +93,13 @@ tier::core::SendStatus AdminClient::send_telemetry(
 int AdminClient::open_stream(const tier::core::PeerId& user) {
   const int fd = connect_unix(path_);
   if (fd < 0) return -1;
+  // A silent peer must not block the collector forever; the reader treats
+  // EAGAIN as "no event yet" and keeps the subscription.
+  constexpr timeval timeout{1, 0};
+  if (!set_socket_timeout(fd, timeout)) {
+    ::close(fd);
+    return -1;
+  }
   const auto req = tier::core::encode_admin_subscribe(user);
   if (!send_all(fd, byte_view(req))) {
     ::close(fd);
@@ -110,6 +119,12 @@ std::optional<tier::core::AdminStreamEvent> StreamParser::next() {
                               (static_cast<std::uint32_t>(buf_[1]) << 16) |
                               (static_cast<std::uint32_t>(buf_[2]) << 8) |
                               static_cast<std::uint32_t>(buf_[3]);
+    // An event is at most one admin message; a bogus length must not make the
+    // parser buffer without bound while waiting for the rest of a frame.
+    if (len > tier::core::kMaxAdminMessageBytes) {
+      buf_.clear();
+      return std::nullopt;
+    }
     if (buf_.size() < 4 + static_cast<std::size_t>(len)) return std::nullopt;
     auto ev = tier::core::decode_admin_stream_event(
         std::span<const std::uint8_t>(buf_.data() + 4, len));
