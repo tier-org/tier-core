@@ -6,7 +6,8 @@
 # Steps:
 #   1. fetch origin (refresh origin/main and origin/dev)
 #   2. fast-forward local main to origin/main (fails loudly if they diverged)
-#   3. merge origin/dev into main
+#   3. merge origin/dev into main (message: -m, else the single dev commit's
+#      title, else git's default)
 #   4. push main
 #   5. scripts/release.sh patch --push  (bump VERSION, commit, tag v*, push both)
 #
@@ -16,8 +17,9 @@
 # run leaves git state recoverable by hand.
 #
 # Usage:
-#   scripts/release_dev_to_main.sh            # patch bump (default)
-#   scripts/release_dev_to_main.sh minor      # or major / an explicit X.Y.Z
+#   scripts/release_dev_to_main.sh                       # patch bump (default)
+#   scripts/release_dev_to_main.sh minor                 # major / X.Y.Z
+#   scripts/release_dev_to_main.sh minor -m "text"       # custom merge message
 
 set -euo pipefail
 
@@ -27,7 +29,34 @@ die() {
 }
 
 # The version bump to pass through to scripts/release.sh (patch by default).
-spec="${1:-patch}"
+# -m/--message is parsed separately and may appear before or after the version.
+spec="patch"
+merge_message=""
+positional=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -m|--message)
+      [ $# -ge 2 ] || die "$1 requires a message"
+      [ -n "$2" ] || die "$1 requires a non-empty message"
+      merge_message=$2
+      shift 2
+      ;;
+    -m=*|--message=*)
+      merge_message=${1#*=}
+      [ -n "$merge_message" ] || die "--message requires a non-empty message"
+      shift
+      ;;
+    -*)
+      die "unknown option: $1"
+      ;;
+    *)
+      [ "$positional" -eq 0 ] || die "unexpected argument: $1"
+      spec=$1
+      positional=1
+      shift
+      ;;
+  esac
+done
 
 root=$(git rev-parse --show-toplevel 2>/dev/null) || die "not inside a git repository"
 cd "$root"
@@ -42,8 +71,20 @@ git fetch origin
 # surprise divergence into an error instead of a silent merge commit.
 git merge --ff-only origin/main
 
-# Bring dev's work into main.
-git merge --no-edit origin/dev
+# Bring dev's work into main. An explicit -m wins; otherwise use the single
+# incoming commit's title. See merge_dev_to_main.sh for the rationale. With a
+# fast-forward there is no merge commit, so the message is unused.
+if [ -n "$merge_message" ]; then
+  git merge -m "$merge_message" origin/dev
+else
+  new_commits=$(git rev-list --count HEAD..origin/dev)
+  subject=$(git log -1 --format=%s origin/dev)
+  if [ "$new_commits" -eq 1 ] && [ -n "$subject" ]; then
+    git merge -m "$subject" origin/dev
+  else
+    git merge --no-edit origin/dev
+  fi
+fi
 
 echo "release-dev-to-main: pushing main..." >&2
 git push origin main

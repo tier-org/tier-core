@@ -43,7 +43,7 @@ struct Envelope {
 // tier::core::kMaxAdminMessageBytes (16 KiB).
 inline constexpr std::size_t kMaxSamples = 4096;
 inline constexpr std::size_t kMaxKeyLen = 256;
-inline constexpr std::size_t kMaxValueLen = 64 * 1024;
+inline constexpr std::size_t kMaxValueLen = std::size_t{64} * 1024;
 inline constexpr std::size_t kMaxEnvelopeBytes = 16000;
 
 [[nodiscard]] std::size_t encoded_size(const Sample& s);  // bytes on the wire
