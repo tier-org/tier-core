@@ -1,6 +1,8 @@
 #include "config.hpp"
 
 #include <cctype>
+#include <limits>
+#include <set>
 #include <sstream>
 
 #include "tier/core/address.hpp"
@@ -24,16 +26,39 @@ std::string unquote(const std::string& s) {
   return s;
 }
 
-// Split a TOML array literal [ "a", "b" ] into its string elements.
+// Strip an inline comment. A '#' inside a quoted value is data, not a comment.
+std::string strip_comment(const std::string& s) {
+  bool quoted = false;
+  for (std::size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '"') quoted = !quoted;
+    else if (s[i] == '#' && !quoted) return trim(s.substr(0, i));
+  }
+  return s;
+}
+
+// Split a TOML array literal [ "a", "b" ] into its string elements. Commas
+// inside quotes are part of a value.
 std::vector<std::string> parse_array(const std::string& v) {
   std::vector<std::string> out;
   const std::string inner = trim(v.substr(1, v.size() - 2));  // drop [ ]
   std::string cur;
-  std::stringstream ss(inner);
-  while (std::getline(ss, cur, ',')) {
+  bool quoted = false;
+  const auto push = [&] {
     const std::string e = unquote(trim(cur));
     if (!e.empty()) out.push_back(e);
+    cur.clear();
+  };
+  for (const char c : inner) {
+    if (c == '"') {
+      quoted = !quoted;
+      cur += c;
+    } else if (c == ',' && !quoted) {
+      push();
+    } else {
+      cur += c;
+    }
   }
+  push();
   return out;
 }
 
@@ -75,7 +100,12 @@ bool split_number_unit(const std::string& v, std::uint64_t& num,
   std::size_t i = 0;
   std::uint64_t acc = 0;
   while (i < v.size() && v[i] >= '0' && v[i] <= '9') {
-    acc = acc * 10 + static_cast<std::uint64_t>(v[i] - '0');
+    const std::uint64_t digit = static_cast<std::uint64_t>(v[i] - '0');
+    if (acc > (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+      err = "number out of range: " + v;
+      return false;
+    }
+    acc = acc * 10 + digit;
     ++i;
   }
   if (i == 0) {
@@ -101,6 +131,10 @@ bool to_duration(const std::string& v, std::uint64_t& out, std::string& err) {
     err = "unknown duration unit (use s|m|h|d): " + v;
     return false;
   }
+  if (num > std::numeric_limits<std::uint64_t>::max() / mult) {
+    err = "duration out of range: " + v;
+    return false;
+  }
   out = num * mult;
   return true;
 }
@@ -119,6 +153,10 @@ bool to_size(const std::string& v, std::uint64_t& out, std::string& err) {
     err = "unknown size unit (use B|KB|MB|GB): " + v;
     return false;
   }
+  if (num > std::numeric_limits<std::uint64_t>::max() / mult) {
+    err = "size out of range: " + v;
+    return false;
+  }
   out = num * mult;
   return true;
 }
@@ -129,10 +167,11 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
   Config cfg;
   bool role_set = false;
   std::string section;
+  std::set<std::string> seen_keys;
   std::stringstream ss(text);
   std::string raw;
   while (std::getline(ss, raw, '\n')) {
-    std::string line = trim(raw);
+    std::string line = strip_comment(trim(raw));
     if (line.empty() || line[0] == '#') continue;
     if (line.front() == '[' && line.back() == ']') {
       section = trim(line.substr(1, line.size() - 2));
@@ -145,6 +184,11 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
     }
     const std::string key = trim(line.substr(0, eq));
     const std::string valraw = trim(line.substr(eq + 1));
+    const std::string full_key = section.empty() ? key : section + "." + key;
+    if (!seen_keys.insert(full_key).second) {
+      err = "duplicate key: " + full_key;
+      return std::nullopt;
+    }
     const std::string val = unquote(valraw);
 
     if (section.empty()) {
@@ -178,6 +222,10 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
           err = "max_batch must be >= 1";
           return std::nullopt;
         }
+        if (cfg.max_batch > kMaxSamples) {
+          err = "max_batch must be <= " + std::to_string(kMaxSamples);
+          return std::nullopt;
+        }
       } else if (key == "exec") {
         cfg.exec = val;
       } else {
@@ -204,9 +252,13 @@ std::optional<Config> parse_config(const std::string& text, std::string& err) {
       } else if (key == "query_socket_group") {
         cfg.query_socket_group = val;
       } else if (key == "persistence") {
+        if (val != "local" && val != "keeper") {
+          err = "persistence must be local|keeper: " + val;
+          return std::nullopt;
+        }
         cfg.keeper_persistence = (val == "keeper");
       } else if (key == "accept_from") {
-        if (valraw.empty() || valraw.front() != '[') {
+        if (valraw.size() < 2 || valraw.front() != '[' || valraw.back() != ']') {
           err = "accept_from must be an array";
           return std::nullopt;
         }
@@ -256,7 +308,10 @@ std::optional<Sample> parse_sample_line(const std::string& line) {
   else return std::nullopt;
   out.key = rest.substr(0, sp2);
   out.value = rest.substr(sp2 + 1);  // may contain spaces
-  if (out.key.empty()) return std::nullopt;
+  if (out.key.empty() || out.key.size() > kMaxKeyLen ||
+      out.value.size() > kMaxValueLen) {
+    return std::nullopt;  // the collector's decoder would reject it anyway
+  }
   return out;
 }
 

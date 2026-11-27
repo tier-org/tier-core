@@ -1,5 +1,8 @@
 #include "envelope.hpp"
 
+#include <algorithm>
+#include <utility>
+
 namespace tier::agent {
 namespace {
 
@@ -8,10 +11,8 @@ constexpr std::uint8_t kMagic1 = 'M';
 constexpr std::uint8_t kVersion = 1;
 
 // Guard rails against a malformed or hostile message. The collector authenticates
-// the sender (transport), but still must never trust sizes in the payload.
-constexpr std::size_t kMaxSamples = 4096;
-constexpr std::size_t kMaxKeyLen = 256;
-constexpr std::size_t kMaxValueLen = std::size_t{64} * 1024;
+// the sender (transport), but still must never trust sizes in the payload. The
+// limits live in the header so the encoder and decoder cannot drift apart.
 
 void put_u16(std::vector<std::uint8_t>& out, std::uint16_t v) {
   out.push_back(static_cast<std::uint8_t>(v >> 8));
@@ -59,7 +60,23 @@ struct Reader {
 
 }  // namespace
 
-std::vector<std::uint8_t> encode(const Envelope& env) {
+std::size_t encoded_size(const Sample& s) {
+  return 1 + 2 + s.key.size() + 4 + s.value.size();
+}
+
+std::size_t encoded_size(const Envelope& e) {
+  std::size_t n = 3 + 8 + 8 + 2;
+  for (const Sample& s : e.samples) n += encoded_size(s);
+  return n;
+}
+
+std::optional<std::vector<std::uint8_t>> encode(const Envelope& env) {
+  if (env.samples.size() > kMaxSamples) return std::nullopt;
+  for (const Sample& s : env.samples) {
+    if (s.key.size() > kMaxKeyLen || s.value.size() > kMaxValueLen) {
+      return std::nullopt;
+    }
+  }
   std::vector<std::uint8_t> out;
   out.push_back(kMagic0);
   out.push_back(kMagic1);
@@ -74,6 +91,42 @@ std::vector<std::uint8_t> encode(const Envelope& env) {
     put_u32(out, static_cast<std::uint32_t>(s.value.size()));
     out.insert(out.end(), s.value.begin(), s.value.end());
   }
+  return out;
+}
+
+std::vector<Envelope> split(const Envelope& env, std::size_t max_bytes,
+                            std::size_t& dropped) {
+  constexpr std::size_t header = 3 + 8 + 8 + 2;
+  const std::size_t limit = std::min(max_bytes, kMaxEnvelopeBytes);
+  dropped = 0;
+  std::vector<Envelope> out;
+  if (limit <= header) {
+    dropped = env.samples.size();
+    return out;
+  }
+
+  Envelope cur;
+  cur.seq = env.seq;
+  cur.ts_unix = env.ts_unix;
+  std::size_t bytes = header;
+  for (const Sample& s : env.samples) {
+    const std::size_t size = encoded_size(s);
+    if (s.key.size() > kMaxKeyLen || s.value.size() > kMaxValueLen ||
+        size > limit - header) {
+      ++dropped;  // unsendable even on its own
+      continue;
+    }
+    if (!cur.samples.empty() && bytes + size > limit) {
+      out.push_back(std::move(cur));
+      cur = Envelope{};
+      cur.seq = env.seq;
+      cur.ts_unix = env.ts_unix;
+      bytes = header;
+    }
+    cur.samples.push_back(s);
+    bytes += size;
+  }
+  if (!cur.samples.empty()) out.push_back(std::move(cur));
   return out;
 }
 

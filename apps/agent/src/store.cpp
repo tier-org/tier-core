@@ -64,14 +64,51 @@ void json_string(std::ostream& out, std::string_view text) {
   out << '"';
 }
 
-// Persist/replay line: "<ts> <sender_hex> <kind> <key> <value...>". Key is
-// assumed free of spaces (metric names are); value is the remainder of the line.
+// Persist/replay line: "<ts> <sender_hex> <kind> <key> <value>". All three
+// variable fields are escaped so a key/value containing spaces, backslashes or
+// newlines cannot split a line on replay. Older unescaped lines still decode.
+std::string escape_field(std::string_view text) {
+  std::string out;
+  out.reserve(text.size());
+  for (const char c : text) {
+    switch (c) {
+      case '\\': out += "\\\\"; break;
+      case '\n': out += "\\n"; break;
+      case '\r': out += "\\r"; break;
+      case ' ': out += "\\s"; break;
+      default: out += c;
+    }
+  }
+  return out;
+}
+
+bool unescape_field(std::string_view text, std::string& out) {
+  out.clear();
+  out.reserve(text.size());
+  for (std::size_t i = 0; i < text.size(); ++i) {
+    if (text[i] != '\\') {
+      out += text[i];
+      continue;
+    }
+    if (++i >= text.size()) return false;
+    switch (text[i]) {
+      case '\\': out += '\\'; break;
+      case 'n': out += '\n'; break;
+      case 'r': out += '\r'; break;
+      case 's': out += ' '; break;
+      default: return false;
+    }
+  }
+  return true;
+}
+
 std::string encode_line(const std::string& sender, Kind kind,
                         const std::string& key, const std::string& value,
                         std::uint64_t ts) {
   std::ostringstream os;
-  os << ts << ' ' << sender << ' ' << (kind == Kind::gauge ? "gauge" : "event")
-     << ' ' << key << ' ' << value;
+  os << ts << ' ' << escape_field(sender) << ' '
+     << (kind == Kind::gauge ? "gauge" : "event") << ' ' << escape_field(key)
+     << ' ' << escape_field(value);
   return os.str();
 }
 
@@ -82,14 +119,23 @@ bool decode_line(const std::string& line, std::string& sender, Sample& s,
   if (line.empty()) return false;
   std::istringstream is(line);
   std::string kind;
+  std::string raw_sender;
+  std::string raw_key;
+  if (!(is >> ts >> raw_sender >> kind >> raw_key)) return false;
+  std::string raw_value;
+  std::getline(is, raw_value);
+  if (!raw_value.empty() && raw_value.front() == ' ') raw_value.erase(0, 1);
+
   std::string key;
-  if (!(is >> ts >> sender >> kind >> key)) return false;
   std::string value;
-  std::getline(is, value);
-  if (!value.empty() && value.front() == ' ') value.erase(0, 1);
+  if (!unescape_field(raw_sender, sender) || !unescape_field(raw_key, key) ||
+      !unescape_field(raw_value, value)) {
+    return false;
+  }
+  if (kind != "gauge" && kind != "event") return false;
   s.kind = (kind == "event") ? Kind::event : Kind::gauge;
-  s.key = key;
-  s.value = value;
+  s.key = std::move(key);
+  s.value = std::move(value);
   return true;
 }
 
@@ -226,6 +272,11 @@ void Store::flush() {
   last_maintenance_ = now_locked();
 }
 
+void Store::maintain() {
+  std::lock_guard<std::mutex> lk(mu_);
+  maybe_maintain_locked();
+}
+
 void Store::maybe_maintain_locked() {
   if (dir_.empty()) return;
   const std::uint64_t t = now_locked();
@@ -268,6 +319,12 @@ void Store::sweep_retention_locked() {
       if (win + opts_.segment_secs <= cutoff) {
         std::error_code ec;
         fs::remove(path, ec);
+        if (ec) {
+          // Still on disk: keep it in the accounting (and for a later sweep).
+          std::fprintf(stderr, "warn: cannot remove %s: %s\n",
+                       path.string().c_str(), ec.message().c_str());
+          kept.emplace_back(win, std::move(path));
+        }
       } else {
         kept.emplace_back(win, std::move(path));
       }
@@ -289,6 +346,12 @@ void Store::sweep_retention_locked() {
     while (total > opts_.max_bytes && i + 1 < segs.size()) {
       std::error_code ec;
       fs::remove(segs[i].second, ec);
+      if (ec) {
+        std::fprintf(stderr, "warn: cannot remove %s: %s\n",
+                     segs[i].second.string().c_str(), ec.message().c_str());
+        ++i;  // try the next-oldest; never subtract bytes that are still there
+        continue;
+      }
       total -= sizes[i];
       ++i;
     }

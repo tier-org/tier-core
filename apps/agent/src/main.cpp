@@ -19,14 +19,17 @@
 // design); guaranteed delivery is a future paid/keeper layer. The collector's
 // durable store plus the query socket are the read path. spool-on-offline and
 // the keeper HA path are the next increments.
+#include <fcntl.h>
 #include <grp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
@@ -93,24 +96,44 @@ std::uint64_t now_unix() {
 
 // Sleep up to `secs`, waking early (within ~200ms) when a stop is requested.
 void interruptible_sleep(std::uint32_t secs) {
-  for (std::uint32_t i = 0; i < secs * 5 && !g_stop.load(); ++i) {
+  for (std::uint64_t i = 0; i < static_cast<std::uint64_t>(secs) * 5 &&
+                           !g_stop.load();
+       ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
   }
 }
 
 // --- agent side -----------------------------------------------------------
 
-// Ship whatever is buffered as one envelope. No-op when the buffer is empty.
+// Ship whatever is buffered. A batch larger than the admin socket's plaintext
+// budget is split into several envelopes rather than dropped whole; only a single
+// sample that cannot fit an envelope on its own is dropped (with a warning).
 void flush(tier::agent::AdminClient& client, const tier::core::PeerId& self,
            const tier::core::PeerId& collector, tier::agent::Batcher& batcher,
            std::uint64_t& seq) {
   if (batcher.empty()) return;
-  const auto env = batcher.drain(seq++, now_unix());
-  const auto status =
-      client.send_telemetry(self, collector, tier::agent::encode(env));
-  if (status != tier::core::SendStatus::accepted) {
-    std::fprintf(stderr, "warn: batch not accepted (%d); %zu sample(s) dropped\n",
-                 static_cast<int>(status), env.samples.size());
+  const auto env = batcher.drain(seq, now_unix());
+  std::size_t dropped = 0;
+  auto parts = tier::agent::split(env, tier::agent::kMaxEnvelopeBytes, dropped);
+  if (dropped != 0) {
+    std::fprintf(stderr, "warn: %zu sample(s) too large to ship, dropped\n",
+                 dropped);
+  }
+  for (auto& part : parts) {
+    part.seq = seq++;
+    const auto wire = tier::agent::encode(part);
+    if (!wire) {  // split() already checked the limits; defensive only
+      std::fprintf(stderr, "warn: batch %llu failed to encode, dropped\n",
+                   static_cast<unsigned long long>(part.seq));
+      continue;
+    }
+    const auto status = client.send_telemetry(self, collector, *wire);
+    if (status != tier::core::SendStatus::accepted) {
+      std::fprintf(stderr,
+                   "warn: batch %llu not accepted (%d); %zu sample(s) dropped\n",
+                   static_cast<unsigned long long>(part.seq),
+                   static_cast<int>(status), part.samples.size());
+    }
   }
 }
 
@@ -119,6 +142,13 @@ void flush(tier::agent::AdminClient& client, const tier::core::PeerId& self,
 void ingest_bytes(std::string& carry, const char* data, std::size_t n,
                   tier::agent::Batcher& batcher) {
   carry.append(data, n);
+  // A source that never sends a newline must not grow the buffer without bound.
+  // No valid ingest line can be this long (see kMaxValueLen).
+  if (carry.size() > tier::agent::kMaxValueLen + tier::agent::kMaxKeyLen) {
+    std::fprintf(stderr, "warn: ingest line too long, discarded\n");
+    carry.clear();
+    return;
+  }
   std::size_t pos;
   while ((pos = carry.find('\n')) != std::string::npos) {
     const std::string line = carry.substr(0, pos);
@@ -143,13 +173,14 @@ void run_agent_stdin(tier::agent::AdminClient& client,
   bool eof = false;
   while (!g_stop.load() && !eof) {
     const auto now = std::chrono::steady_clock::now();
-    const int timeout_ms =
-        deadline > now
-            ? static_cast<int>(
-                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                      deadline - now)
-                      .count())
-            : 0;
+    const auto remaining_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+            .count();
+    const int timeout_ms = remaining_ms > 0
+                               ? static_cast<int>(std::min<std::uint64_t>(
+                                     static_cast<std::uint64_t>(remaining_ms),
+                                     1000))
+                               : 0;
     const int r = ::poll(&pfd, 1, timeout_ms);
     if (r < 0) {
       if (errno == EINTR) continue;
@@ -173,6 +204,111 @@ void run_agent_stdin(tier::agent::AdminClient& client,
   flush(client, self, cfg.collector, batcher, seq);  // final drain
 }
 
+// Run `sh -c cmd`, forwarding stdout in chunks, with a hard deadline. popen()
+// cannot be bounded: a hung script would block the agent forever (pclose waits
+// for it). Fork + poll + kill keeps one bad collector script from wedging the
+// agent, and lets a signal stop it promptly.
+template <typename OnChunk>
+void run_exec_capture(const std::string& cmd, std::uint32_t timeout_secs,
+                      OnChunk on_chunk) {
+  int fds[2];
+  if (::pipe2(fds, O_CLOEXEC) != 0) {
+    std::perror("exec: pipe");
+    return;
+  }
+  const pid_t pid = ::fork();
+  if (pid < 0) {
+    std::perror("exec: fork");
+    ::close(fds[0]);
+    ::close(fds[1]);
+    return;
+  }
+  if (pid == 0) {
+    ::close(fds[0]);
+    if (fds[1] != STDOUT_FILENO) {
+      if (::dup2(fds[1], STDOUT_FILENO) < 0) ::_exit(127);
+      ::close(fds[1]);
+    }
+    ::execl("/bin/sh", "sh", "-c", cmd.c_str(), nullptr);
+    ::_exit(127);
+  }
+  ::close(fds[1]);
+
+  bool timed_out = false;
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(timeout_secs);
+  std::array<char, 4096> buf{};
+  while (!g_stop.load()) {
+    const auto now = std::chrono::steady_clock::now();
+    // Cap each wait so a very large configured interval cannot overflow int.
+    const auto remaining_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)
+            .count();
+    const int wait_ms = remaining_ms > 0
+                            ? static_cast<int>(std::min<std::uint64_t>(
+                                  static_cast<std::uint64_t>(remaining_ms),
+                                  1000))
+                            : 0;
+    pollfd pfd{};
+    pfd.fd = fds[0];
+    pfd.events = POLLIN;
+    const int r = ::poll(&pfd, 1, wait_ms);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      std::perror("exec: poll");
+      break;
+    }
+    if (r == 0) {
+      timed_out = true;
+      break;
+    }
+    if ((pfd.revents & (POLLIN | POLLHUP | POLLERR)) == 0) continue;
+    const ssize_t n = ::read(fds[0], buf.data(), buf.size());
+    if (n > 0) {
+      on_chunk(buf.data(), static_cast<std::size_t>(n));
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    break;  // EOF (or a read error): the script is done
+  }
+  ::close(fds[0]);
+
+  // EOF on stdout is not proof that the script exited: it may have closed fd 1
+  // and kept running. Reap with the same deadline instead of blocking forever.
+  int status = 0;
+  bool reaped = false;
+  for (;;) {
+    const pid_t r = ::waitpid(pid, &status, WNOHANG);
+    if (r == pid) {
+      reaped = true;
+      break;
+    }
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      break;  // ECHILD: nothing left to reap
+    }
+    if (g_stop.load() || std::chrono::steady_clock::now() >= deadline) {
+      ::kill(pid, SIGKILL);
+      if (!g_stop.load()) timed_out = true;
+      while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+      }
+      break;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  }
+
+  if (timed_out) {
+    std::fprintf(stderr, "warn: exec timed out after %us: %s\n", timeout_secs,
+                 cmd.c_str());
+  } else if (!g_stop.load() && reaped && WIFEXITED(status) &&
+             WEXITSTATUS(status) != 0) {
+    std::fprintf(stderr, "warn: exec exited %d: %s\n", WEXITSTATUS(status),
+                 cmd.c_str());
+  } else if (!g_stop.load() && reaped && !WIFEXITED(status)) {
+    std::fprintf(stderr, "warn: exec did not exit cleanly: %s\n", cmd.c_str());
+  }
+}
+
 // Agent mode that runs `cfg.exec` every interval and parses its stdout as ingest
 // lines (serf-like: a script that emits the host's current state each tick).
 void run_agent_exec(tier::agent::AdminClient& client,
@@ -180,19 +316,14 @@ void run_agent_exec(tier::agent::AdminClient& client,
                     const tier::agent::Config& cfg) {
   tier::agent::Batcher batcher(cfg.max_batch);
   std::uint64_t seq = 0;
+  std::string carry;
   while (!g_stop.load()) {
-    FILE* p = ::popen(cfg.exec.c_str(), "r");
-    if (p == nullptr) {
-      std::fprintf(stderr, "warn: cannot run exec: %s\n", cfg.exec.c_str());
-    } else {
-      char line[4096];
-      while (std::fgets(line, sizeof line, p) != nullptr) {
-        std::string l(line);
-        if (!l.empty() && l.back() == '\n') l.pop_back();
-        if (const auto s = tier::agent::parse_sample_line(l)) batcher.add(*s);
-      }
-      ::pclose(p);
-    }
+    run_exec_capture(cfg.exec, cfg.interval_secs,
+                     [&](const char* data, std::size_t n) {
+                       ingest_bytes(carry, data, n, batcher);
+                       if (batcher.full()) flush(client, self, cfg.collector,
+                                                 batcher, seq);
+                     });
     flush(client, self, cfg.collector, batcher, seq);
     interruptible_sleep(cfg.interval_secs);
   }
@@ -209,29 +340,12 @@ void run_agent(tier::agent::AdminClient& client, const tier::core::PeerId& self,
 
 // --- collector side -------------------------------------------------------
 
-// Create every missing component of a directory path (mkdir -p), 0755. Best
-// effort: a failure surfaces later as the bind/open error. Used so a collector
-// run by hand still works when the query socket's parent (e.g. /run/tier-agent,
-// a tmpfs dir that systemd's RuntimeDirectory= would make under the unit) does
-// not exist yet.
-void make_parent_dirs(const std::string& file_path) {
-  const auto slash = file_path.find_last_of('/');
-  if (slash == std::string::npos || slash == 0) return;  // no dir, or root
-  const std::string dir = file_path.substr(0, slash);
-  std::string acc;
-  for (std::size_t i = 0; i < dir.size(); ++i) {
-    acc.push_back(dir[i]);
-    if (dir[i] == '/' || i + 1 == dir.size()) {
-      if (acc != "/") ::mkdir(acc.c_str(), 0755);  // ignore EEXIST and errors
-    }
-  }
-}
-
 // One request line followed by one snapshot, then EOF. The reserved command
 // selects JSON. Other requests are the human-readable query's substring filter.
 std::string query_response(int fd, const tier::agent::Store& store) {
   std::string request;
   std::array<char, 256> buffer{};
+  bool complete = false;
   while (request.size() < buffer.size()) {
     const ssize_t n = ::recv(fd, buffer.data(), buffer.size() - request.size(), 0);
     if (n < 0 && errno == EINTR && !g_stop.load()) continue;
@@ -240,12 +354,15 @@ std::string query_response(int fd, const tier::agent::Store& store) {
     const auto newline = request.find('\n');
     if (newline != std::string::npos) {
       request.resize(newline);
+      complete = true;
       break;
     }
   }
   while (!request.empty() && (request.back() == '\r' || request.back() == ' ')) {
     request.pop_back();
   }
+  // A truncated command must not be silently reinterpreted as a filter.
+  if (!complete && !request.empty()) return "error: incomplete request\n";
 
   constexpr std::string_view command = "TIER-QUERY/1";
   if (request == command) return store.snapshot_json();
@@ -263,7 +380,7 @@ std::string query_response(int fd, const tier::agent::Store& store) {
 
 void run_query_server(const std::string& path, tier::agent::Store& store,
                       std::optional<gid_t> socket_group) {
-  make_parent_dirs(path);
+  tier::agent::create_parent_dirs(path);
   ::unlink(path.c_str());
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
@@ -308,10 +425,19 @@ void run_query_server(const std::string& path, tier::agent::Store& store,
     }
     if (r == 0) continue;
     const int cfd = ::accept(fd, nullptr, nullptr);
-    if (cfd < 0) continue;
+    if (cfd < 0) {
+      if (errno != EINTR && !g_stop.load()) {
+        std::perror("query: accept");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+      continue;
+    }
     constexpr timeval timeout{2, 0};
     if (tier::agent::set_socket_timeout(cfd, timeout)) {
-      tier::agent::send_all(cfd, query_response(cfd, store));
+      const std::string response = query_response(cfd, store);
+      if (!tier::agent::send_all(cfd, response)) {
+        std::fprintf(stderr, "warn: query: short write to client\n");
+      }
     }
     ::close(cfd);
   }
@@ -353,13 +479,23 @@ void run_collector(tier::agent::AdminClient& client,
     if (fd < 0) {
       backoff = backoff ? (backoff < 4 ? backoff * 2 : 4) : 1;
       interruptible_sleep(backoff);  // tierd unreachable: wait and retry
+      store.maintain();             // keep the snapshot fresh while offline
       continue;
     }
     backoff = 0;  // reset after a good subscribe
     tier::agent::StreamParser parser;
     while (!g_stop.load()) {
       const ssize_t n = ::recv(fd, buf.data(), buf.size(), 0);
-      if (n <= 0) break;  // stream dropped -> reconnect
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+          store.maintain();  // idle tick: refresh gauges/retention on schedule
+          continue;
+        }
+        std::perror("collector: recv");
+        break;
+      }
+      if (n == 0) break;  // stream dropped -> reconnect
       parser.feed(buf.data(), static_cast<std::size_t>(n));
       for (;;) {
         auto ev = parser.next();
@@ -388,6 +524,7 @@ void run_collector(tier::agent::AdminClient& client,
     if (g_stop.load()) break;
     backoff = backoff ? (backoff < 4 ? backoff * 2 : 4) : 1;
     interruptible_sleep(backoff);  // tierd restart/blip: back off, re-subscribe
+    store.flush();
   }
   g_stop.store(true);
   for (tier::agent::Sink* sink : sinks) sink->flush();  // persist on shutdown
@@ -402,6 +539,12 @@ int run_query_client(const std::string& path, const std::string& needle) {
   const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
   if (fd < 0) {
     std::perror("query: socket");
+    return 1;
+  }
+  constexpr timeval timeout{2, 0};
+  if (!tier::agent::set_socket_timeout(fd, timeout)) {
+    std::perror("query: setsockopt");
+    ::close(fd);
     return 1;
   }
   sockaddr_un addr{};
@@ -427,9 +570,19 @@ int run_query_client(const std::string& path, const std::string& needle) {
   }
   ::shutdown(fd, SHUT_WR);
   char b[4096];
-  ssize_t n;
-  while ((n = ::recv(fd, b, sizeof b, 0)) > 0) {
-    std::fwrite(b, 1, static_cast<std::size_t>(n), stdout);
+  for (;;) {
+    const ssize_t n = ::recv(fd, b, sizeof b, 0);
+    if (n > 0) {
+      std::fwrite(b, 1, static_cast<std::size_t>(n), stdout);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) {
+      std::perror("query: recv");
+      ::close(fd);
+      return 1;
+    }
+    break;
   }
   ::close(fd);
   return 0;

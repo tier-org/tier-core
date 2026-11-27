@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -20,7 +21,8 @@ class Batcher {
   // `max_samples` is the soft cap at which full() reports true so the caller can
   // flush early (distinct gauge keys + events). Zero is treated as one.
   explicit Batcher(std::size_t max_samples)
-      : max_(max_samples == 0 ? 1 : max_samples) {}
+      : max_(std::clamp(max_samples == 0 ? 1 : max_samples,
+                        std::size_t{1}, kMaxSamples)) {}
 
   // Buffer one sample. A gauge overwrites any pending value for its key; an
   // event is appended.

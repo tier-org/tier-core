@@ -37,7 +37,28 @@ struct Envelope {
 // Wire format (all integers big-endian):
 //   ["TM"][ver:1=1][seq:8][ts_unix:8][count:2]
 //   count x ( [kind:1][klen:2][key][vlen:4][value] )
-[[nodiscard]] std::vector<std::uint8_t> encode(const Envelope& env);
+// The decoder enforces these limits on untrusted input; the encoder refuses to
+// produce bytes the decoder would reject. Transport has a tighter budget still:
+// an envelope travels inside a 20-byte app frame in an admin request capped at
+// tier::core::kMaxAdminMessageBytes (16 KiB).
+inline constexpr std::size_t kMaxSamples = 4096;
+inline constexpr std::size_t kMaxKeyLen = 256;
+inline constexpr std::size_t kMaxValueLen = 64 * 1024;
+inline constexpr std::size_t kMaxEnvelopeBytes = 16000;
+
+[[nodiscard]] std::size_t encoded_size(const Sample& s);  // bytes on the wire
+[[nodiscard]] std::size_t encoded_size(const Envelope& e);
+
+// Encode. std::nullopt if the envelope exceeds a format limit.
+[[nodiscard]] std::optional<std::vector<std::uint8_t>> encode(const Envelope& env);
+
+// Split into pieces that fit `max_bytes` (never more than kMaxEnvelopeBytes) and
+// the format limits. Samples too large to ship alone are skipped and counted in
+// `dropped`; all other samples are preserved in order. seq/ts are copied to each
+// piece - the caller assigns distinct seq numbers before sending.
+[[nodiscard]] std::vector<Envelope> split(const Envelope& env,
+                                          std::size_t max_bytes,
+                                          std::size_t& dropped);
 
 // Decode a full envelope. std::nullopt on a bad magic/version, truncation,
 // an unknown kind, an oversize field, or trailing bytes.

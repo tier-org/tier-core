@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 
 #include "tier/crypto/identity.hpp"
 
@@ -39,6 +40,13 @@ FileResult create_private_file(const std::string& path, std::string_view data) {
   return result;
 }
 
+void create_parent_dirs(const std::string& path) {
+  const auto parent = std::filesystem::path(path).parent_path();
+  if (parent.empty()) return;
+  std::error_code ec;
+  std::filesystem::create_directories(parent, ec);  // EEXIST is fine
+}
+
 FileResult read_seed_file(const std::string& path, Seed& seed) {
   const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
   if (fd < 0) return errno == ENOENT ? FileResult::absent : FileResult::error;
@@ -67,6 +75,7 @@ bool load_or_create_seed(const std::string& path, Seed& seed) {
   if (result == FileResult::absent) {
     seed = tier::crypto::NodeIdentity::generate().seed();
     const std::string_view data(reinterpret_cast<const char*>(seed.data()), seed.size());
+    create_parent_dirs(path);
     result = create_private_file(path, data);
     if (result == FileResult::exists) result = read_seed_file(path, seed);
   }

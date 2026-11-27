@@ -164,7 +164,13 @@ std::optional<Config> load_existing(const Options& options, const std::string& p
 std::optional<Config> prepare_config(const Options& options, const char* name) {
   const std::string path = std::string(kConfigDirectory) + name + ".toml";
   struct stat info {};
-  if (::lstat(path.c_str(), &info) == 0) return load_existing(options, path);
+  if (::lstat(path.c_str(), &info) == 0) {
+    if (S_ISLNK(info.st_mode)) {
+      std::fprintf(stderr, "bootstrap: refusing symlinked config %s\n", path.c_str());
+      return std::nullopt;
+    }
+    return load_existing(options, path);
+  }
   if (errno != ENOENT) {
     std::fprintf(stderr, "bootstrap: cannot inspect %s: %s\n", path.c_str(), std::strerror(errno));
     return std::nullopt;
